@@ -1,0 +1,97 @@
+paths:
+  # Any value may be overridden via env vars. Precedence:
+  #   ${env:VAR:-default}  ->  os.environ["VAR"] if set, else "default"
+  # This lets the same config work on the laptop and on RunPod.
+  root:         "${env:SIB_ROOT:-/media/kabir/Research/Project/sodium battery /Data_Failure_Mode_and_Degradation_Analysis_of_a_Commercial_Sodium-Ion_Battery_With_Severe_Gassing_Issue/Standard cycling}"
+  data_statics: "${env:SIB_DATA_STATICS:-${paths.root}/data statics}"
+  # DOD*/CU_at_25degC/*.ird and DOD*/Cycling_Periods/*.ird live under this root.
+  # On laptop it's the same as `paths.root`; on the pod it points at the extracted dataset dir.
+  dataset_root: "${env:SIB_DATASET_ROOT:-${paths.root}}"
+  tables:
+    cycle_metrics:      "${paths.data_statics}/tables/cycle_metrics.csv"
+    file_statistics:    "${paths.data_statics}/tables/file_statistics.csv"
+    inventory:          "${paths.data_statics}/tables/inventory.csv"
+    degradation_rates:  "${paths.data_statics}/tables/degradation_rates.csv"
+    condition_summary:  "${paths.data_statics}/tables/condition_summary.csv"
+  parse_errors_csv:     "${paths.data_statics}/logs/parse_errors.csv"
+  artifacts:            "${env:SIB_ARTIFACTS:-${paths.root}/code/artifacts}"
+  canonical:            "${env:SIB_CANONICAL:-${paths.artifacts}/canonical}"
+  logs:                 "${env:SIB_LOGS:-${paths.root}/code/logs}"
+
+cleaning:
+  hampel_window: 5
+  hampel_k: 3.0
+  incomplete_cycle_frac: 0.5      # drop cycle if Q < 0.5 * cell median
+  ce_clip: [0.4, 1.05]
+  soh_clip_max: 100.0             # clip target SOH to <= 100 (activation handling)
+  skip_files:
+    - "S2000FP452_CU_at-10degC_V01_4860.ird"
+    - "S2000FQ9MI_CU_at50degC_V01_4872.ird"
+
+protocol:
+  # Inferred from raw Standard-cycling protocols; confirm against RWTH metadata.
+  nominal_capacity_Ah: 1.2
+  current_deadband_A: 0.02
+  cycling_current_relative_tolerance: 0.35
+  minimum_phase_capacity_Ah: 0.001
+  capacity_ratio_bounds: [0.25, 4.0]
+  # Reject narrow diagnostic pulse pairs as complete cycling cycles without
+  # deleting genuinely degraded cycles that still traverse the voltage window.
+  minimum_cycle_voltage_span_V: 0.30
+  minimum_phase_voltage_span_V: 0.25
+  max_invalid_fraction: 0.0
+  max_sampling_gap_s: 300.0
+  physical_bounds:
+    Voltage: [0.0, 5.0]
+    Current: [-5.0, 5.0]
+    Temperature: [-30.0, 70.0]
+  rpt_reference_current_A: 0.6
+  rpt_current_relative_tolerance: 0.2
+  rpt_charged_voltage_min_V: 3.6
+  rpt_discharged_voltage_max_V: 1.8
+  rpt_capacity_bounds_Ah: [0.2, 2.0]
+
+preprocessing:
+  rolling_window: 10
+  severson_window: [10, 100]
+  dqdv_smooth_sigma: 3
+  vq_resample_points: 100
+  minimum_p3_file_coverage: 0.95
+  minimum_p3_cycle_coverage: 0.98
+
+targets:
+  next_rpt:
+    initial_visit: 0
+    delta_sign: "next_minus_previous"
+  capacity_eol:
+    soh_threshold_pct: 80.0
+    minimum_consecutive_cycles: 3
+  failure:
+    enabled: false
+    events_path: null
+
+split:
+  holdout_fraction: 0.25
+  n_splits: 5
+  random_state: 42
+  stratify_by: "condition"
+  holdout_candidates: 1024
+
+evaluation:
+  bootstrap_replicates: 1000
+  bootstrap_random_state: 42
+  horizon_bin_edges_days: [0.0, 1.0, 5.0, 15.0, 1000000.0]
+  horizon_bin_labels: ["<1d", "1-5d", "5-15d", ">15d"]
+  prediction_bounds:
+    next_rpt_Q_Ah: [0.0, 2.0]
+    next_rpt_SOH_pct: [0.0, 150.0]
+    delta_next_rpt_Q_Ah: [-1.0, 1.0]
+    delta_next_rpt_SOH_pct: [-100.0, 100.0]
+
+plotting:
+  formats: ["png", "pdf"]
+  dpi: 300
+
+experiment:
+  parallel_workers: 6
+  cache_features: true

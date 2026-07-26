@@ -1,0 +1,7 @@
+runpod/r2.env
+runpod/downloads/
+artifacts/
+logs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
