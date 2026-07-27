@@ -6,12 +6,17 @@
 #   bash runpod/run.sh 2>&1 | tee run.log
 #
 # Runs, in order (override with RUN_STAGES in r2.env):
-#   1. scripts/00_build_canonical.py      — raw IRD -> canonical tables + QC
-#   2. scripts/01_build_features.py       — parquets for P1/P2/P3
-#   3. scripts/05_analyze_degradation.py  — RPT-SOH and projected threshold tables
-#   4. scripts/02_run_all_experiments.py  — locked 75/25 + development five-fold CV
-#   5. scripts/03_aggregate_results.py    — pooled/macro/bootstrap result tables
-#   6. scripts/04_plot_results.py         — publication PNG/PDF figure suite
+#   1. scripts/00_build_canonical.py               — raw IRD -> canonical tables + QC
+#   2. scripts/01_build_features.py                — parquets for P1/P2/P3
+#   3. scripts/05_analyze_degradation.py           — RPT-SOH and projected threshold tables
+#   4. scripts/02_run_all_experiments.py           — locked 75/25 + five-fold CV (classical)
+#   5. scripts/03_aggregate_results.py             — pooled/macro/bootstrap classical tables
+#   6. scripts/04_plot_results.py                  — classical publication figure suite
+#   7. scripts/06_run_pinn_experiments.py          — DNN-Q + NaPINN-Q fold training
+#   8. scripts/07_aggregate_pinn_results.py        — PINN metric aggregation
+#   9. scripts/08_plot_pinn_results.py             — PINN publication plots
+#  10. scripts/10_run_pinn_ablations.py            — physics ablation A0..A5
+#  11. scripts/09_combine_classical_pinn_results.py — combined report
 #
 # Exit codes: 0 = pipeline + upload + shutdown attempted. Non-zero = pipeline
 # stage failed; we STILL try to upload whatever exists but leave the pod up.
@@ -53,6 +58,11 @@ echo "[run] r2.env loaded  R2_BUCKET=${R2_BUCKET:-<unset>}  STOP_MODE=${STOP_MOD
 : "${STOP_MODE:=terminate}"
 : "${R2_PREFIX:=sodium_ion_battery}"
 : "${RUN_STAGES:=canonical,build,degradation,experiments,aggregate,plot}"
+
+# Expand the alias 'all' to the full classical + PINN pipeline.
+if [[ "$RUN_STAGES" == "all" ]]; then
+  RUN_STAGES="canonical,build,degradation,experiments,aggregate,plot,pinn,pinn_aggregate,pinn_plot,pinn_ablation,combined_report"
+fi
 
 log(){ printf '\n[run %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
@@ -100,11 +110,21 @@ REQUIRED_SOURCE=(
   scripts/02_run_all_experiments.py
   scripts/03_aggregate_results.py
   scripts/04_plot_results.py
+  scripts/06_run_pinn_experiments.py
+  scripts/07_aggregate_pinn_results.py
+  scripts/08_plot_pinn_results.py
+  scripts/09_combine_classical_pinn_results.py
+  scripts/10_run_pinn_ablations.py
   src/io/canonical.py
   src/preprocessing/protocol_segmentation.py
   src/preprocessing/p3_waveform.py
   src/splits/group_kfold.py
   src/evaluation/report.py
+  src/pinn/__init__.py
+  src/pinn/dataset.py
+  src/pinn/models.py
+  src/pinn/physics.py
+  src/pinn/trainer.py
 )
 for required in "${REQUIRED_SOURCE[@]}"; do
   if [[ ! -f "$required" ]]; then
@@ -114,6 +134,10 @@ for required in "${REQUIRED_SOURCE[@]}"; do
 done
 if ! python -c 'from src.io.canonical import build_canonical_tables; from src.preprocessing.protocol_segmentation import segment_cyc_protocol'; then
   echo "ERROR: canonical pipeline import preflight failed" >&2
+  exit 1
+fi
+if ! python -c 'from src.pinn.models import NaPINNQ; from src.pinn.physics import autograd_du_ds; import torch'; then
+  echo "ERROR: PINN import preflight failed (torch or src.pinn.* missing)" >&2
   exit 1
 fi
 
@@ -155,6 +179,11 @@ for stage in "${STAGES[@]}"; do
     degradation) run_stage degradation scripts/05_analyze_degradation.py ;;
     aggregate)   run_stage aggregate   scripts/03_aggregate_results.py ;;
     plot)        run_stage plot        scripts/04_plot_results.py ;;
+    pinn)             run_stage pinn             scripts/06_run_pinn_experiments.py ;;
+    pinn_aggregate)   run_stage pinn_aggregate   scripts/07_aggregate_pinn_results.py ;;
+    pinn_plot)        run_stage pinn_plot        scripts/08_plot_pinn_results.py ;;
+    pinn_ablation)    run_stage pinn_ablation    scripts/10_run_pinn_ablations.py ;;
+    combined_report)  run_stage combined_report  scripts/09_combine_classical_pinn_results.py ;;
     smoke)       run_stage smoke       scripts/00_smoke_test.py ;;
     "" )         ;;
     *) log "unknown stage '$stage' in RUN_STAGES"; PIPELINE_RC=2 ;;

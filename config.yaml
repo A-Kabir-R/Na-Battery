@@ -113,3 +113,144 @@ models:
     - DummyMean
     - PreviousRPT
     - ExtraTrees
+
+# ---------------------------------------------------------------------------
+# NaPINN-Q autograd-based physics-informed neural network configuration.
+# Consumed by scripts/06_run_pinn_experiments.py and downstream aggregation.
+# The classical pipeline above is not modified when pinn.enabled is toggled.
+# ---------------------------------------------------------------------------
+pinn:
+  enabled: true
+  model_name: "NaPINN-Q"
+  results_subdir: "pinn_preprocessing_study"
+
+  preprocessing:
+    - p1
+    - p2
+    - p3
+
+  architectures:
+    - DNN-Q
+    - NaPINN-Q
+
+  seeds:
+    - 17
+    - 42
+    - 73
+
+  derive_all_targets_from_capacity: true
+  reuse_existing_folds: true
+  reuse_existing_holdout: true
+
+  stress:
+    preferred_coordinate: "EFC_cum"
+    fallback_coordinate: "cumulative_Ah_throughput"
+    allow_elapsed_time_fallback: true
+    time_fallback_column: "cycle_end_time_s"
+    require_known_forecast_horizon: true
+    epsilon: 1.0e-6
+
+  model:
+    solution_hidden_dims: [64, 64, 32]
+    rate_hidden_dims: [32, 16]
+    solution_activation: "tanh"
+    rate_activation: "tanh"
+    rate_output_activation: "softplus"
+    maximum_parameters: 50000
+
+  collocation:
+    enabled: true
+    points_per_transition: 8
+    sampling: "uniform"
+    resample_each_epoch: true
+
+  quadrature:
+    method: "trapezoidal"       # midpoint | trapezoidal
+    nodes: 8
+
+  training:
+    optimizer: "adamw"
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    maximum_epochs: 2000
+    minimum_epochs: 200
+    early_stopping_patience: 200
+    scheduler: "reduce_on_plateau"
+    scheduler_factor: 0.5
+    scheduler_patience: 60
+    minimum_learning_rate: 1.0e-6
+    gradient_clip_norm: 1.0
+    use_amp: true
+    physics_float32: true
+    batch_mode: "cell_balanced"
+
+  losses:
+    data: 1.0
+    pde: 0.5
+    initial_condition: 0.5
+    integral: 0.25
+    monotonicity: 0.1
+    bounds: 0.1
+    rate_regularization: 1.0e-4
+    huber_delta: 1.0
+
+  bounds:
+    u_min: 0.0
+    u_max_source: "outer_training"   # constant | outer_training
+    u_max_constant: 1.05
+    u_max_margin: 0.05
+
+  monotonicity:
+    tolerance_source: "outer_training"   # constant | outer_training
+    tolerance_constant: 0.02
+    tolerance_quantile: 0.95
+
+  curriculum:
+    warmup_fraction: 0.10
+    ramp_end_fraction: 0.30
+
+  evaluation:
+    bootstrap_replicates_development: 100
+    bootstrap_replicates_final: 1000
+    bootstrap_unit: "cell"
+    bootstrap_random_state: 42
+
+  logging:
+    console: true
+    epoch_csv: true
+    epoch_parquet: true
+    tensorboard: false
+    log_every_epochs: 1
+    save_checkpoint_every_epochs: 100
+    log_gpu_memory: true
+    log_gradient_norms: true
+    log_physics_metrics: true
+
+  ablation:
+    enabled: true
+    configurations:
+      - name: "A0_DNN"
+        architecture: "DNN-Q"
+        weights: {data: 1.0, pde: 0.0, initial_condition: 0.0, integral: 0.0,
+                  monotonicity: 0.0, bounds: 0.0, rate_regularization: 0.0}
+      - name: "A1_Constrained_NN"
+        architecture: "NaPINN-Q"
+        weights: {data: 1.0, pde: 0.0, initial_condition: 0.5, integral: 0.0,
+                  monotonicity: 0.1, bounds: 0.1, rate_regularization: 0.0}
+      - name: "A2_PINN_PDE"
+        architecture: "NaPINN-Q"
+        weights: {data: 1.0, pde: 0.5, initial_condition: 0.5, integral: 0.0,
+                  monotonicity: 0.0, bounds: 0.0, rate_regularization: 1.0e-4}
+      - name: "A3_PINN_PDE_integral"
+        architecture: "NaPINN-Q"
+        weights: {data: 1.0, pde: 0.5, initial_condition: 0.5, integral: 0.25,
+                  monotonicity: 0.0, bounds: 0.0, rate_regularization: 1.0e-4}
+      - name: "A4_Full_NaPINN_Q"
+        architecture: "NaPINN-Q"
+        weights: {data: 1.0, pde: 0.5, initial_condition: 0.5, integral: 0.25,
+                  monotonicity: 0.1, bounds: 0.1, rate_regularization: 1.0e-4}
+      - name: "A5_Discrete_State_Transition"
+        architecture: "NaPINN-Q"
+        weights: {data: 1.0, pde: 0.0, initial_condition: 0.5, integral: 0.0,
+                  monotonicity: 0.1, bounds: 0.1, rate_regularization: 1.0e-4,
+                  discrete_state_transition: 0.5}
