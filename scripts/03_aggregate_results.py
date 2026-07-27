@@ -26,9 +26,18 @@ from src.evaluation.report import (
 from src.io.loaders import load_config
 
 
+def _results_dir(cfg: dict) -> Path:
+    base = Path(cfg["paths"]["artifacts"]) / "results"
+    subdir = (cfg.get("experiment") or {}).get("results_subdir") or ""
+    subdir = str(subdir).strip()
+    return base / subdir if subdir else base
+
+
 def main() -> None:
     cfg = load_config()
-    results_dir = Path(cfg["paths"]["artifacts"]) / "results"
+    results_dir = _results_dir(cfg)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[agg] results directory: {results_dir}", flush=True)
     for optional_name in (
         "development_cv_model_ranking.csv", "feature_selection_frequency.csv",
         "feature_importance_raw.csv", "feature_importance_summary.csv",
@@ -38,6 +47,20 @@ def main() -> None:
     raw_results = pd.read_csv(results_dir / "raw_results.csv")
     print(f"[agg] loaded {len(raw_results):,} result rows in {perf_counter() - t0:.1f}s",
           flush=True)
+
+    allowlist = list(
+        ((cfg.get("models") or {}).get("enabled_regressors") or [])
+    ) + list(
+        ((cfg.get("models") or {}).get("enabled_classifiers") or [])
+    )
+    if allowlist and not raw_results.empty:
+        present = set(raw_results["model"].astype(str).unique())
+        extra = sorted(present - set(allowlist))
+        if extra:
+            raise SystemExit(
+                f"raw_results.csv contains models outside the allowlist: {extra}. "
+                f"Expected only: {allowlist}"
+            )
 
     t0 = _log_stage("aggregating fold metrics...")
     agg = aggregate(results_dir / "raw_results.csv")

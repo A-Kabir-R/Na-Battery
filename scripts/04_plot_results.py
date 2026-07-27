@@ -396,10 +396,18 @@ def _dataset_plots(artifacts: Path, out: Path, formats: list[str], dpi: int) -> 
             _save(out, f"degradation_{column}_by_condition", formats, dpi)
 
 
+def _results_dir(cfg: dict) -> Path:
+    base = Path(cfg["paths"]["artifacts"]) / "results"
+    subdir = (cfg.get("experiment") or {}).get("results_subdir") or ""
+    subdir = str(subdir).strip()
+    return base / subdir if subdir else base
+
+
 def main() -> None:
     cfg = load_config()
     artifacts = Path(cfg["paths"]["artifacts"])
-    results = artifacts / "results"
+    results = _results_dir(cfg)
+    print(f"[plot] results directory: {results}", flush=True)
     out = results / "plots"
     out.mkdir(parents=True, exist_ok=True)
     plotting = cfg.get("plotting", {})

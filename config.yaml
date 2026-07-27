@@ -95,3 +95,21 @@ plotting:
 experiment:
   parallel_workers: 6
   cache_features: true
+  # Isolate this run's aggregated tables/plots from historical outputs written
+  # under artifacts/results/. Set to "" or null to write directly to the base
+  # artifacts/results/ directory. The subdir is created lazily.
+  results_subdir: "extratrees_preprocessing_selection"
+  # Prevent nested parallelism: when parallel_workers > 1, models that expose
+  # n_jobs (ExtraTrees, RandomForest, XGBoost, ...) are forced to this value
+  # so that thread counts do not multiply across the outer joblib pool.
+  model_n_jobs: 1
+
+# Central regressor allowlist. Only names listed here are executed by
+# scripts/02_run_all_experiments.py; every other regressor implementation
+# remains in src/models/regressors.py for later experiments. The order is
+# preserved for reproducibility of the startup banner and the raw results.
+models:
+  enabled_regressors:
+    - DummyMean
+    - PreviousRPT
+    - ExtraTrees

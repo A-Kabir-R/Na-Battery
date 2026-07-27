@@ -1,9 +1,11 @@
 """Run every (preprocessing × target × model) combination on GroupKFold splits.
 
-Writes long-format results to artifacts/results/raw_results.csv.
+Writes long-format results to the configured results directory
+(``artifacts/results/[experiment.results_subdir/]raw_results.csv``).
 """
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from itertools import product
@@ -17,7 +19,7 @@ from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 
 from src.io.loaders import load_config
-from src.models.registry import classifiers, regressors
+from src.models.registry import enabled_classifiers, enabled_regressors
 from src.pipeline.run_experiment import (CLASSIFICATION_TARGETS,
                                           REGRESSION_TARGETS, run_one)
 from src.splits.group_kfold import (
@@ -36,14 +38,60 @@ def _load_pipeline(name: str, features_dir: Path) -> pd.DataFrame:
     return pd.read_parquet(p)
 
 
+def _results_dir(cfg: dict) -> Path:
+    base = Path(cfg["paths"]["artifacts"]) / "results"
+    subdir = (cfg.get("experiment") or {}).get("results_subdir") or ""
+    subdir = str(subdir).strip()
+    return base / subdir if subdir else base
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="List the planned (preprocessing, target, model) combinations without fitting.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = _parse_args()
     cfg = load_config()
     features_dir = Path(cfg["paths"]["artifacts"]) / "features"
-    results_dir = Path(cfg["paths"]["artifacts"]) / "results"
+    results_dir = _results_dir(cfg)
     results_dir.mkdir(parents=True, exist_ok=True)
     n_splits = cfg["split"]["n_splits"]
     rs = cfg["split"]["random_state"]
-    workers = cfg["experiment"]["parallel_workers"]
+    workers = int(cfg["experiment"]["parallel_workers"])
+    model_n_jobs = (cfg.get("experiment") or {}).get("model_n_jobs")
+    if model_n_jobs is not None:
+        model_n_jobs = int(model_n_jobs)
+
+    reg_models = enabled_regressors(cfg, model_n_jobs=model_n_jobs)
+    clf_models = enabled_classifiers(cfg, model_n_jobs=model_n_jobs) if CLF_TARGETS else {}
+
+    reg_names = list(reg_models.keys())
+    clf_names = list(clf_models.keys())
+    expected_reg_combos = len(PIPELINES) * len(REG_TARGETS) * len(reg_names)
+    expected_clf_combos = len(PIPELINES) * len(CLF_TARGETS) * len(clf_names)
+
+    print(f"[run] enabled regressors: {', '.join(reg_names)}", flush=True)
+    if clf_names:
+        print(f"[run] enabled classifiers: {', '.join(clf_names)}", flush=True)
+    print(f"[run] preprocessing pipelines: {', '.join(PIPELINES)}", flush=True)
+    print(f"[run] regression targets: {len(REG_TARGETS)}", flush=True)
+    print(f"[run] expected experiment combinations: {expected_reg_combos + expected_clf_combos}",
+          flush=True)
+    print(f"[run] results directory: {results_dir}", flush=True)
+    print(f"[run] outer workers: {workers}  |  model n_jobs: {model_n_jobs}", flush=True)
+
+    if args.dry_run:
+        print("[run] --dry-run: listing planned combinations only", flush=True)
+        for pipe, target, name in product(PIPELINES, REG_TARGETS, reg_names):
+            print(f"[run]   {pipe:>3} | {target:>25} | {name}", flush=True)
+        for pipe, target, name in product(PIPELINES, CLF_TARGETS, clf_names):
+            print(f"[run]   {pipe:>3} | {target:>25} | {name}", flush=True)
+        return
 
     reference = _load_pipeline("p2", features_dir)
     primary_target = REG_TARGETS[0]
@@ -83,9 +131,6 @@ def main() -> None:
         f"cv_folds={n_splits}"
     )
 
-    reg_models = regressors()
-    clf_models = classifiers()
-
     all_rows = []
     total_t = time.time()
 
@@ -111,23 +156,25 @@ def main() -> None:
                        f"{len(rows):3d} rows | {time.time()-t0:5.1f}s")
             return rows
 
-        with tqdm_joblib(tqdm(total=len(reg_jobs),
-                              desc=f"[run] {pipe} regressors", unit="fit")):
-            res = Parallel(n_jobs=workers, backend="loky")(
-                delayed(_job)(pipe, t, n, m, "regression")
-                for t, (n, m) in reg_jobs
-            )
-        for r in res:
-            all_rows.extend(r)
+        if reg_jobs:
+            with tqdm_joblib(tqdm(total=len(reg_jobs),
+                                  desc=f"[run] {pipe} regressors", unit="fit")):
+                res = Parallel(n_jobs=workers, backend="loky")(
+                    delayed(_job)(pipe, t, n, m, "regression")
+                    for t, (n, m) in reg_jobs
+                )
+            for r in res:
+                all_rows.extend(r)
 
-        with tqdm_joblib(tqdm(total=len(clf_jobs),
-                              desc=f"[run] {pipe} classifiers", unit="fit")):
-            res = Parallel(n_jobs=workers, backend="loky")(
-                delayed(_job)(pipe, t, n, m, "classification")
-                for t, (n, m) in clf_jobs
-            )
-        for r in res:
-            all_rows.extend(r)
+        if clf_jobs:
+            with tqdm_joblib(tqdm(total=len(clf_jobs),
+                                  desc=f"[run] {pipe} classifiers", unit="fit")):
+                res = Parallel(n_jobs=workers, backend="loky")(
+                    delayed(_job)(pipe, t, n, m, "classification")
+                    for t, (n, m) in clf_jobs
+                )
+            for r in res:
+                all_rows.extend(r)
     outer.close()
 
     raw = pd.DataFrame(all_rows)
@@ -136,6 +183,16 @@ def main() -> None:
     raw.to_csv(temporary, index=False)
     temporary.replace(out)
     print(f"[run] wrote {out} ({len(raw)} rows) in {time.time()-total_t:.1f}s")
+
+    if not raw.empty:
+        present = set(raw["model"].astype(str).unique())
+        allowed = set(reg_names) | set(clf_names)
+        unexpected = sorted(present - allowed)
+        if unexpected:
+            raise SystemExit(
+                f"raw_results.csv contains models outside the allowlist: {unexpected}"
+            )
+
     failed = raw[raw["status"].ne("completed")] if not raw.empty else raw
     if raw.empty or not failed.empty:
         if not failed.empty:
