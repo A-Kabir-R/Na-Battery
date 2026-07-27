@@ -147,15 +147,37 @@ pinn:
     fallback_coordinate: "cumulative_Ah_throughput"
     allow_elapsed_time_fallback: true
     time_fallback_column: "cycle_end_time_s"
+    # Retrospective block-to-RPT task: Δs is exposure accumulated during the
+    # current (already completed) CYC block, so the horizon is always known.
     require_known_forecast_horizon: true
     epsilon: 1.0e-6
+
+  audit:
+    # If false, any feature column not on the causal allow-list (or matching a
+    # known-causal name prefix) is rejected at dataset-build time with an
+    # explicit reason. Set true only when you have manually vetted the
+    # preprocessing pipeline for temporal safety.
+    allow_unaudited: false
+    # Fixed seed for the inner (early-stopping) split; must NOT be the training
+    # seed so that seed variability isolates neural stochasticity rather than
+    # also changing the inner-validation cell composition.
+    inner_split_seed: 20240117
 
   model:
     solution_hidden_dims: [64, 64, 32]
     rate_hidden_dims: [32, 16]
+    # DNN-Q shares SolutionNet architecture but has no rate head; widening
+    # brings its trainable parameter count into rough parity with the full
+    # NaPINN-Q (Stage 2 diagnosis fix #11).
+    dnn_solution_hidden_dims: [80, 80, 40]
     solution_activation: "tanh"
     rate_activation: "tanh"
     rate_output_activation: "softplus"
+    # When true, the rate network receives u_hat as an input. Setting false
+    # produces the constrained-rate variant used in ablation A6, which
+    # prevents H = du/ds + r ≈ 0 from being satisfied tautologically
+    # (Stage 2 diagnosis fix #14).
+    rate_uses_u_hat: true
     maximum_parameters: 50000
 
   collocation:
@@ -254,3 +276,8 @@ pinn:
         weights: {data: 1.0, pde: 0.0, initial_condition: 0.5, integral: 0.0,
                   monotonicity: 0.1, bounds: 0.1, rate_regularization: 1.0e-4,
                   discrete_state_transition: 0.5}
+      - name: "A6_Constrained_Rate_No_UHat"
+        architecture: "NaPINN-Q"
+        rate_uses_u_hat: false
+        weights: {data: 1.0, pde: 0.5, initial_condition: 0.5, integral: 0.25,
+                  monotonicity: 0.1, bounds: 0.1, rate_regularization: 1.0e-4}

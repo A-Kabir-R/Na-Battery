@@ -29,7 +29,7 @@ from src.pinn.logging_utils import (  # noqa: E402
     get_logger, log_config_snapshot, log_dataset_summary, log_event, log_failure,
 )
 from src.pinn.losses import LossWeights  # noqa: E402
-from src.pinn.trainer import FoldPaths, TrainerConfig, train_fold  # noqa: E402
+from src.pinn.trainer import FoldPaths, FoldTrainingError, TrainerConfig, train_fold  # noqa: E402
 from src.pinn.utils import (  # noqa: E402
     atomic_write_csv, atomic_write_json, git_commit, resolve_device,
 )
@@ -51,6 +51,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-epochs", type=int, default=None)
     parser.add_argument("--device", type=str, default=None,
                         choices=["cpu", "cuda"])
+    parser.add_argument("--allow-partial", action="store_true",
+                        help="Exit 0 even if some runs failed (default: exit 2 on any failure).")
     return parser.parse_args()
 
 
@@ -81,7 +83,15 @@ def main() -> None:
     args = _parse_args()
     cfg = load_config()
     pinn_cfg = cfg["pinn"]
-    device = resolve_device(args.device or ("cuda" if pinn_cfg["training"].get("use_amp") else "cpu"))
+    # Device selection is independent of AMP (Stage 3 diagnosis fix #20).
+    # Priority: --device flag > SIB_DEVICE env var > "cuda" (with graceful
+    # cpu fallback). If --device cuda is passed explicitly, refuse silent
+    # cpu fallback so a GPU smoke test cannot accidentally succeed on cpu.
+    import os as _os
+    device_request = args.device or _os.environ.get("SIB_DEVICE")
+    device = resolve_device(device_request)
+    if args.device == "cuda" and device != "cuda":
+        raise SystemExit("--device cuda requested but CUDA is not available")
     results_dir = _results_dir(cfg)
     results_dir.mkdir(parents=True, exist_ok=True)
     (results_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
@@ -156,6 +166,7 @@ def main() -> None:
             frame = pd.read_parquet(features_dir / f"{prep}.parquet")
             dataset = build_anchor_dataset(
                 frame, preprocessing=prep, stress_cfg=pinn_cfg["stress"],
+                audit_cfg=pinn_cfg.get("audit"),
                 audit_path=results_dir / f"temporal_feature_audit_{prep}.csv",
             )
             attached = apply_split_manifest(dataset.frame, split_manifest)
@@ -181,9 +192,14 @@ def main() -> None:
                 quadrature_nodes=int(pinn_cfg["quadrature"]["nodes"]),
                 solution_hidden_dims=tuple(int(h) for h in pinn_cfg["model"]["solution_hidden_dims"]),
                 rate_hidden_dims=tuple(int(h) for h in pinn_cfg["model"]["rate_hidden_dims"]),
+                dnn_solution_hidden_dims=tuple(int(h) for h in pinn_cfg["model"].get(
+                    "dnn_solution_hidden_dims", pinn_cfg["model"]["solution_hidden_dims"])),
                 solution_activation=str(pinn_cfg["model"]["solution_activation"]),
                 rate_activation=str(pinn_cfg["model"]["rate_activation"]),
+                rate_uses_u_hat=bool(pinn_cfg["model"].get("rate_uses_u_hat", True)),
                 maximum_parameters=int(pinn_cfg["model"]["maximum_parameters"]),
+                inner_split_seed=int(pinn_cfg.get("audit", {}).get(
+                    "inner_split_seed", 20240117)),
                 log_every_epochs=int(pinn_cfg["logging"]["log_every_epochs"]),
                 save_checkpoint_every_epochs=int(pinn_cfg["logging"]["save_checkpoint_every_epochs"]),
                 log_gpu_memory=bool(pinn_cfg["logging"]["log_gpu_memory"]),
@@ -213,7 +229,7 @@ def main() -> None:
                 "run_dir": str(run_dir),
                 "git_commit": git_commit(HERE.parent),
             })
-        except Exception as exc:  # pragma: no cover
+        except (FoldTrainingError, Exception) as exc:  # pragma: no cover
             failed_rows.append({
                 "architecture": arch, "preprocessing": prep, "fold": fold, "seed": seed,
                 "error_type": type(exc).__name__,
@@ -221,6 +237,16 @@ def main() -> None:
                 "run_dir": str(run_dir),
                 "git_commit": git_commit(HERE.parent),
                 "timestamp": time.time(),
+            })
+            manifest_rows.append({
+                "architecture": arch, "preprocessing": prep, "fold": fold, "seed": seed,
+                "status": "failed",
+                "best_epoch": -1,
+                "best_validation_mae": float("nan"),
+                "trainable_parameters": 0,
+                "predictions_path": "",
+                "run_dir": str(run_dir),
+                "git_commit": git_commit(HERE.parent),
             })
             tqdm.write(f"[pinn] FAILED {arch}|{prep}|f{fold}|s{seed}: {exc}")
             log_failure(logger, "run_failed", exc,
@@ -239,11 +265,19 @@ def main() -> None:
     print(f"[pinn] wrote experiment manifest: {len(manifest_df)} rows")
     print(f"[pinn] failed runs: {len(failed_rows)}")
     print(f"[pinn] elapsed: {time.time() - total_start:.1f}s")
+    completed_count = int((manifest_df["status"] == "completed").sum()) if not manifest_df.empty else 0
     log_event(logger, logging.INFO, "script_complete",
               total_runs=len(plan),
-              completed=int((manifest_df["status"] == "completed").sum()) if not manifest_df.empty else 0,
+              completed=completed_count,
               failed=len(failed_rows),
               elapsed_seconds=time.time() - total_start)
+
+    # Exit non-zero when any run failed so the pipeline halts before
+    # aggregation contaminates results (Stage 4 diagnosis fix #32).
+    if failed_rows and not args.allow_partial:
+        print(f"[pinn] exiting non-zero: {len(failed_rows)} failed run(s); "
+              f"pass --allow-partial to proceed anyway")
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

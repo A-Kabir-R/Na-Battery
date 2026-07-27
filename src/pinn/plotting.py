@@ -3,12 +3,23 @@
 Every plot is written as PNG (300 dpi) plus PDF. Missing data raises a warning
 but does not crash the pipeline — combined reports must remain resilient to
 partial runs.
+
+Stage-4 diagnosis fixes applied here:
+
+* Performance figures (parity, residuals, per-cell trajectories, degradation
+  rate, PDE residual) filter to ``evaluation_role == "outer_validation"``
+  by default (issues #26, #27).
+* Per-cell trajectories use ``stress_target`` as the x-coordinate — the
+  target-time coordinate — rather than ``stress_current`` (issue #26).
+* Seed-stability boxplot restricts to a single target, aggregation and
+  evaluation role so one scalar per seed is compared (issue #28).
+* Ablation bar aggregates per-ablation before plotting to survive duplicate
+  index labels from multi-fold / multi-seed rows (issue #29).
 """
 from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from typing import Iterable
 
 import matplotlib
 
@@ -19,6 +30,7 @@ import pandas as pd  # noqa: E402
 
 
 FORMATS = ("png", "pdf")
+DEFAULT_ROLE = "outer_validation"
 
 
 def _save(fig, path: Path) -> None:
@@ -30,6 +42,12 @@ def _save(fig, path: Path) -> None:
 
 def _skip(name: str, reason: str) -> None:
     warnings.warn(f"[pinn.plot] skipping {name}: {reason}", RuntimeWarning)
+
+
+def _outer_only(predictions: pd.DataFrame) -> pd.DataFrame:
+    if "evaluation_role" not in predictions.columns:
+        return predictions
+    return predictions[predictions["evaluation_role"].astype(str).eq(DEFAULT_ROLE)]
 
 
 def _epoch_curve(epoch_log: pd.DataFrame, y_column: str, title: str, path: Path,
@@ -71,6 +89,7 @@ def plot_epoch_curves(epoch_log: pd.DataFrame, output_dir: Path) -> None:
         ("validation_R2", "Inner-validation R²", False),
         ("learning_rate", "Learning rate", True),
         ("gradient_norm_total", "Total gradient norm", True),
+        ("gradient_norm_pde", "PDE-component gradient norm", True),
         ("GPU_memory_allocated_MB", "GPU memory allocated (MB)", False),
     ]:
         _epoch_curve(epoch_log, column, title, output_dir / f"epoch_{column}", log_y=log_y)
@@ -78,39 +97,45 @@ def plot_epoch_curves(epoch_log: pd.DataFrame, output_dir: Path) -> None:
 
 def plot_predicted_vs_true(predictions: pd.DataFrame, output_dir: Path) -> None:
     output_dir = Path(output_dir)
+    subset_all = _outer_only(predictions)
     for target, true_col, pred_col in [
         ("capacity", "true_next_Q_Ah", "predicted_next_Q_Ah"),
         ("soh", "true_next_SOH_pct", "predicted_next_SOH_pct"),
     ]:
-        if predictions.empty or true_col not in predictions.columns:
-            _skip(f"pred_vs_true_{target}", "columns missing"); continue
+        if subset_all.empty or true_col not in subset_all.columns:
+            _skip(f"pred_vs_true_{target}", "columns missing or no outer rows"); continue
         fig, ax = plt.subplots(figsize=(5, 5))
-        mask = predictions["evaluation_role"].astype(str).eq("outer_validation")
-        subset = predictions[mask]
-        ax.scatter(subset[true_col], subset[pred_col], s=6, alpha=0.5)
-        lo = float(min(subset[true_col].min(), subset[pred_col].min()))
-        hi = float(max(subset[true_col].max(), subset[pred_col].max()))
-        ax.plot([lo, hi], [lo, hi], color="black", linestyle="--", linewidth=0.8)
+        ax.scatter(subset_all[true_col], subset_all[pred_col], s=6, alpha=0.5)
+        finite = np.isfinite(subset_all[true_col]) & np.isfinite(subset_all[pred_col])
+        if finite.any():
+            lo = float(min(subset_all[true_col][finite].min(),
+                           subset_all[pred_col][finite].min()))
+            hi = float(max(subset_all[true_col][finite].max(),
+                           subset_all[pred_col][finite].max()))
+            ax.plot([lo, hi], [lo, hi], color="black", linestyle="--", linewidth=0.8)
         ax.set_xlabel(true_col)
         ax.set_ylabel(pred_col)
-        ax.set_title(f"Predicted vs observed ({target})")
+        ax.set_title(f"Predicted vs observed ({target}, outer validation)")
         _save(fig, output_dir / f"predicted_vs_true_{target}")
 
 
 def plot_residual_distribution(predictions: pd.DataFrame, output_dir: Path) -> None:
     output_dir = Path(output_dir)
+    subset_all = _outer_only(predictions)
     for target, true_col, pred_col in [
         ("capacity", "true_next_Q_Ah", "predicted_next_Q_Ah"),
         ("soh", "true_next_SOH_pct", "predicted_next_SOH_pct"),
     ]:
-        if predictions.empty or true_col not in predictions.columns:
-            _skip(f"residual_{target}", "columns missing"); continue
-        residual = (predictions[pred_col] - predictions[true_col]).astype(float).dropna()
+        if subset_all.empty or true_col not in subset_all.columns:
+            _skip(f"residual_{target}", "columns missing or no outer rows"); continue
+        residual = (subset_all[pred_col] - subset_all[true_col]).astype(float).dropna()
+        if residual.empty:
+            _skip(f"residual_{target}", "no finite residuals"); continue
         fig, ax = plt.subplots(figsize=(6, 3.5))
         ax.hist(residual, bins=40, alpha=0.75)
         ax.set_xlabel(f"residual ({target})")
         ax.set_ylabel("count")
-        ax.set_title(f"Residual distribution ({target})")
+        ax.set_title(f"Residual distribution ({target}, outer validation)")
         _save(fig, output_dir / f"residual_hist_{target}")
 
 
@@ -118,58 +143,104 @@ def plot_per_cell_trajectories(predictions: pd.DataFrame, output_dir: Path,
                                 target_col: str = "predicted_next_Q_Ah",
                                 true_col: str = "true_next_Q_Ah") -> None:
     output_dir = Path(output_dir)
-    if predictions.empty or true_col not in predictions.columns:
-        _skip("per_cell_trajectories", "columns missing"); return
-    cells = sorted(predictions["cell_id"].astype(str).unique())
+    subset_all = _outer_only(predictions)
+    if subset_all.empty or true_col not in subset_all.columns:
+        _skip("per_cell_trajectories", "columns missing or no outer rows"); return
+    if "stress_target" not in subset_all.columns:
+        _skip("per_cell_trajectories", "stress_target column missing"); return
+    cells = sorted(subset_all["cell_id"].astype(str).unique())
     fig, ax = plt.subplots(figsize=(8, 5))
     for cell in cells[:30]:
-        sub = predictions[predictions["cell_id"].astype(str).eq(cell)].sort_values("stress_current")
-        ax.plot(sub["stress_current"], sub[true_col], color="black", alpha=0.4, linewidth=0.6)
-        ax.plot(sub["stress_current"], sub[target_col], color="tab:red", alpha=0.4, linewidth=0.6)
-    ax.set_xlabel("stress (physical units)")
+        sub = subset_all[subset_all["cell_id"].astype(str).eq(cell)].sort_values("stress_target")
+        ax.plot(sub["stress_target"], sub[true_col], color="black", alpha=0.4, linewidth=0.6)
+        ax.plot(sub["stress_target"], sub[target_col], color="tab:red", alpha=0.4, linewidth=0.6)
+    ax.set_xlabel("stress at target time (physical units)")
     ax.set_ylabel("capacity (Ah)")
-    ax.set_title("Per-cell observed (black) vs predicted (red) capacity")
+    ax.set_title("Per-cell observed (black) vs predicted (red) capacity, outer validation")
     _save(fig, output_dir / "per_cell_trajectories")
 
 
 def plot_degradation_rate(predictions: pd.DataFrame, output_dir: Path) -> None:
     output_dir = Path(output_dir)
-    if predictions.empty or "predicted_degradation_rate" not in predictions.columns:
-        _skip("degradation_rate", "columns missing"); return
-    fig, ax = plt.subplots(figsize=(6, 3.5))
-    ax.hist(predictions["predicted_degradation_rate"].astype(float).dropna(),
-            bins=50, alpha=0.75)
-    ax.set_xlabel("predicted effective degradation rate")
-    ax.set_ylabel("count")
-    ax.set_title("Predicted degradation-rate distribution")
-    _save(fig, output_dir / "degradation_rate_distribution")
+    subset_all = _outer_only(predictions)
+    for suffix, column, xlabel in [
+        ("normalized", "predicted_degradation_rate_normalized",
+         "predicted rate (normalized-stress units)"),
+        ("physical", "predicted_degradation_rate_physical",
+         "predicted rate (physical stress units)"),
+        # legacy fallback
+        ("legacy", "predicted_degradation_rate",
+         "predicted degradation rate"),
+    ]:
+        if subset_all.empty or column not in subset_all.columns:
+            continue
+        values = pd.to_numeric(subset_all[column], errors="coerce").dropna()
+        if values.empty:
+            continue
+        fig, ax = plt.subplots(figsize=(6, 3.5))
+        ax.hist(values, bins=50, alpha=0.75)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("count")
+        ax.set_title(f"Predicted degradation-rate distribution ({suffix})")
+        _save(fig, output_dir / f"degradation_rate_distribution_{suffix}")
 
 
 def plot_pde_residual(predictions: pd.DataFrame, output_dir: Path) -> None:
     output_dir = Path(output_dir)
-    if predictions.empty or "pde_residual" not in predictions.columns:
-        _skip("pde_residual", "columns missing"); return
-    fig, ax = plt.subplots(figsize=(6, 3.5))
-    ax.hist(predictions["pde_residual"].astype(float).dropna(), bins=50, alpha=0.75)
-    ax.set_xlabel("PDE residual (du/ds + r)")
-    ax.set_ylabel("count")
-    ax.set_title("Governing-equation residual distribution")
-    _save(fig, output_dir / "pde_residual_distribution")
+    subset_all = _outer_only(predictions)
+    for suffix, column, xlabel in [
+        ("normalized", "pde_residual_normalized",
+         "PDE residual (normalized-stress units)"),
+        ("physical", "pde_residual_physical",
+         "PDE residual (physical stress units)"),
+        ("legacy", "pde_residual", "PDE residual (du/ds + r)"),
+    ]:
+        if subset_all.empty or column not in subset_all.columns:
+            continue
+        values = pd.to_numeric(subset_all[column], errors="coerce").dropna()
+        if values.empty:
+            continue
+        fig, ax = plt.subplots(figsize=(6, 3.5))
+        ax.hist(values, bins=50, alpha=0.75)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("count")
+        ax.set_title(f"Governing-equation residual distribution ({suffix})")
+        _save(fig, output_dir / f"pde_residual_distribution_{suffix}")
 
 
 def plot_ablation_bar(ablation_metrics: pd.DataFrame, output_dir: Path,
                       metric: str = "MAE") -> None:
+    """Per-ablation mean of a scalar metric.
+
+    Aggregates across folds and seeds *before* plotting so that duplicate
+    index labels (multiple rows per ablation) cannot break the reindex step.
+    Restricts to ``target == 'next_rpt_Q_Ah'``, ``aggregation == 'cell_macro'``
+    and ``evaluation_role == 'outer_validation'`` when those columns exist.
+    """
     output_dir = Path(output_dir)
     if ablation_metrics.empty or metric not in ablation_metrics.columns:
         _skip("ablation_bar", "columns missing"); return
-    subset = ablation_metrics[ablation_metrics["target"] == "next_rpt_Q_Ah"]
+    subset = ablation_metrics
+    if "target" in subset.columns:
+        subset = subset[subset["target"] == "next_rpt_Q_Ah"]
+    if "aggregation" in subset.columns:
+        subset = subset[subset["aggregation"].astype(str).isin({"cell_macro", ""})]
+    if "evaluation_role" in subset.columns:
+        subset = subset[subset["evaluation_role"].astype(str).isin({DEFAULT_ROLE, ""})]
     if subset.empty:
-        _skip("ablation_bar", "no rows"); return
+        _skip("ablation_bar", "no rows after filters"); return
+    if "ablation" not in subset.columns:
+        _skip("ablation_bar", "no ablation column"); return
+    summary = (
+        subset.groupby("ablation", as_index=False, dropna=False)[metric]
+        .mean()
+        .sort_values(metric)
+    )
+    if summary.empty:
+        _skip("ablation_bar", "empty summary"); return
     fig, ax = plt.subplots(figsize=(7, 4))
-    order = subset.sort_values(metric)["ablation"].tolist()
-    values = subset.set_index("ablation").reindex(order)[metric]
-    ax.bar(order, values)
-    ax.set_ylabel(metric)
+    ax.bar(summary["ablation"].astype(str), summary[metric])
+    ax.set_ylabel(f"mean {metric} (outer validation, cell macro)")
     ax.set_title(f"Physics ablation ({metric})")
     plt.xticks(rotation=30, ha="right")
     _save(fig, output_dir / f"ablation_{metric.lower()}")
@@ -180,25 +251,74 @@ def plot_seed_stability(target_metrics: pd.DataFrame, output_dir: Path,
     output_dir = Path(output_dir)
     if target_metrics.empty or "seed" not in target_metrics.columns:
         _skip("seed_stability", "column missing"); return
-    subset = target_metrics[target_metrics["target"] == "next_rpt_Q_Ah"]
+    subset = target_metrics
+    if "target" in subset.columns:
+        subset = subset[subset["target"] == "next_rpt_Q_Ah"]
+    if "aggregation" in subset.columns:
+        subset = subset[subset["aggregation"].astype(str) == "cell_macro"]
+    if "evaluation_role" in subset.columns:
+        subset = subset[subset["evaluation_role"].astype(str) == DEFAULT_ROLE]
     if subset.empty:
-        return
+        _skip("seed_stability", "no rows after filters"); return
+    per_seed = subset.groupby(
+        ["architecture", "seed"], as_index=False, dropna=False
+    )[metric].mean()
     fig, ax = plt.subplots(figsize=(6, 4))
-    groups = [g[metric].dropna().to_numpy() for _, g in subset.groupby("architecture")]
-    labels = [name for name, _ in subset.groupby("architecture")]
+    groups = [g[metric].dropna().to_numpy() for _, g in per_seed.groupby("architecture")]
+    labels = [name for name, _ in per_seed.groupby("architecture")]
     if not groups:
         _skip("seed_stability", "no groups"); return
     ax.boxplot(groups, labels=labels)
-    ax.set_ylabel(metric)
-    ax.set_title(f"Seed / fold stability ({metric})")
+    ax.set_ylabel(f"{metric} (per-seed average across folds)")
+    ax.set_title(f"Seed stability ({metric}, outer validation, cell macro)")
     _save(fig, output_dir / f"seed_stability_{metric.lower()}")
+
+
+def plot_model_complexity(complexity: pd.DataFrame, output_dir: Path) -> None:
+    """Bar plot of trainable parameters by architecture (Stage 4 fix #11 dashboard)."""
+    output_dir = Path(output_dir)
+    if complexity.empty or "trainable_parameters" not in complexity.columns:
+        _skip("model_complexity", "columns missing"); return
+    summary = (
+        complexity.groupby("architecture", as_index=False, dropna=False)
+        ["trainable_parameters"].mean()
+        .sort_values("trainable_parameters", ascending=False)
+    )
+    if summary.empty:
+        _skip("model_complexity", "no rows"); return
+    fig, ax = plt.subplots(figsize=(5, 3.5))
+    ax.bar(summary["architecture"].astype(str), summary["trainable_parameters"])
+    ax.set_ylabel("trainable parameters (avg over folds/seeds)")
+    ax.set_title("Model complexity")
+    plt.xticks(rotation=15, ha="right")
+    _save(fig, output_dir / "model_complexity")
+
+
+def plot_pde_residual_vs_stress(predictions: pd.DataFrame, output_dir: Path) -> None:
+    """Scatter of PDE residual vs stress_target (Stage 4 fix #30)."""
+    output_dir = Path(output_dir)
+    subset_all = _outer_only(predictions)
+    column = "pde_residual_physical" if "pde_residual_physical" in subset_all.columns \
+        else ("pde_residual_normalized" if "pde_residual_normalized" in subset_all.columns
+              else "pde_residual")
+    if subset_all.empty or column not in subset_all.columns or "stress_target" not in subset_all.columns:
+        _skip("pde_residual_vs_stress", "columns missing"); return
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.scatter(subset_all["stress_target"], pd.to_numeric(subset_all[column], errors="coerce"),
+               s=6, alpha=0.4)
+    ax.axhline(0, color="black", linewidth=0.6)
+    ax.set_xlabel("stress at target time")
+    ax.set_ylabel(column)
+    ax.set_title("PDE residual vs stress (outer validation)")
+    _save(fig, output_dir / "pde_residual_vs_stress")
 
 
 def render_all_pinn_plots(*, epoch_log: pd.DataFrame,
                           predictions: pd.DataFrame,
                           target_metrics: pd.DataFrame,
                           ablation_metrics: pd.DataFrame,
-                          output_dir: Path) -> None:
+                          output_dir: Path,
+                          complexity: pd.DataFrame | None = None) -> None:
     """Render every PINN plot into ``output_dir``."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -208,5 +328,8 @@ def render_all_pinn_plots(*, epoch_log: pd.DataFrame,
     plot_per_cell_trajectories(predictions, output_dir)
     plot_degradation_rate(predictions, output_dir)
     plot_pde_residual(predictions, output_dir)
+    plot_pde_residual_vs_stress(predictions, output_dir)
     plot_ablation_bar(ablation_metrics, output_dir)
     plot_seed_stability(target_metrics, output_dir)
+    if complexity is not None:
+        plot_model_complexity(complexity, output_dir)

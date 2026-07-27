@@ -3,12 +3,38 @@
 Implements the composite cell-balanced loss, physics-weight curriculum,
 autograd-based governing residual, unlabeled collocation points, checkpointing
 and resume, plus per-epoch physics + validation metrics.
+
+Stage-2/3 diagnosis fixes applied here:
+
+* :func:`_pde_gradient_norm` computes the PDE-component gradient contribution
+  via ``torch.autograd.grad`` (issue #7).
+* Training exceptions raise :class:`FoldTrainingError` so failed runs are
+  never written as ``status=completed`` (issue #8).
+* Prediction rows carry both normalized-coordinate and physical-coordinate
+  ``du/ds`` and ``predicted_degradation_rate`` (issue #9).
+* DNN-Q physics diagnostics (rate, PDE residual, integral consistency,
+  negative-rate fraction, IC error) are ``NaN`` rather than fake zeros
+  (issue #10).
+* :class:`FoldScaler` is fit on inner-training rows only, never on inner-
+  validation rows (issue #12).
+* Inner split is drawn from :attr:`TrainerConfig.inner_split_seed`, decoupled
+  from the model training seed (issue #13).
+* :class:`DNNQ` receives an independent ``dnn_solution_hidden_dims`` so it
+  can be widened to approximately match NaPINN-Q's trainable parameter count
+  (issue #11).
+* Checkpoints record ``next_epoch = epoch + 1`` and ``resume`` restarts from
+  that value, removing the off-by-one that trained the checkpointed epoch
+  twice (issue #17).
+* Completed-run reuse verifies the checkpoint, predictions and fingerprint
+  before returning early (issue #18).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
+import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -40,6 +66,10 @@ from .utils import (
 )
 
 
+class FoldTrainingError(RuntimeError):
+    """Raised when a fold cannot be completed. Prevents aggregation contamination."""
+
+
 @dataclass
 class TrainerConfig:
     architecture: str
@@ -55,7 +85,7 @@ class TrainerConfig:
     scheduler_patience: int = 60
     minimum_learning_rate: float = 1.0e-6
     gradient_clip_norm: float = 1.0
-    use_amp: bool = True
+    use_amp: bool = False
     physics_float32: bool = True
     curriculum_warmup_fraction: float = 0.10
     curriculum_ramp_end_fraction: float = 0.30
@@ -65,9 +95,12 @@ class TrainerConfig:
     quadrature_nodes: int = 8
     solution_hidden_dims: tuple[int, ...] = (64, 64, 32)
     rate_hidden_dims: tuple[int, ...] = (32, 16)
+    dnn_solution_hidden_dims: tuple[int, ...] = (80, 80, 40)
     solution_activation: str = "tanh"
     rate_activation: str = "tanh"
+    rate_uses_u_hat: bool = True
     maximum_parameters: int = 50000
+    inner_split_seed: int = 20240117
     log_every_epochs: int = 1
     save_checkpoint_every_epochs: int = 100
     log_gpu_memory: bool = True
@@ -136,8 +169,8 @@ class FoldPaths:
         return self.root / "predictions.parquet"
 
     @property
-    def collocation_predictions_path(self) -> Path:
-        return self.root / "collocation_predictions.parquet"
+    def fingerprint_path(self) -> Path:
+        return self.root / "run_fingerprint.json"
 
 
 def _tensor(values, device: str, dtype=torch.float32,
@@ -159,26 +192,36 @@ def _build_feature_matrix(dataset: AnchorDataset, frame: pd.DataFrame,
     scaled_features = scaler.transform_features(frame, dataset.feature_columns)
     horizon = scaler.transform_horizon(frame["stress_delta"].to_numpy(dtype=float))
     u_current = frame["u_current"].to_numpy(dtype=float)
-    # Feature vector: [horizon, u_current, scaled auxiliary features]
     return np.concatenate(
         [horizon[:, None], u_current[:, None], scaled_features], axis=1
     )
 
 
-def _forward_pinn(model: NaPINNQ, stress: torch.Tensor, features: torch.Tensor
-                  ) -> tuple[torch.Tensor, torch.Tensor]:
-    u_hat = model.solution(stress, features)
-    r_hat = model.rate(stress, features, u_hat)
-    return u_hat, r_hat
+def _pde_gradient_norm(component_loss: torch.Tensor,
+                       parameters: list[nn.Parameter]) -> float:
+    """Return ‖∂(PDE component)/∂θ‖₂ via ``torch.autograd.grad`` (issue #7).
 
-
-def _gradient_norm(parameters) -> float:
-    total = 0.0
-    for p in parameters:
-        if p.grad is None:
+    Uses ``retain_graph=True`` so the caller's subsequent ``total.backward()``
+    still succeeds. Returns 0.0 if the component is not differentiable w.r.t.
+    the model (e.g. when curriculum has scaled the PDE weight to zero).
+    """
+    if not component_loss.requires_grad:
+        return 0.0
+    try:
+        grads = torch.autograd.grad(
+            component_loss,
+            tuple(parameters),
+            retain_graph=True,
+            allow_unused=True,
+        )
+    except RuntimeError:
+        return 0.0
+    total_sq = 0.0
+    for g in grads:
+        if g is None:
             continue
-        total += float(p.grad.detach().pow(2).sum().item())
-    return float(total ** 0.5)
+        total_sq += float(g.detach().pow(2).sum().item())
+    return float(total_sq ** 0.5)
 
 
 def _init_optimizer(model: nn.Module, config: TrainerConfig
@@ -196,12 +239,18 @@ def _init_scheduler(optimizer: torch.optim.Optimizer, config: TrainerConfig):
 
 def _load_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer,
                      scheduler, paths: FoldPaths) -> dict[str, Any]:
-    state: dict[str, Any] = {"epoch": 0, "best_val": float("inf"),
+    state: dict[str, Any] = {"next_epoch": 0, "best_val": float("inf"),
                               "best_epoch": 0, "patience": 0}
     if paths.last_model.exists():
         payload = torch.load(paths.last_model, map_location="cpu", weights_only=False)
         model.load_state_dict(payload["model"])
-        state.update({k: payload.get(k, state[k]) for k in state})
+        for key in list(state.keys()):
+            if key in payload:
+                state[key] = payload[key]
+        # Backward-compat: earlier checkpoints stored ``epoch`` (== last-run
+        # epoch); translate to ``next_epoch`` so resume never trains it twice.
+        if "next_epoch" not in payload and "epoch" in payload:
+            state["next_epoch"] = int(payload["epoch"]) + 1
     if paths.optimizer_state.exists():
         optimizer.load_state_dict(torch.load(paths.optimizer_state, map_location="cpu",
                                              weights_only=False))
@@ -209,6 +258,24 @@ def _load_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer,
         scheduler.load_state_dict(torch.load(paths.scheduler_state, map_location="cpu",
                                              weights_only=False))
     return state
+
+
+def _compute_run_fingerprint(*, architecture: str, preprocessing: str,
+                              fold: int, seed: int,
+                              feature_columns: list[str],
+                              trainer_config: TrainerConfig,
+                              loss_weights: LossWeights) -> str:
+    payload = {
+        "architecture": architecture,
+        "preprocessing": preprocessing,
+        "fold": fold,
+        "seed": seed,
+        "feature_columns": list(feature_columns),
+        "trainer_config": asdict(trainer_config),
+        "loss_weights": asdict(loss_weights),
+    }
+    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 @dataclass
@@ -226,15 +293,18 @@ class FoldResult:
     error_message: str | None = None
     ablation_name: str | None = None
     epoch_log: list[dict[str, Any]] = field(default_factory=list)
+    fingerprint: str = ""
 
 
 def _prediction_frame(architecture: str, preprocessing: str, fold: int, seed: int,
                       evaluation_role: str, indices: np.ndarray,
                       dataset: AnchorDataset, frame: pd.DataFrame,
-                      predicted_u_next: np.ndarray, predicted_r: np.ndarray,
-                      du_ds: np.ndarray, pde_res: np.ndarray, ic_err: np.ndarray,
-                      integral_err: np.ndarray, mono_viol: np.ndarray,
-                      lower_viol: np.ndarray, upper_viol: np.ndarray,
+                      predicted_u_next: np.ndarray, predicted_r_norm: np.ndarray,
+                      du_ds_norm: np.ndarray, pde_res_norm: np.ndarray,
+                      ic_err: np.ndarray, integral_err: np.ndarray,
+                      mono_viol: np.ndarray, lower_viol: np.ndarray,
+                      upper_viol: np.ndarray, *,
+                      stress_std: float, is_pinn: bool,
                       ablation_name: str | None = None) -> pd.DataFrame:
     sub = frame.iloc[indices].reset_index(drop=True)
     q0 = sub[dataset.q0_column].to_numpy(dtype=float)
@@ -243,6 +313,22 @@ def _prediction_frame(architecture: str, preprocessing: str, fold: int, seed: in
     predicted_soh_next = 100.0 * predicted_u_next
     predicted_delta_q = predicted_q_next - q_current
     predicted_delta_soh = predicted_soh_next - (100.0 * q_current / q0)
+
+    # Physical-unit conversion (Stage 2 diagnosis fix #9).
+    stress_std = float(stress_std) if stress_std else 1.0
+    du_ds_physical = du_ds_norm / stress_std
+    pde_res_physical = pde_res_norm / stress_std
+    if is_pinn:
+        predicted_r_physical = predicted_r_norm / stress_std
+    else:
+        # DNN-Q reports NaN rate — no physics-informed rate exists.
+        predicted_r_norm = np.full_like(du_ds_norm, np.nan, dtype=float)
+        predicted_r_physical = predicted_r_norm.copy()
+        pde_res_norm = np.full_like(du_ds_norm, np.nan, dtype=float)
+        pde_res_physical = pde_res_norm.copy()
+        ic_err = np.full_like(du_ds_norm, np.nan, dtype=float)
+        integral_err = np.full_like(du_ds_norm, np.nan, dtype=float)
+
     frame_out = pd.DataFrame({
         "run_id": [run_fingerprint(architecture=architecture,
                                     preprocessing=preprocessing,
@@ -277,9 +363,15 @@ def _prediction_frame(architecture: str, preprocessing: str, fold: int, seed: in
         "predicted_delta_SOH_pct": predicted_delta_soh,
         "normalized_capacity_true": sub["u_true_next"].to_numpy(dtype=float),
         "normalized_capacity_predicted": predicted_u_next,
-        "predicted_degradation_rate": predicted_r,
-        "du_ds": du_ds,
-        "pde_residual": pde_res,
+        # Rate: both coordinates.
+        "predicted_degradation_rate_normalized": predicted_r_norm,
+        "predicted_degradation_rate_physical": predicted_r_physical,
+        # Derivative: both coordinates.
+        "du_dstress_normalized": du_ds_norm,
+        "du_dstress_physical": du_ds_physical,
+        # PDE residual: both coordinates.
+        "pde_residual_normalized": pde_res_norm,
+        "pde_residual_physical": pde_res_physical,
         "initial_condition_error": ic_err,
         "integral_consistency_error": integral_err,
         "monotonicity_violation": mono_viol,
@@ -322,9 +414,9 @@ def _evaluate(model, dataset: AnchorDataset, frame: pd.DataFrame,
     model.eval()
     with torch.enable_grad():
         if is_pinn:
-            u_next, r_next = _forward_pinn(model, stress_next, features)
+            u_next = model.solution(stress_next, features)
+            r_next = model.rate(stress_next, features, u_next)
             u_anchor = model.solution(stress_current, features)
-            r_anchor = model.rate(stress_current, features, u_anchor)
             du_next = autograd_du_ds(u_next, stress_next)
             residual = pde_residual(du_next, r_next)
             u_integrated = integral_transition(
@@ -334,18 +426,21 @@ def _evaluate(model, dataset: AnchorDataset, frame: pd.DataFrame,
         else:
             u_next = model(stress_next, features)
             u_anchor = model(stress_current, features)
-            r_next = torch.zeros_like(u_next)
-            r_anchor = torch.zeros_like(u_anchor)
+            r_next = torch.full_like(u_next, float("nan"))
             du_next = autograd_du_ds(u_next, stress_next)
-            residual = torch.zeros_like(u_next)
-            u_integrated = torch.zeros_like(u_next)
+            residual = torch.full_like(u_next, float("nan"))
+            u_integrated = torch.full_like(u_next, float("nan"))
 
     u_next_np = u_next.detach().cpu().numpy()
     r_next_np = r_next.detach().cpu().numpy()
     du_ds_np = du_next.detach().cpu().numpy()
     residual_np = residual.detach().cpu().numpy()
     ic_err_np = (u_anchor.detach().cpu().numpy() - u_current_np)
-    integral_err_np = (u_next_np - u_integrated.detach().cpu().numpy())
+    if is_pinn:
+        integral_err_np = (u_next_np - u_integrated.detach().cpu().numpy())
+    else:
+        integral_err_np = np.full_like(u_next_np, np.nan)
+        ic_err_np = np.full_like(u_next_np, np.nan)
     mono_viol_np = np.maximum(u_next_np - u_current_np - scaler.epsilon_rec, 0.0)
     lower_viol_np = np.maximum(0.0 - u_next_np, 0.0)
     upper_viol_np = np.maximum(u_next_np - scaler.u_max, 0.0)
@@ -363,6 +458,44 @@ def _evaluate(model, dataset: AnchorDataset, frame: pd.DataFrame,
     }
 
 
+def _try_reuse_completed_run(paths: FoldPaths, fingerprint: str,
+                              architecture: str, preprocessing: str,
+                              fold: int, seed: int,
+                              ablation_name: str | None) -> FoldResult | None:
+    """Return an existing FoldResult only when every artifact is present and
+    the fingerprint matches. Otherwise return None to force retraining.
+    """
+    if not paths.status_path.exists():
+        return None
+    try:
+        status = json.loads(paths.status_path.read_text())
+    except Exception:
+        return None
+    if status.get("status") != "completed":
+        return None
+    if not paths.best_model.exists() or not paths.predictions_path.exists():
+        return None
+    if not paths.fingerprint_path.exists():
+        return None
+    try:
+        recorded = json.loads(paths.fingerprint_path.read_text()).get("fingerprint")
+    except Exception:
+        return None
+    if recorded != fingerprint:
+        return None
+    return FoldResult(
+        architecture=architecture, preprocessing=preprocessing,
+        fold=fold, seed=seed,
+        trainable_parameters=int(status.get("trainable_parameters", 0)),
+        best_epoch=int(status.get("best_epoch", -1)),
+        best_validation_mae=float(status.get("best_validation_mae", np.nan)),
+        predictions_path=paths.predictions_path,
+        physics_metrics=status.get("physics_metrics", {}),
+        status="reused", ablation_name=ablation_name,
+        fingerprint=fingerprint,
+    )
+
+
 def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                config: TrainerConfig, fold_paths: FoldPaths,
                loss_weights: LossWeights, u_max_source: str,
@@ -377,46 +510,44 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                logger: logging.Logger | None = None) -> FoldResult:
     """Train one fold + seed for the requested architecture.
 
-    ``ablation_name`` is stored on prediction rows and status files for later
-    reporting. When ``include_discrete_transition`` is true, the A5 discrete
-    residual is added to the total loss.
+    Raises :class:`FoldTrainingError` on any training failure so that
+    aggregation cannot consume partial predictions from a failed run.
     """
     fold_paths.root.mkdir(parents=True, exist_ok=True)
     fold_paths.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     fold_paths.logs_dir.mkdir(parents=True, exist_ok=True)
     device = resolve_device(config.device)
 
-    # Skip completed runs unless --force.
-    if not force and fold_paths.status_path.exists():
-        try:
-            status = json.loads(fold_paths.status_path.read_text())
-            if status.get("status") == "completed":
-                return FoldResult(
-                    architecture=config.architecture,
-                    preprocessing=config.preprocessing,
-                    fold=config.fold, seed=config.seed,
-                    trainable_parameters=int(status.get("trainable_parameters", 0)),
-                    best_epoch=int(status.get("best_epoch", -1)),
-                    best_validation_mae=float(status.get("best_validation_mae", np.nan)),
-                    predictions_path=fold_paths.predictions_path,
-                    physics_metrics=status.get("physics_metrics", {}),
-                    status="reused", ablation_name=ablation_name,
-                )
-        except Exception:
-            pass
+    # Determine fingerprint early so completed-run reuse can validate it.
+    fingerprint = _compute_run_fingerprint(
+        architecture=config.architecture, preprocessing=config.preprocessing,
+        fold=config.fold, seed=config.seed,
+        feature_columns=dataset.feature_columns,
+        trainer_config=config, loss_weights=loss_weights,
+    )
+    if not force:
+        reused = _try_reuse_completed_run(
+            fold_paths, fingerprint,
+            architecture=config.architecture, preprocessing=config.preprocessing,
+            fold=config.fold, seed=config.seed, ablation_name=ablation_name,
+        )
+        if reused is not None:
+            return reused
 
     set_seeds(config.seed)
 
     outer_train_idx, outer_val_idx = fold_indices(frame, config.fold)
     outer_train_frame = frame.iloc[outer_train_idx].reset_index(drop=True)
     inner_train_local, inner_val_local = inner_split_indices(
-        outer_train_frame, seed=config.seed
+        outer_train_frame, seed=config.inner_split_seed,
     )
     inner_train_idx = outer_train_idx[inner_train_local]
     inner_val_idx = outer_train_idx[inner_val_local]
 
+    # Fit scaler on INNER TRAIN ONLY (issue #12).
+    inner_train_frame = frame.iloc[inner_train_idx].reset_index(drop=True)
     scaler = FoldScaler().fit(
-        outer_train_frame, dataset.feature_columns,
+        inner_train_frame, dataset.feature_columns,
         u_max_source=u_max_source, u_max_constant=u_max_constant,
         u_max_margin=u_max_margin, tolerance_source=tolerance_source,
         tolerance_constant=tolerance_constant, tolerance_quantile=tolerance_quantile,
@@ -433,14 +564,14 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             inner_val_cells=int(frame.iloc[inner_val_idx]["cell"].nunique()),
             n_rows_train=int(inner_train_idx.size),
             n_rows_val=int(inner_val_idx.size),
-            trainable_parameters=0,  # updated after model construction
+            trainable_parameters=0,
             u_max=float(scaler.u_max),
             epsilon_rec=float(scaler.epsilon_rec),
             device=device,
         )
 
     is_pinn = config.architecture == "NaPINN-Q"
-    feature_dim = 2 + len(dataset.feature_columns)  # horizon + u_current + aux
+    feature_dim = 2 + len(scaler.feature_columns_used or [])
     if is_pinn:
         model = NaPINNQ(
             feature_dim=feature_dim,
@@ -448,17 +579,18 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             rate_hidden_dims=config.rate_hidden_dims,
             solution_activation=config.solution_activation,
             rate_activation=config.rate_activation,
+            rate_uses_u_hat=config.rate_uses_u_hat,
         )
     elif config.architecture == "DNN-Q":
         model = DNNQ(feature_dim=feature_dim,
-                     solution_hidden_dims=config.solution_hidden_dims,
+                     hidden_dims=config.dnn_solution_hidden_dims,
                      solution_activation=config.solution_activation)
     else:
-        raise ValueError(f"unknown architecture: {config.architecture}")
+        raise FoldTrainingError(f"unknown architecture: {config.architecture}")
 
     trainable_parameters = count_parameters(model)
     if trainable_parameters > config.maximum_parameters:
-        raise ValueError(
+        raise FoldTrainingError(
             f"model has {trainable_parameters} params exceeding the cap "
             f"{config.maximum_parameters}"
         )
@@ -475,7 +607,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
     optimizer = _init_optimizer(model, config)
     scheduler = _init_scheduler(optimizer, config)
     checkpoint_state = _load_checkpoint(model, optimizer, scheduler, fold_paths) if resume else {
-        "epoch": 0, "best_val": float("inf"), "best_epoch": 0, "patience": 0
+        "next_epoch": 0, "best_val": float("inf"), "best_epoch": 0, "patience": 0
     }
     curriculum = CurriculumSchedule(
         max_epochs=config.max_epochs,
@@ -483,8 +615,8 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
         ramp_end_fraction=config.curriculum_ramp_end_fraction,
     )
 
-    # Build training tensors once (all outer-training rows). Inner train/val
-    # are sub-selections by boolean masks.
+    # Build training tensors on the outer-training rows (inner train/val are
+    # boolean sub-selections).
     training_frame = frame.iloc[outer_train_idx].reset_index(drop=True)
     features_np = _build_feature_matrix(dataset, training_frame, scaler)
     stress_current_np = scaler.transform_stress(training_frame["stress_current"].to_numpy(dtype=float))
@@ -508,6 +640,37 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
     generator = torch.Generator(device=device if device == "cpu" else "cpu")
     generator.manual_seed(config.seed)
 
+    manifest = {
+        "architecture": config.architecture,
+        "preprocessing": config.preprocessing,
+        "fold": config.fold,
+        "seed": config.seed,
+        "device": device,
+        "feature_dim": feature_dim,
+        "feature_columns": scaler.feature_columns_used,
+        "dropped_all_nan_feature_columns": scaler.dropped_all_nan_columns,
+        "cell_map": cell_map,
+        "trainable_parameters": trainable_parameters,
+        "loss_weights": asdict(loss_weights),
+        "ablation": ablation_name or "",
+        "trainer_config": asdict(config),
+        "fingerprint": fingerprint,
+    }
+    atomic_write_json(manifest, fold_paths.manifest_path)
+    atomic_write_json(scaler.state_dict(), fold_paths.scaler_path)
+    dataset.audit.to_csv(fold_paths.audit_subset, index=False)
+    atomic_write_json({"seed": config.seed, "architecture": config.architecture,
+                       "preprocessing": config.preprocessing}, fold_paths.config_snapshot)
+    atomic_write_json({"fingerprint": fingerprint}, fold_paths.fingerprint_path)
+
+    # Clear stale status while training so a crash doesn't leave a claim of
+    # "completed" behind (issue #8, defensive).
+    if fold_paths.status_path.exists():
+        try:
+            fold_paths.status_path.unlink()
+        except OSError:
+            pass
+
     if dry_run:
         return FoldResult(
             architecture=config.architecture, preprocessing=config.preprocessing,
@@ -516,37 +679,17 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             best_epoch=-1, best_validation_mae=float("nan"),
             predictions_path=fold_paths.predictions_path,
             physics_metrics={}, status="dry_run", ablation_name=ablation_name,
+            fingerprint=fingerprint,
         )
 
     best_val = float(checkpoint_state.get("best_val", float("inf")))
     best_epoch = int(checkpoint_state.get("best_epoch", 0))
     patience = int(checkpoint_state.get("patience", 0))
-    start_epoch = int(checkpoint_state.get("epoch", 0))
-
-    manifest = {
-        "architecture": config.architecture,
-        "preprocessing": config.preprocessing,
-        "fold": config.fold,
-        "seed": config.seed,
-        "device": device,
-        "feature_dim": feature_dim,
-        "feature_columns": dataset.feature_columns,
-        "cell_map": cell_map,
-        "trainable_parameters": trainable_parameters,
-        "loss_weights": asdict(loss_weights),
-        "ablation": ablation_name or "",
-        "trainer_config": asdict(config),
-    }
-    atomic_write_json(manifest, fold_paths.manifest_path)
-    atomic_write_json(scaler.state_dict(), fold_paths.scaler_path)
-    dataset.audit.to_csv(fold_paths.audit_subset, index=False)
-    atomic_write_json({"seed": config.seed, "architecture": config.architecture,
-                       "preprocessing": config.preprocessing}, fold_paths.config_snapshot)
+    start_epoch = int(checkpoint_state.get("next_epoch", 0))
 
     tag = f"[{config.architecture} | {config.preprocessing} | fold {config.fold} | seed {config.seed}]"
     bar = tqdm(range(start_epoch, config.max_epochs), desc=tag, unit="ep",
                initial=start_epoch, total=config.max_epochs, leave=False)
-    error_message: str | None = None
 
     try:
         for epoch in bar:
@@ -571,7 +714,6 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                 du_current = autograd_du_ds(u_anchor_hat, stress_current_tensor)
                 residual_anchor = pde_residual(du_current, r_anchor_hat)
                 residual_next = pde_residual(du_next, r_next_hat)
-                # Collocation
                 collocation = sample_collocation_points(
                     stress_current=stress_current_tensor.detach(),
                     stress_delta=torch.as_tensor(delta_np, dtype=torch.float32, device=device),
@@ -585,7 +727,6 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                 r_collo = model.rate(collo_stress, collocation.features, u_collo)
                 du_collo = autograd_du_ds(u_collo, collo_stress)
                 residual_collo = pde_residual(du_collo, r_collo)
-                # Integral consistency
                 u_integrated = integral_transition(
                     model.solution, model.rate,
                     stress_current_tensor, torch.as_tensor(delta_np, dtype=torch.float32, device=device),
@@ -605,7 +746,6 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                 u_integrated = torch.zeros_like(u_next_hat)
                 collocation = None
 
-            # Mask to inner-train rows only.
             train_pred = u_next_hat[train_selector]
             train_true = u_true[train_selector]
             train_cells = cell_index[train_selector]
@@ -670,9 +810,10 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                         discrete_residual[train_selector], train_cells,
                     )
 
+            pde_component = effective_weights.pde * (pde_anchor_loss + pde_collo_loss)
             total_loss = (
                 effective_weights.data * train_data_loss
-                + effective_weights.pde * (pde_anchor_loss + pde_collo_loss)
+                + pde_component
                 + effective_weights.initial_condition * ic_loss
                 + effective_weights.integral * integral_loss
                 + effective_weights.monotonicity * mono_loss_val
@@ -682,17 +823,23 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             )
 
             if not torch.isfinite(total_loss):
-                raise FloatingPointError(
+                raise FoldTrainingError(
                     f"non-finite total loss at epoch {epoch}: {total_loss.item()}"
                 )
-            total_loss.backward()
-            grad_total = _gradient_norm(model.parameters())
+
+            # Measure PDE-only gradient contribution via autograd BEFORE the
+            # composite backward (issue #7).
             grad_pde = 0.0
-            if is_pinn and effective_weights.pde > 0 and (
-                pde_anchor_loss.requires_grad or pde_collo_loss.requires_grad
-            ):
-                # Approximate physics gradient contribution via a scaled second pass.
-                pass
+            if is_pinn and effective_weights.pde > 0:
+                grad_pde = _pde_gradient_norm(pde_component, list(model.parameters()))
+
+            total_loss.backward()
+            grad_total = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    grad_total += float(p.grad.detach().pow(2).sum().item())
+            grad_total = float(grad_total ** 0.5)
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
             optimizer.step()
 
@@ -747,9 +894,9 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                 "validation_RMSE": val_rmse,
                 "validation_R2": val_r2,
                 "pde_residual_MAE": float(np.mean(np.abs(residual_next.detach().cpu().numpy())))
-                    if residual_next.numel() else float("nan"),
+                    if is_pinn and residual_next.numel() else float("nan"),
                 "pde_residual_RMSE": float(np.sqrt(np.mean(residual_next.detach().cpu().numpy() ** 2)))
-                    if residual_next.numel() else float("nan"),
+                    if is_pinn and residual_next.numel() else float("nan"),
                 "positive_derivative_fraction": float((du_next.detach().cpu().numpy() > 0).mean())
                     if du_next.numel() else float("nan"),
                 "monotonicity_violation_fraction": float(
@@ -787,7 +934,8 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                 best_epoch = epoch
                 patience = 0
                 atomic_write_torch(
-                    {"model": model.state_dict(), "epoch": epoch,
+                    {"model": model.state_dict(),
+                     "next_epoch": epoch + 1,
                      "best_val": best_val, "best_epoch": best_epoch,
                      "patience": patience},
                     fold_paths.best_model,
@@ -807,7 +955,8 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
 
             if (epoch + 1) % max(1, config.save_checkpoint_every_epochs) == 0 or epoch == config.max_epochs - 1:
                 atomic_write_torch(
-                    {"model": model.state_dict(), "epoch": epoch,
+                    {"model": model.state_dict(),
+                     "next_epoch": epoch + 1,
                      "best_val": best_val, "best_epoch": best_epoch,
                      "patience": patience},
                     fold_paths.last_model,
@@ -817,13 +966,20 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
 
             if patience >= config.early_stopping_patience and epoch >= config.min_epochs:
                 break
-    except Exception as exc:  # pragma: no cover
-        error_message = f"{type(exc).__name__}: {exc}"
-        if logger is not None:
-            log_failure(logger, "fold_training_failed", exc,
-                        architecture=config.architecture,
-                        preprocessing=config.preprocessing,
-                        fold=config.fold, seed=config.seed)
+    except FoldTrainingError:
+        bar.close()
+        _write_failure(fold_paths, config, ablation_name, fingerprint,
+                        trainable_parameters, best_epoch, best_val, logger,
+                        epoch_rows)
+        raise
+    except Exception as exc:  # pragma: no cover — propagate as FoldTrainingError
+        bar.close()
+        _write_failure(fold_paths, config, ablation_name, fingerprint,
+                        trainable_parameters, best_epoch, best_val, logger,
+                        epoch_rows,
+                        error=f"{type(exc).__name__}: {exc}",
+                        traceback_text=traceback.format_exc())
+        raise FoldTrainingError(f"{type(exc).__name__}: {exc}") from exc
 
     bar.close()
 
@@ -841,24 +997,15 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                                  weights_only=False)
         model.load_state_dict(best_state["model"])
 
-    # Evaluate on inner-validation, outer-validation.
-    inner_eval = _evaluate(model, dataset, frame, inner_val_idx, scaler, device,
-                            is_pinn, config, config.quadrature_method,
-                            config.quadrature_nodes)
-    outer_eval = _evaluate(model, dataset, frame, outer_val_idx, scaler, device,
-                            is_pinn, config, config.quadrature_method,
-                            config.quadrature_nodes)
-
     prediction_frames = []
-    for indices, split_name, eval_data in (
-        (inner_train_idx, "inner_train", None),
-        (inner_val_idx, "inner_validation", inner_eval),
-        (outer_val_idx, "outer_validation", outer_eval),
+    for indices, split_name in (
+        (inner_train_idx, "inner_train"),
+        (inner_val_idx, "inner_validation"),
+        (outer_val_idx, "outer_validation"),
     ):
-        if eval_data is None:
-            eval_data = _evaluate(model, dataset, frame, indices, scaler, device,
-                                   is_pinn, config, config.quadrature_method,
-                                   config.quadrature_nodes)
+        eval_data = _evaluate(model, dataset, frame, indices, scaler, device,
+                               is_pinn, config, config.quadrature_method,
+                               config.quadrature_nodes)
         if not eval_data:
             continue
         prediction_frames.append(_prediction_frame(
@@ -868,6 +1015,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             eval_data["pde_residual"], eval_data["ic_error"],
             eval_data["integral_error"], eval_data["mono_violation"],
             eval_data["lower_violation"], eval_data["upper_violation"],
+            stress_std=scaler.stress_std, is_pinn=is_pinn,
             ablation_name=ablation_name,
         ))
 
@@ -878,28 +1026,16 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
     if not predictions_frame.empty:
         atomic_write_parquet(predictions_frame, fold_paths.predictions_path)
 
-    physics_summary = {}
-    if outer_eval:
-        physics_summary = {
-            "pde_residual_MAE": float(np.mean(np.abs(outer_eval["pde_residual"]))),
-            "pde_residual_RMSE": float(np.sqrt(np.mean(outer_eval["pde_residual"] ** 2))),
-            "positive_derivative_fraction": float((outer_eval["du_ds"] > 0).mean()),
-            "monotonicity_violation_fraction": float((outer_eval["mono_violation"] > 0).mean()),
-            "mean_monotonicity_violation": float(outer_eval["mono_violation"].mean()),
-            "max_monotonicity_violation": float(outer_eval["mono_violation"].max())
-                if outer_eval["mono_violation"].size else float("nan"),
-            "initial_condition_MAE": float(np.mean(np.abs(outer_eval["ic_error"]))),
-            "integral_consistency_MAE": float(np.mean(np.abs(outer_eval["integral_error"]))),
-            "lower_bound_violation_fraction": float((outer_eval["lower_violation"] > 0).mean()),
-            "upper_bound_violation_fraction": float((outer_eval["upper_violation"] > 0).mean()),
-            "negative_rate_fraction": float((outer_eval["r_next"] < 0).mean()),
-            "mean_r": float(outer_eval["r_next"].mean()),
-            "std_r": float(outer_eval["r_next"].std()),
-        }
+    physics_summary = _summarize_outer_physics(
+        _evaluate(model, dataset, frame, outer_val_idx, scaler, device,
+                   is_pinn, config, config.quadrature_method,
+                   config.quadrature_nodes),
+        is_pinn=is_pinn,
+    )
 
     atomic_write_json({
-        "status": "failed" if error_message else "completed",
-        "error_message": error_message,
+        "status": "completed",
+        "error_message": None,
         "architecture": config.architecture,
         "preprocessing": config.preprocessing,
         "fold": config.fold,
@@ -909,6 +1045,8 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
         "trainable_parameters": trainable_parameters,
         "physics_metrics": physics_summary,
         "ablation": ablation_name or "",
+        "fingerprint": fingerprint,
+        "stress_std": float(scaler.stress_std),
     }, fold_paths.status_path)
 
     if logger is not None:
@@ -916,11 +1054,12 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                   architecture=config.architecture,
                   preprocessing=config.preprocessing,
                   fold=config.fold, seed=config.seed,
-                  status="failed" if error_message else "completed",
+                  status="completed",
                   best_epoch=best_epoch,
                   best_validation_mae=best_val,
                   physics_metrics=physics_summary,
-                  n_epoch_rows=len(epoch_rows))
+                  n_epoch_rows=len(epoch_rows),
+                  fingerprint=fingerprint)
 
     return FoldResult(
         architecture=config.architecture, preprocessing=config.preprocessing,
@@ -929,8 +1068,101 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
         best_epoch=best_epoch, best_validation_mae=best_val,
         predictions_path=fold_paths.predictions_path,
         physics_metrics=physics_summary,
-        status="failed" if error_message else "completed",
-        error_message=error_message,
+        status="completed",
+        error_message=None,
         ablation_name=ablation_name,
         epoch_log=epoch_rows,
+        fingerprint=fingerprint,
     )
+
+
+def _summarize_outer_physics(outer_eval: dict[str, np.ndarray],
+                              *, is_pinn: bool) -> dict[str, float]:
+    if not outer_eval:
+        return {}
+    if not is_pinn:
+        # DNN-Q has no physics-informed rate; report NaN so the aggregator
+        # and combined report do not compare apples to oranges.
+        nan = float("nan")
+        return {
+            "pde_residual_MAE": nan, "pde_residual_RMSE": nan,
+            "positive_derivative_fraction":
+                float((outer_eval["du_ds"] > 0).mean()) if outer_eval["du_ds"].size else nan,
+            "monotonicity_violation_fraction":
+                float((outer_eval["mono_violation"] > 0).mean()),
+            "mean_monotonicity_violation": float(outer_eval["mono_violation"].mean()),
+            "max_monotonicity_violation": float(outer_eval["mono_violation"].max())
+                if outer_eval["mono_violation"].size else nan,
+            "initial_condition_MAE": nan,
+            "integral_consistency_MAE": nan,
+            "lower_bound_violation_fraction":
+                float((outer_eval["lower_violation"] > 0).mean()),
+            "upper_bound_violation_fraction":
+                float((outer_eval["upper_violation"] > 0).mean()),
+            "negative_rate_fraction": nan,
+            "mean_r": nan, "std_r": nan,
+        }
+    return {
+        "pde_residual_MAE": float(np.mean(np.abs(outer_eval["pde_residual"]))),
+        "pde_residual_RMSE": float(np.sqrt(np.mean(outer_eval["pde_residual"] ** 2))),
+        "positive_derivative_fraction": float((outer_eval["du_ds"] > 0).mean()),
+        "monotonicity_violation_fraction": float((outer_eval["mono_violation"] > 0).mean()),
+        "mean_monotonicity_violation": float(outer_eval["mono_violation"].mean()),
+        "max_monotonicity_violation": float(outer_eval["mono_violation"].max())
+            if outer_eval["mono_violation"].size else float("nan"),
+        "initial_condition_MAE": float(np.mean(np.abs(outer_eval["ic_error"]))),
+        "integral_consistency_MAE": float(np.mean(np.abs(outer_eval["integral_error"]))),
+        "lower_bound_violation_fraction": float((outer_eval["lower_violation"] > 0).mean()),
+        "upper_bound_violation_fraction": float((outer_eval["upper_violation"] > 0).mean()),
+        "negative_rate_fraction": float((outer_eval["r_next"] < 0).mean()),
+        "mean_r": float(outer_eval["r_next"].mean()),
+        "std_r": float(outer_eval["r_next"].std()),
+    }
+
+
+def _write_failure(fold_paths: FoldPaths, config: TrainerConfig,
+                    ablation_name: str | None, fingerprint: str,
+                    trainable_parameters: int, best_epoch: int, best_val: float,
+                    logger: logging.Logger | None,
+                    epoch_rows: list[dict[str, Any]],
+                    *, error: str | None = None,
+                    traceback_text: str | None = None) -> None:
+    """Persist a status=failed marker without predictions.
+
+    Aggregator scripts must key on this status when deciding what to include.
+    """
+    if epoch_rows:
+        try:
+            df = pd.DataFrame(epoch_rows)
+            atomic_write_csv(df, fold_paths.epoch_log_csv)
+            atomic_write_parquet(df, fold_paths.epoch_log_parquet)
+        except Exception:
+            pass
+    atomic_write_json({
+        "status": "failed",
+        "error_message": error,
+        "traceback": traceback_text,
+        "architecture": config.architecture,
+        "preprocessing": config.preprocessing,
+        "fold": config.fold,
+        "seed": config.seed,
+        "best_epoch": best_epoch,
+        "best_validation_mae": best_val,
+        "trainable_parameters": trainable_parameters,
+        "physics_metrics": {},
+        "ablation": ablation_name or "",
+        "fingerprint": fingerprint,
+    }, fold_paths.status_path)
+    # Delete stale predictions from a previous completed run so the aggregator
+    # cannot re-consume them under a new (failed) fingerprint.
+    if fold_paths.predictions_path.exists():
+        try:
+            fold_paths.predictions_path.unlink()
+        except OSError:
+            pass
+    if logger is not None:
+        log_event(logger, logging.WARNING, "fold_marked_failed",
+                  architecture=config.architecture,
+                  preprocessing=config.preprocessing,
+                  fold=config.fold, seed=config.seed,
+                  error=error, fingerprint=fingerprint)

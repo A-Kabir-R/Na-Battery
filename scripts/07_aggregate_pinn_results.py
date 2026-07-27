@@ -31,11 +31,39 @@ def _results_dir(cfg: dict) -> Path:
 
 
 def _iter_prediction_paths(run_root: Path):
-    yield from sorted(run_root.rglob("predictions.parquet"))
+    """Yield only ``predictions.parquet`` files that live alongside a
+    ``status.json`` with ``status == "completed"``.
+
+    Stage 3/4 diagnosis fix #21: never let failed or partial runs enter the
+    aggregation. A run without ``status.json`` is treated as incomplete.
+    """
+    for predictions in sorted(run_root.rglob("predictions.parquet")):
+        status_path = predictions.parent / "status.json"
+        if not status_path.exists():
+            continue
+        try:
+            status = json.loads(status_path.read_text())
+        except Exception:
+            continue
+        if status.get("status") != "completed":
+            continue
+        yield predictions
 
 
 def _iter_epoch_logs(run_root: Path):
-    yield from sorted(run_root.rglob("epoch_log.parquet"))
+    for epoch_log in sorted(run_root.rglob("epoch_log.parquet")):
+        status_path = epoch_log.parent.parent / "status.json"
+        if not status_path.exists():
+            yield epoch_log
+            continue
+        try:
+            status = json.loads(status_path.read_text())
+        except Exception:
+            yield epoch_log
+            continue
+        if status.get("status") != "completed":
+            continue
+        yield epoch_log
 
 
 def main() -> None:
@@ -50,9 +78,29 @@ def main() -> None:
     if not run_root.exists():
         raise SystemExit(f"no run directory at {run_root}; run scripts/06 first")
 
+    # Cross-check against the experiment manifest to detect silently missing
+    # runs — the aggregator must not produce a ranking table from a partial
+    # sweep (Stage 4 diagnosis fix #21).
+    manifest_path = results / "experiment_manifest.csv"
+    if manifest_path.exists():
+        manifest_df = pd.read_csv(manifest_path)
+        expected_completed = int((manifest_df["status"] == "completed").sum()) \
+            if "status" in manifest_df.columns else int(len(manifest_df))
+        planned = int(len(manifest_df))
+    else:
+        manifest_df = pd.DataFrame()
+        expected_completed = 0
+        planned = 0
+
     prediction_paths = list(_iter_prediction_paths(run_root))
     log_event(logger, logging.INFO, "prediction_paths_discovered",
-              n=len(prediction_paths))
+              n=len(prediction_paths), expected_completed=expected_completed,
+              planned=planned)
+    if expected_completed and len(prediction_paths) < expected_completed:
+        raise SystemExit(
+            f"[pinn.aggregate] found {len(prediction_paths)} completed prediction files "
+            f"but the manifest expected {expected_completed}; refusing to aggregate."
+        )
     predictions_frames = []
     for path in tqdm(prediction_paths, desc="[pinn.aggregate] loading", unit="run"):
         try:

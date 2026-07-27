@@ -45,6 +45,7 @@ def main() -> None:
         ("epoch_logs_combined.parquet", "epoch_log", True),
         ("prediction_metrics.csv", "metrics", False),
         ("ablation_metrics.csv", "ablation", False),
+        ("model_complexity.csv", "complexity", False),
     ]
     loaded: dict[str, pd.DataFrame] = {}
     for filename, key, parquet in tqdm(stages, desc="[pinn.plot] load", unit="artifact"):
@@ -57,6 +58,7 @@ def main() -> None:
         predictions=loaded["predictions"],
         target_metrics=loaded["metrics"],
         ablation_metrics=loaded["ablation"],
+        complexity=loaded["complexity"],
         output_dir=plots_dir,
     )
     print(f"[pinn.plot] rendered plots into {plots_dir}")

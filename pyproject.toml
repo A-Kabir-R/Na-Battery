@@ -21,7 +21,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0"]
+# ``pinn`` bundles PyTorch — the classical pipeline does not require it, but
+# every ``scripts/06..10_*`` PINN entrypoint imports ``torch`` at module
+# load time. Install with ``pip install -e '.[pinn]'`` for local dev, or
+# ``pip install -e '.[test]'`` for the full test suite (which imports the
+# PINN package).
+pinn = ["torch>=2.2"]
+test = ["pytest>=8.0", "torch>=2.2"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

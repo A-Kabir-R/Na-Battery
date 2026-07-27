@@ -29,7 +29,7 @@ from src.pinn.logging_utils import (  # noqa: E402
     get_logger, log_config_snapshot, log_dataset_summary, log_event, log_failure,
 )
 from src.pinn.losses import LossWeights  # noqa: E402
-from src.pinn.trainer import FoldPaths, TrainerConfig, train_fold  # noqa: E402
+from src.pinn.trainer import FoldPaths, FoldTrainingError, TrainerConfig, train_fold  # noqa: E402
 from src.pinn.utils import atomic_write_csv, git_commit, resolve_device  # noqa: E402
 from src.splits.group_kfold import validate_locked_split_manifest  # noqa: E402
 
@@ -53,16 +53,32 @@ def _pinn_dir(cfg: dict) -> Path:
     )
 
 
-def _select_preprocessing(ranking_path: Path, default: str = "p2") -> str:
+def _select_preprocessing(ranking_path: Path, default: str = "p2",
+                          *, target: str = "next_rpt_Q_Ah") -> str:
+    """Pick the winning preprocessing for a *specific* target.
+
+    Sorting the ranking by pooled MAE across all targets is dominated by unit
+    scale — capacity MAE in Ah is orders of magnitude smaller than SOH MAE in
+    percentage points, so the first row would be a units artifact rather than
+    a comparable model choice (Stage 4 diagnosis fix #25).
+    """
     if not ranking_path.exists():
         return default
     ranking = pd.read_csv(ranking_path)
     if ranking.empty:
         return default
-    focus = ranking[ranking["architecture"] == "NaPINN-Q"] \
-        if "architecture" in ranking.columns else ranking
+    focus = ranking
+    if "architecture" in focus.columns:
+        focus = focus[focus["architecture"] == "NaPINN-Q"]
+    if "target" in focus.columns:
+        focus = focus[focus["target"] == target]
+    if "aggregation" in focus.columns:
+        focus = focus[focus["aggregation"].astype(str).isin({"cell_macro", ""})]
+    if "evaluation_role" in focus.columns:
+        focus = focus[focus["evaluation_role"].astype(str).isin({"outer_validation", ""})]
     if focus.empty:
         return default
+    focus = focus.sort_values("MAE") if "MAE" in focus.columns else focus
     winner = focus.iloc[0]["preprocessing"]
     return str(winner)
 
@@ -77,6 +93,8 @@ def main() -> None:
         return
 
     device = resolve_device(args.device)
+    if args.device == "cuda" and device != "cuda":
+        raise SystemExit("--device cuda requested but CUDA is not available")
     results = _pinn_dir(cfg)
     results.mkdir(parents=True, exist_ok=True)
     logger = get_logger("10_run_pinn_ablations", log_dir=results / "logs")
@@ -123,16 +141,21 @@ def main() -> None:
 
     dataset = build_anchor_dataset(
         frame, preprocessing=preprocessing, stress_cfg=pinn_cfg["stress"],
+        audit_cfg=pinn_cfg.get("audit"),
         audit_path=results / f"temporal_feature_audit_{preprocessing}.csv",
     )
     attached = apply_split_manifest(dataset.frame, split_manifest)
     log_dataset_summary(logger, dataset, attached, preprocessing=preprocessing)
 
     prediction_paths = []
+    failed_runs: list[dict[str, object]] = []
     for config_row, seed, fold in tqdm(plan, desc="[pinn.ablation]", unit="run"):
         arch = str(config_row["architecture"])
         weights = LossWeights.from_mapping(config_row["weights"])
         include_discrete = bool(config_row["weights"].get("discrete_state_transition", 0.0))
+        # Per-ablation override for rate_uses_u_hat (A6 constrained rate).
+        rate_uses_u_hat = bool(config_row.get(
+            "rate_uses_u_hat", pinn_cfg["model"].get("rate_uses_u_hat", True)))
         run_dir = results / "ablation" / str(config_row["name"]) / preprocessing / f"fold_{fold}" / f"seed_{seed}"
         paths = FoldPaths(root=run_dir)
         trainer_cfg = TrainerConfig(
@@ -156,9 +179,14 @@ def main() -> None:
             quadrature_nodes=int(pinn_cfg["quadrature"]["nodes"]),
             solution_hidden_dims=tuple(int(h) for h in pinn_cfg["model"]["solution_hidden_dims"]),
             rate_hidden_dims=tuple(int(h) for h in pinn_cfg["model"]["rate_hidden_dims"]),
+            dnn_solution_hidden_dims=tuple(int(h) for h in pinn_cfg["model"].get(
+                "dnn_solution_hidden_dims", pinn_cfg["model"]["solution_hidden_dims"])),
             solution_activation=str(pinn_cfg["model"]["solution_activation"]),
             rate_activation=str(pinn_cfg["model"]["rate_activation"]),
+            rate_uses_u_hat=rate_uses_u_hat,
             maximum_parameters=int(pinn_cfg["model"]["maximum_parameters"]),
+            inner_split_seed=int(pinn_cfg.get("audit", {}).get(
+                "inner_split_seed", 20240117)),
             log_every_epochs=int(pinn_cfg["logging"]["log_every_epochs"]),
             save_checkpoint_every_epochs=int(pinn_cfg["logging"]["save_checkpoint_every_epochs"]),
             log_gpu_memory=bool(pinn_cfg["logging"]["log_gpu_memory"]),
@@ -181,11 +209,15 @@ def main() -> None:
                 logger=logger,
             )
             prediction_paths.append(paths.predictions_path)
-        except Exception as exc:
+        except (FoldTrainingError, Exception) as exc:
             print(f"[pinn.ablation] FAILED {config_row['name']}|fold {fold}|seed {seed}: {exc}")
             log_failure(logger, "ablation_run_failed", exc,
                         ablation=str(config_row["name"]),
                         fold=fold, seed=seed, run_dir=str(run_dir))
+            failed_runs.append({
+                "ablation": str(config_row["name"]), "fold": fold, "seed": seed,
+                "error_type": type(exc).__name__, "error_message": str(exc),
+            })
 
     predictions = aggregate_predictions(prediction_paths)
     if predictions.empty:
@@ -202,9 +234,13 @@ def main() -> None:
     metrics = pd.concat(metric_frames, ignore_index=True) if metric_frames else pd.DataFrame()
     atomic_write_csv(metrics, results / "ablation_metrics.csv")
 
-    print(f"[pinn.ablation] wrote {len(metrics)} metric rows")
+    atomic_write_csv(pd.DataFrame(failed_runs), results / "ablation_failed_runs.csv")
+    print(f"[pinn.ablation] wrote {len(metrics)} metric rows; {len(failed_runs)} failed")
     log_event(logger, logging.INFO, "script_complete",
-              metric_rows=len(metrics), predictions=len(prediction_paths))
+              metric_rows=len(metrics), predictions=len(prediction_paths),
+              failed=len(failed_runs))
+    if failed_runs:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

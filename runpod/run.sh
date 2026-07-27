@@ -183,7 +183,23 @@ for stage in "${STAGES[@]}"; do
     pinn_aggregate)   run_stage pinn_aggregate   scripts/07_aggregate_pinn_results.py ;;
     pinn_plot)        run_stage pinn_plot        scripts/08_plot_pinn_results.py ;;
     pinn_ablation)    run_stage pinn_ablation    scripts/10_run_pinn_ablations.py ;;
-    combined_report)  run_stage combined_report  scripts/09_combine_classical_pinn_results.py ;;
+    combined_report)
+      # --require-classical if the classical pipeline actually ran in this
+      # session; otherwise skip the strict flag so a PINN-only R2 upload is
+      # still produced.
+      COMBINED_ARGS=""
+      if [[ -f "${SIB_ARTIFACTS}/results/${SIB_EXPERIMENT_SUBDIR:-standard_cycling}/raw_results.csv" ]]; then
+        COMBINED_ARGS="--require-classical"
+      fi
+      log "===== stage: combined_report -> python scripts/09_combine_classical_pinn_results.py ${COMBINED_ARGS} ====="
+      t0=$SECONDS
+      python scripts/09_combine_classical_pinn_results.py ${COMBINED_ARGS}
+      rc=$?
+      log "stage 'combined_report' finished rc=$rc in $((SECONDS - t0))s"
+      if [[ $rc -ne 0 ]]; then
+        PIPELINE_RC=$rc
+      fi
+      ;;
     smoke)       run_stage smoke       scripts/00_smoke_test.py ;;
     "" )         ;;
     *) log "unknown stage '$stage' in RUN_STAGES"; PIPELINE_RC=2 ;;

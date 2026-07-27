@@ -113,23 +113,93 @@ def horizon_metric_rows(predictions: pd.DataFrame,
     return pd.DataFrame(rows)
 
 
+def _nan_safe_abs_mean(series: pd.Series) -> float:
+    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+    values = values[np.isfinite(values)]
+    return float(np.mean(np.abs(values))) if values.size else float("nan")
+
+
+def _nan_safe_rms(series: pd.Series) -> float:
+    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+    values = values[np.isfinite(values)]
+    return float(np.sqrt(np.mean(values ** 2))) if values.size else float("nan")
+
+
+def _nan_safe_frac(series: pd.Series, predicate) -> float:
+    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+    finite = np.isfinite(values)
+    if not finite.any():
+        return float("nan")
+    return float(predicate(values[finite]).mean())
+
+
 def physics_metric_rows(predictions: pd.DataFrame) -> pd.DataFrame:
+    """Compute physics diagnostics per run, reporting normalized AND physical
+    residual/derivative magnitudes side by side (Stage 2 fix #9).
+
+    DNN-Q rows have ``NaN`` PDE/integral/rate columns and are handled with
+    NaN-safe reducers so a family comparison plot doesn't crash (Stage 2
+    fix #10).
+    """
     if predictions.empty:
         return pd.DataFrame()
+    # Prefer the new normalized/physical column names, fall back to the
+    # legacy single columns if a downstream user reads an older parquet.
+    def _col(*candidates: str) -> pd.Series:
+        for name in candidates:
+            if name in predictions.columns:
+                return predictions[name]
+        return pd.Series(dtype=float, index=predictions.index)
+
+    pde_norm = _col("pde_residual_normalized", "pde_residual")
+    pde_phys = _col("pde_residual_physical", "pde_residual")
+    du_norm = _col("du_dstress_normalized", "du_ds")
+    du_phys = _col("du_dstress_physical", "du_ds")
+    rate_norm = _col("predicted_degradation_rate_normalized",
+                     "predicted_degradation_rate")
+    rate_phys = _col("predicted_degradation_rate_physical",
+                     "predicted_degradation_rate")
+
     physics = {
-        "pde_residual_MAE": float(np.mean(np.abs(predictions["pde_residual"]))),
-        "pde_residual_RMSE": float(np.sqrt(np.mean(predictions["pde_residual"].astype(float) ** 2))),
-        "positive_derivative_fraction": float((predictions["du_ds"] > 0).mean()),
-        "monotonicity_violation_fraction": float((predictions["monotonicity_violation"] > 0).mean()),
-        "mean_monotonicity_violation": float(predictions["monotonicity_violation"].mean()),
-        "max_monotonicity_violation": float(predictions["monotonicity_violation"].max()),
-        "initial_condition_MAE": float(np.mean(np.abs(predictions["initial_condition_error"]))),
-        "integral_consistency_MAE": float(np.mean(np.abs(predictions["integral_consistency_error"]))),
-        "lower_bound_violation_fraction": float((predictions["lower_bound_violation"] > 0).mean()),
-        "upper_bound_violation_fraction": float((predictions["upper_bound_violation"] > 0).mean()),
-        "negative_rate_fraction": float((predictions["predicted_degradation_rate"] < 0).mean()),
-        "mean_predicted_rate": float(predictions["predicted_degradation_rate"].mean()),
-        "std_predicted_rate": float(predictions["predicted_degradation_rate"].std()),
+        "pde_residual_MAE_normalized": _nan_safe_abs_mean(pde_norm),
+        "pde_residual_RMSE_normalized": _nan_safe_rms(pde_norm),
+        "pde_residual_MAE_physical": _nan_safe_abs_mean(pde_phys),
+        "pde_residual_RMSE_physical": _nan_safe_rms(pde_phys),
+        "positive_derivative_fraction":
+            _nan_safe_frac(du_norm, lambda a: a > 0),
+        "mean_du_dstress_normalized": _nan_safe_abs_mean(du_norm) if du_norm.size else float("nan"),
+        "mean_du_dstress_physical": _nan_safe_abs_mean(du_phys) if du_phys.size else float("nan"),
+        "monotonicity_violation_fraction":
+            _nan_safe_frac(predictions.get("monotonicity_violation", pd.Series(dtype=float)),
+                           lambda a: a > 0),
+        "mean_monotonicity_violation":
+            float(pd.to_numeric(predictions.get("monotonicity_violation",
+                                                 pd.Series(dtype=float)),
+                                 errors="coerce").mean(skipna=True)),
+        "max_monotonicity_violation":
+            float(pd.to_numeric(predictions.get("monotonicity_violation",
+                                                 pd.Series(dtype=float)),
+                                 errors="coerce").max(skipna=True)),
+        "initial_condition_MAE":
+            _nan_safe_abs_mean(predictions.get("initial_condition_error", pd.Series(dtype=float))),
+        "integral_consistency_MAE":
+            _nan_safe_abs_mean(predictions.get("integral_consistency_error", pd.Series(dtype=float))),
+        "lower_bound_violation_fraction":
+            _nan_safe_frac(predictions.get("lower_bound_violation", pd.Series(dtype=float)),
+                           lambda a: a > 0),
+        "upper_bound_violation_fraction":
+            _nan_safe_frac(predictions.get("upper_bound_violation", pd.Series(dtype=float)),
+                           lambda a: a > 0),
+        "negative_rate_fraction":
+            _nan_safe_frac(rate_norm, lambda a: a < 0),
+        "mean_predicted_rate_normalized":
+            float(pd.to_numeric(rate_norm, errors="coerce").mean(skipna=True)),
+        "std_predicted_rate_normalized":
+            float(pd.to_numeric(rate_norm, errors="coerce").std(skipna=True)),
+        "mean_predicted_rate_physical":
+            float(pd.to_numeric(rate_phys, errors="coerce").mean(skipna=True)),
+        "std_predicted_rate_physical":
+            float(pd.to_numeric(rate_phys, errors="coerce").std(skipna=True)),
     }
     row = {**physics}
     for column in ("architecture", "preprocessing", "fold", "seed",
