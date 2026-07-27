@@ -14,18 +14,47 @@ from sklearn.model_selection import GroupKFold, GroupShuffleSplit, StratifiedGro
 def make_folds(df: pd.DataFrame, n_splits: int = 5,
                group_col: str = "cell", stratify_col: str | None = "condition",
                random_state: int = 42) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+    if group_col not in df.columns:
+        raise KeyError(f"Missing group column: {group_col}")
+    n_groups = df[group_col].nunique()
+    if n_groups < n_splits:
+        raise ValueError(
+            f"Cannot create {n_splits} folds from only {n_groups} unique {group_col}s."
+        )
     groups = df[group_col].to_numpy()
+    can_stratify = False
     if stratify_col and stratify_col in df.columns:
-        y = df[stratify_col].astype("category").cat.codes.to_numpy()
-        # StratifiedGroupKFold does not accept random_state prior to shuffle=True;
-        # we shuffle groups outside instead.
-        try:
-            sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-            yield from sgkf.split(np.zeros(len(df)), y, groups)
-            return
-        except Exception:
-            pass
-    gkf = GroupKFold(n_splits=n_splits)
+        cell_metadata = df[[group_col, stratify_col]].dropna().drop_duplicates()
+        condition_count_per_cell = cell_metadata.groupby(group_col)[stratify_col].nunique()
+        if not condition_count_per_cell.empty and condition_count_per_cell.max() > 1:
+            raise ValueError(
+                f"At least one {group_col} is assigned to multiple {stratify_col}s."
+            )
+        groups_per_condition = cell_metadata.groupby(stratify_col)[group_col].nunique()
+        can_stratify = (
+            len(groups_per_condition) >= 2
+            and groups_per_condition.min() >= n_splits
+        )
+        if not can_stratify:
+            min_groups = int(groups_per_condition.min()) if len(groups_per_condition) else 0
+            warnings.warn(
+                f"Condition-stratified GroupKFold is impossible: minimum unique "
+                f"{group_col}s per {stratify_col} is {min_groups}, but n_splits={n_splits}. "
+                f"Falling back to GroupKFold.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    if can_stratify:
+        sgkf = StratifiedGroupKFold(
+            n_splits=n_splits, shuffle=True, random_state=random_state
+        )
+        y = df[stratify_col].astype(str).to_numpy()
+        yield from sgkf.split(np.zeros(len(df)), y, groups)
+        return
+    try:
+        gkf = GroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    except TypeError:
+        gkf = GroupKFold(n_splits=n_splits)
     yield from gkf.split(np.zeros(len(df)), groups=groups)
 
 

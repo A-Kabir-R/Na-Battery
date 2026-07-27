@@ -78,7 +78,7 @@ split:
   holdout_candidates: 1024
 
 evaluation:
-  bootstrap_replicates: 1000
+  bootstrap_replicates: 100
   bootstrap_random_state: 42
   horizon_bin_edges_days: [0.0, 1.0, 5.0, 15.0, 1000000.0]
   horizon_bin_labels: ["<1d", "1-5d", "5-15d", ">15d"]

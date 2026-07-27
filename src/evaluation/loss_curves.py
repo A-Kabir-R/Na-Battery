@@ -70,11 +70,19 @@ def _fit_lgbm(est, X_tr, y_tr, X_te, y_te, kind: str) -> Tuple[Any, Optional[pd.
     try:
         import lightgbm as lgb
         record: dict = {}
-        est.fit(X_tr, y_tr,
-                eval_set=[(X_tr, y_tr), (X_te, y_te)],
-                eval_names=["train", "val"],
-                eval_metric=eval_metric,
-                callbacks=[lgb.record_evaluation(record)])
+        try:
+            est.fit(X_tr, y_tr,
+                    eval_X=[X_tr, X_te],
+                    eval_y=[y_tr, y_te],
+                    eval_names=["train", "val"],
+                    eval_metric=eval_metric,
+                    callbacks=[lgb.record_evaluation(record)])
+        except TypeError:
+            est.fit(X_tr, y_tr,
+                    eval_set=[(X_tr, y_tr), (X_te, y_te)],
+                    eval_names=["train", "val"],
+                    eval_metric=eval_metric,
+                    callbacks=[lgb.record_evaluation(record)])
         tr = np.asarray(record["train"][eval_metric], dtype=float)
         va = np.asarray(record["val"][eval_metric], dtype=float)
         return est, _curve_df(tr, va, eval_metric)

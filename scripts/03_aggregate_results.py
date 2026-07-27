@@ -4,8 +4,14 @@ from __future__ import annotations
 import sys
 import json
 from pathlib import Path
+from time import perf_counter
 
 import pandas as pd
+
+
+def _log_stage(message: str) -> float:
+    print(f"[agg] {message}", flush=True)
+    return perf_counter()
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -28,25 +34,40 @@ def main() -> None:
         "feature_importance_raw.csv", "feature_importance_summary.csv",
     ):
         (results_dir / optional_name).unlink(missing_ok=True)
+    t0 = _log_stage("loading raw results...")
     raw_results = pd.read_csv(results_dir / "raw_results.csv")
+    print(f"[agg] loaded {len(raw_results):,} result rows in {perf_counter() - t0:.1f}s",
+          flush=True)
+
+    t0 = _log_stage("aggregating fold metrics...")
     agg = aggregate(results_dir / "raw_results.csv")
     agg.to_csv(results_dir / "results_summary.csv", index=False)
     wide = pivot_comparison(agg)
     wide.to_csv(results_dir / "comparison_table.csv", index=False)
     gap = overfitting_gap(agg)
     gap.to_csv(results_dir / "overfitting_gap.csv", index=False)
+    print(f"[agg] fold aggregation finished in {perf_counter() - t0:.1f}s", flush=True)
+
+    t0 = _log_stage("collecting prediction artifacts...")
     predictions = collect_predictions(
         Path(cfg["paths"]["artifacts"]), results_dir / "raw_results.csv"
     )
     predictions.to_parquet(results_dir / "all_predictions.parquet", index=False)
+    print(f"[agg] collected {len(predictions):,} predictions in "
+          f"{perf_counter() - t0:.1f}s", flush=True)
+
     evaluation = cfg.get("evaluation", {})
+    t0 = _log_stage(
+        "calculating pooled, cell-macro, condition-macro, horizon and bootstrap metrics..."
+    )
     prediction_metrics, group_metrics, horizon_metrics, plausibility = prediction_metric_tables(
         predictions,
-        bootstrap_replicates=int(evaluation.get("bootstrap_replicates", 1000)),
+        bootstrap_replicates=int(evaluation.get("bootstrap_replicates", 100)),
         random_state=int(evaluation.get("bootstrap_random_state", 42)),
         horizon_edges=evaluation.get("horizon_bin_edges_days", [0, 1, 5, 15, 1e6]),
         horizon_labels=evaluation.get("horizon_bin_labels", ["<1d", "1-5d", "5-15d", ">15d"]),
     )
+    print(f"[agg] prediction metrics finished in {perf_counter() - t0:.1f}s", flush=True)
     prediction_metrics.to_csv(results_dir / "prediction_metrics.csv", index=False)
     group_metrics.to_csv(results_dir / "group_metrics.csv", index=False)
     horizon_metrics.to_csv(results_dir / "horizon_metrics.csv", index=False)

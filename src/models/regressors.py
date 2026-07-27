@@ -39,7 +39,9 @@ def build_regressors() -> Dict[str, Any]:
         "RandomForest":     RandomForestRegressor(n_estimators=200, n_jobs=-1, random_state=RS),
         "ExtraTrees":       ExtraTreesRegressor(n_estimators=200, n_jobs=-1, random_state=RS),
         "GradientBoosting": GradientBoostingRegressor(random_state=RS),
-        "MLP":              MLPRegressor(hidden_layer_sizes=(64,), max_iter=500, random_state=RS),
+        "MLP":              MLPRegressor(hidden_layer_sizes=(16,), activation="relu",
+                                          solver="lbfgs", alpha=0.01, max_iter=2000,
+                                          max_fun=30000, random_state=RS),
     }
     try:
         from xgboost import XGBRegressor

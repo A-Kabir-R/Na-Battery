@@ -19,7 +19,9 @@ def build_classifiers() -> Dict[str, Any]:
         "SVC-RBF":            SVC(kernel="rbf", probability=True, random_state=RS),
         "KNN-clf":            KNeighborsClassifier(n_neighbors=5),
         "RandomForest-clf":   RandomForestClassifier(n_estimators=200, n_jobs=-1, random_state=RS),
-        "MLP-clf":            MLPClassifier(hidden_layer_sizes=(64,), max_iter=500, random_state=RS),
+        "MLP-clf":            MLPClassifier(hidden_layer_sizes=(16,), activation="relu",
+                                            solver="lbfgs", alpha=0.01, max_iter=2000,
+                                            random_state=RS),
         "GaussianNB":         GaussianNB(),
     }
     try:

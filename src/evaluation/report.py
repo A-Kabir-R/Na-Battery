@@ -11,6 +11,7 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+from tqdm.auto import tqdm
 
 from .metrics import REGRESSION_METRIC_NAMES, aggregated_regression_metrics, regression_metrics
 
@@ -236,10 +237,19 @@ def prediction_metric_tables(predictions: pd.DataFrame, *, bootstrap_replicates:
     subgroup_rows: list[dict] = []
     horizon_rows: list[dict] = []
     plausibility_rows: list[dict] = []
-    for key, frame in predictions.groupby(keys, dropna=False):
+    grouped_predictions = list(predictions.groupby(keys, dropna=False, sort=False))
+    for key, frame in tqdm(
+        grouped_predictions,
+        desc="[agg] prediction metric groups",
+        unit="group",
+        dynamic_ncols=True,
+    ):
         base = dict(zip(keys, key))
+        role_bootstrap_replicates = (
+            0 if str(base["evaluation_role"]) == "development_fit" else bootstrap_replicates
+        )
         intervals = _bootstrap_intervals(
-            frame, replicates=bootstrap_replicates, random_state=random_state
+            frame, replicates=role_bootstrap_replicates, random_state=random_state
         )
         per_cell_metrics: dict[object, dict[str, float]] = {}
         per_cell_rows: dict[object, int] = {}
