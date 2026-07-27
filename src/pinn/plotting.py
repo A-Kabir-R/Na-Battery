@@ -313,12 +313,201 @@ def plot_pde_residual_vs_stress(predictions: pd.DataFrame, output_dir: Path) -> 
     _save(fig, output_dir / "pde_residual_vs_stress")
 
 
+def plot_residuals_by_condition(predictions: pd.DataFrame, output_dir: Path,
+                                 *, true_col: str = "true_next_Q_Ah",
+                                 pred_col: str = "predicted_next_Q_Ah") -> None:
+    """Boxplot of |residual| binned by temperature, DOD and C-rate.
+
+    Produces three panels — temperature, depth-of-discharge, discharge C-rate —
+    so heterogeneity of error by operating condition is visible in one figure.
+    """
+    output_dir = Path(output_dir)
+    subset = _outer_only(predictions)
+    if subset.empty or true_col not in subset.columns:
+        _skip("residuals_by_condition", "columns missing or no outer rows"); return
+    residual = (subset[pred_col].astype(float) - subset[true_col].astype(float)).abs()
+    conditions = [
+        ("temperature", "temperature (°C)", 5),
+        ("DOD", "depth-of-discharge (%)", 4),
+        ("discharge_C_rate", "discharge C-rate", 4),
+    ]
+    for column, xlabel, n_bins in conditions:
+        if column not in subset.columns:
+            continue
+        values = pd.to_numeric(subset[column], errors="coerce")
+        mask = np.isfinite(values) & np.isfinite(residual)
+        if mask.sum() < 5:
+            _skip(f"residuals_vs_{column}", "not enough finite pairs"); continue
+        try:
+            bins = pd.qcut(values[mask], q=n_bins, duplicates="drop")
+        except ValueError:
+            continue
+        groups = [residual[mask][bins == cat].to_numpy()
+                  for cat in bins.cat.categories]
+        labels = [str(cat) for cat in bins.cat.categories]
+        if not groups:
+            continue
+        fig, ax = plt.subplots(figsize=(6, 3.5))
+        ax.boxplot(groups, labels=labels, showfliers=False)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("|residual| capacity (Ah)")
+        ax.set_title(f"Residuals vs {column} (outer validation)")
+        plt.xticks(rotation=25, ha="right")
+        _save(fig, output_dir / f"residuals_vs_{column}")
+
+
+def plot_rate_by_condition(predictions: pd.DataFrame, output_dir: Path) -> None:
+    """Predicted degradation rate binned by physical condition (T, DOD, C-rate)."""
+    output_dir = Path(output_dir)
+    subset = _outer_only(predictions)
+    rate_col = ("predicted_degradation_rate_physical"
+                if "predicted_degradation_rate_physical" in subset.columns
+                else "predicted_degradation_rate_normalized")
+    if subset.empty or rate_col not in subset.columns:
+        _skip("rate_by_condition", "rate column missing"); return
+    rate = pd.to_numeric(subset[rate_col], errors="coerce")
+    for column, xlabel, n_bins in [
+        ("temperature", "temperature (°C)", 5),
+        ("DOD", "depth-of-discharge (%)", 4),
+        ("discharge_C_rate", "discharge C-rate", 4),
+    ]:
+        if column not in subset.columns:
+            continue
+        values = pd.to_numeric(subset[column], errors="coerce")
+        mask = np.isfinite(values) & np.isfinite(rate)
+        if mask.sum() < 5:
+            continue
+        try:
+            bins = pd.qcut(values[mask], q=n_bins, duplicates="drop")
+        except ValueError:
+            continue
+        groups = [rate[mask][bins == cat].to_numpy() for cat in bins.cat.categories]
+        labels = [str(cat) for cat in bins.cat.categories]
+        if not groups:
+            continue
+        fig, ax = plt.subplots(figsize=(6, 3.5))
+        ax.boxplot(groups, labels=labels, showfliers=False)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(rate_col)
+        ax.set_title(f"Degradation rate vs {column} (outer validation)")
+        plt.xticks(rotation=25, ha="right")
+        _save(fig, output_dir / f"rate_vs_{column}")
+
+
+def plot_integral_consistency(predictions: pd.DataFrame, output_dir: Path) -> None:
+    """Diagnostic: ∫r ds should approximately equal u_next - u_current for a PINN."""
+    output_dir = Path(output_dir)
+    subset = _outer_only(predictions)
+    if subset.empty or "integral_consistency_error" not in subset.columns:
+        _skip("integral_consistency", "columns missing"); return
+    err = pd.to_numeric(subset["integral_consistency_error"], errors="coerce").dropna()
+    if err.empty:
+        _skip("integral_consistency", "no finite errors"); return
+    fig, ax = plt.subplots(figsize=(6, 3.5))
+    ax.hist(err, bins=50, alpha=0.75)
+    ax.axvline(0, color="black", linewidth=0.6)
+    ax.set_xlabel("integral consistency error (u_next - ∫ r ds - u_current)")
+    ax.set_ylabel("count")
+    ax.set_title("Integral consistency diagnostic (outer validation)")
+    _save(fig, output_dir / "integral_consistency_hist")
+
+
+def plot_condition_trajectories(predictions: pd.DataFrame, output_dir: Path,
+                                 *, target_col: str = "predicted_next_Q_Ah",
+                                 true_col: str = "true_next_Q_Ah") -> None:
+    """Per-condition mean trajectory vs stress, PINN vs observed."""
+    output_dir = Path(output_dir)
+    subset = _outer_only(predictions)
+    if subset.empty or "condition_id" not in subset.columns \
+            or "stress_target" not in subset.columns:
+        _skip("condition_trajectories", "columns missing"); return
+    conditions = sorted(subset["condition_id"].astype(str).unique())[:8]
+    if not conditions:
+        return
+    fig, ax = plt.subplots(figsize=(8, 5))
+    palette = plt.cm.tab10(np.linspace(0, 1, len(conditions)))
+    for color, cond in zip(palette, conditions):
+        sub = subset[subset["condition_id"].astype(str).eq(cond)].sort_values("stress_target")
+        if sub.empty:
+            continue
+        ax.plot(sub["stress_target"], sub[true_col], color=color, linewidth=1.0,
+                label=f"{cond} obs", alpha=0.9)
+        ax.plot(sub["stress_target"], sub[target_col], color=color, linewidth=0.8,
+                linestyle="--", alpha=0.7)
+    ax.set_xlabel("stress at target time")
+    ax.set_ylabel("capacity (Ah)")
+    ax.set_title("Per-condition observed (solid) vs predicted (dashed), outer validation")
+    ax.legend(fontsize=6, loc="best", ncol=2)
+    _save(fig, output_dir / "condition_trajectories")
+
+
+def plot_accuracy_vs_runtime(complexity: pd.DataFrame, target_metrics: pd.DataFrame,
+                              output_dir: Path,
+                              *, metric: str = "MAE") -> None:
+    """Scatter of (trainable parameters, mean MAE) — a rough accuracy/cost tradeoff."""
+    output_dir = Path(output_dir)
+    if complexity.empty or target_metrics.empty:
+        _skip("accuracy_vs_runtime", "empty inputs"); return
+    if "trainable_parameters" not in complexity.columns:
+        _skip("accuracy_vs_runtime", "no trainable_parameters column"); return
+    metrics = target_metrics
+    if "target" in metrics.columns:
+        metrics = metrics[metrics["target"].astype(str) == "next_rpt_Q_Ah"]
+    if "aggregation" in metrics.columns:
+        metrics = metrics[metrics["aggregation"].astype(str) == "cell_macro"]
+    if "evaluation_role" in metrics.columns:
+        metrics = metrics[metrics["evaluation_role"].astype(str) == DEFAULT_ROLE]
+    if metrics.empty:
+        _skip("accuracy_vs_runtime", "no rows after filters"); return
+    per_arch_metric = metrics.groupby("architecture", as_index=False, dropna=False)[metric].mean()
+    per_arch_params = complexity.groupby("architecture", as_index=False, dropna=False
+                                          )["trainable_parameters"].mean()
+    joined = per_arch_metric.merge(per_arch_params, on="architecture", how="inner")
+    if joined.empty:
+        _skip("accuracy_vs_runtime", "no architecture overlap"); return
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.scatter(joined["trainable_parameters"], joined[metric], s=40)
+    for _, r in joined.iterrows():
+        ax.annotate(str(r["architecture"]),
+                    (r["trainable_parameters"], r[metric]),
+                    fontsize=8, xytext=(5, 5), textcoords="offset points")
+    ax.set_xlabel("trainable parameters")
+    ax.set_ylabel(f"{metric} (outer validation, cell macro)")
+    ax.set_title("Accuracy vs. model size")
+    _save(fig, output_dir / f"accuracy_vs_size_{metric.lower()}")
+
+
+def plot_combined_family_bar(combined_metrics: pd.DataFrame, output_dir: Path,
+                              *, metric: str = "MAE") -> None:
+    """Mean metric by architecture across all model families (classical + PINN)."""
+    output_dir = Path(output_dir)
+    if combined_metrics.empty or metric not in combined_metrics.columns:
+        _skip("combined_family_bar", "columns missing"); return
+    subset = combined_metrics
+    if "target" in subset.columns:
+        subset = subset[subset["target"].astype(str) == "next_rpt_Q_Ah"]
+    if "aggregation" in subset.columns:
+        subset = subset[subset["aggregation"].astype(str) == "cell_macro"]
+    if "evaluation_role" in subset.columns:
+        subset = subset[subset["evaluation_role"].astype(str).isin({DEFAULT_ROLE, ""})]
+    if subset.empty or "architecture" not in subset.columns:
+        _skip("combined_family_bar", "no rows after filters"); return
+    summary = subset.groupby("architecture", as_index=False, dropna=False)[metric].mean().sort_values(metric)
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.bar(summary["architecture"].astype(str), summary[metric])
+    ax.set_ylabel(f"mean {metric} (outer validation, cell macro)")
+    ax.set_title("Model family comparison (ExtraTrees + DNN-Q + NaPINN-Q)")
+    plt.xticks(rotation=20, ha="right")
+    _save(fig, output_dir / f"combined_family_{metric.lower()}")
+
+
 def render_all_pinn_plots(*, epoch_log: pd.DataFrame,
                           predictions: pd.DataFrame,
                           target_metrics: pd.DataFrame,
                           ablation_metrics: pd.DataFrame,
                           output_dir: Path,
-                          complexity: pd.DataFrame | None = None) -> None:
+                          complexity: pd.DataFrame | None = None,
+                          combined_metrics: pd.DataFrame | None = None) -> None:
     """Render every PINN plot into ``output_dir``."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -326,10 +515,17 @@ def render_all_pinn_plots(*, epoch_log: pd.DataFrame,
     plot_predicted_vs_true(predictions, output_dir)
     plot_residual_distribution(predictions, output_dir)
     plot_per_cell_trajectories(predictions, output_dir)
+    plot_condition_trajectories(predictions, output_dir)
     plot_degradation_rate(predictions, output_dir)
     plot_pde_residual(predictions, output_dir)
     plot_pde_residual_vs_stress(predictions, output_dir)
+    plot_residuals_by_condition(predictions, output_dir)
+    plot_rate_by_condition(predictions, output_dir)
+    plot_integral_consistency(predictions, output_dir)
     plot_ablation_bar(ablation_metrics, output_dir)
     plot_seed_stability(target_metrics, output_dir)
     if complexity is not None:
         plot_model_complexity(complexity, output_dir)
+        plot_accuracy_vs_runtime(complexity, target_metrics, output_dir)
+    if combined_metrics is not None:
+        plot_combined_family_bar(combined_metrics, output_dir)

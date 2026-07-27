@@ -202,9 +202,20 @@ pinn:
     scheduler_patience: 60
     minimum_learning_rate: 1.0e-6
     gradient_clip_norm: 1.0
-    use_amp: true
+    # AMP is not implemented — mixed precision breaks the fp32 autograd path
+    # used for du/ds and the PDE residual. Keep this false until an
+    # autocast/GradScaler wrapper that preserves fp32 physics is added.
+    use_amp: false
     physics_float32: true
     batch_mode: "cell_balanced"
+    # Two-phase outer-training refit: after inner train/val chooses best_epoch,
+    # discard the temporary model and retrain a fresh one on ALL outer-training
+    # cells for exactly best_epoch+1 epochs. Matches how the classical model
+    # is trained on the full outer-training fold.
+    two_phase_refit: true
+    # PDE-gradient enforcement gate (physics-active epochs after warm-up).
+    pde_gradient_min_norm: 1.0e-8
+    pde_gradient_zero_patience: 5
 
   losses:
     data: 1.0

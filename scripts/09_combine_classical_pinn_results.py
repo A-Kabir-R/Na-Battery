@@ -149,11 +149,19 @@ def main() -> None:
 
     atomic_write_csv(combined_raw, combined_dir / "raw_results_combined.csv")
 
-    # Publication main table: cell-macro MAE by architecture × preprocessing × target.
+    # Publication main table: cell-macro outer-validation MAE by
+    # architecture × preprocessing × target. Restricting to outer_validation is
+    # required — otherwise inner-training / inner-validation rows from the PINN
+    # aggregator are averaged into the headline number.
     if {"metric", "value", "architecture", "preprocessing", "target"}.issubset(combined_raw.columns):
         main_mae = combined_raw[combined_raw["metric"] == "MAE"]
         if "aggregation" in main_mae.columns:
             main_mae = main_mae[main_mae["aggregation"].fillna("").isin(["cell_macro", ""])]
+        if "evaluation_role" in main_mae.columns:
+            main_mae = main_mae[
+                main_mae["evaluation_role"].fillna("").astype(str)
+                .isin(["outer_validation", ""])
+            ]
         pub_table = (
             main_mae.groupby(["model_family", "architecture", "preprocessing", "target"],
                              dropna=False)
@@ -177,11 +185,16 @@ def main() -> None:
                              combined_dir / "all_predictions_combined.parquet")
 
     # Prediction metrics table combined (per architecture/preprocessing/target).
+    # Group by evaluation_role too so downstream readers can pick their slice
+    # instead of the averaged mess.
     if not combined_raw.empty and {"metric", "value"}.issubset(combined_raw.columns):
+        group_keys = ["model_family", "architecture", "preprocessing", "target",
+                      "aggregation", "metric"]
+        if "evaluation_role" in combined_raw.columns:
+            group_keys.append("evaluation_role")
         metrics_wide = (
             combined_raw
-            .groupby(["model_family", "architecture", "preprocessing", "target",
-                      "aggregation", "metric"], dropna=False)
+            .groupby(group_keys, dropna=False)
             ["value"].mean().reset_index()
         )
         atomic_write_csv(metrics_wide, combined_dir / "prediction_metrics_combined.csv")

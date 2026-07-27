@@ -106,6 +106,19 @@ class TrainerConfig:
     log_gpu_memory: bool = True
     log_gradient_norms: bool = True
     device: str = "cuda"
+    # Two-phase refit: after inner train/val selects best_epoch, discard the
+    # temporary model, refit statistics on ALL outer-training cells, and
+    # retrain a fresh model for exactly best_epoch+1 epochs without early
+    # stopping. Improves comparability with classical models trained on the
+    # full outer-training fold.
+    two_phase_refit: bool = True
+    # PDE-gradient gate — after curriculum warm-up, if the physics loss is
+    # active but its gradient is either non-finite or below
+    # ``pde_gradient_min_norm`` for ``pde_gradient_zero_patience`` consecutive
+    # epochs, raise FoldTrainingError instead of silently reporting a PINN
+    # that isn't actually learning physics.
+    pde_gradient_min_norm: float = 1.0e-8
+    pde_gradient_zero_patience: int = 5
 
 
 @dataclass
@@ -198,12 +211,15 @@ def _build_feature_matrix(dataset: AnchorDataset, frame: pd.DataFrame,
 
 
 def _pde_gradient_norm(component_loss: torch.Tensor,
-                       parameters: list[nn.Parameter]) -> float:
+                       parameters: list[nn.Parameter],
+                       logger: logging.Logger | None = None) -> float:
     """Return ‖∂(PDE component)/∂θ‖₂ via ``torch.autograd.grad`` (issue #7).
 
     Uses ``retain_graph=True`` so the caller's subsequent ``total.backward()``
-    still succeeds. Returns 0.0 if the component is not differentiable w.r.t.
-    the model (e.g. when curriculum has scaled the PDE weight to zero).
+    still succeeds. Returns 0.0 only when the component is not differentiable
+    w.r.t. the model (e.g. when curriculum has scaled the PDE weight to zero).
+    Autograd runtime errors are logged and re-raised — silently swallowing
+    them would mask real PINN faults that the enforcement gate must catch.
     """
     if not component_loss.requires_grad:
         return 0.0
@@ -214,8 +230,11 @@ def _pde_gradient_norm(component_loss: torch.Tensor,
             retain_graph=True,
             allow_unused=True,
         )
-    except RuntimeError:
-        return 0.0
+    except RuntimeError as exc:
+        if logger is not None:
+            log_event(logger, logging.ERROR, "pde_gradient_autograd_failed",
+                      error=str(exc))
+        raise
     total_sq = 0.0
     for g in grads:
         if g is None:
@@ -260,11 +279,35 @@ def _load_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer,
     return state
 
 
+def _file_sha256(path: Path | None) -> str:
+    """Return a short hex hash of a file for fingerprinting; '' if missing."""
+    if path is None:
+        return ""
+    p = Path(path)
+    if not p.exists():
+        return ""
+    h = hashlib.sha256()
+    with p.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
 def _compute_run_fingerprint(*, architecture: str, preprocessing: str,
                               fold: int, seed: int,
                               feature_columns: list[str],
                               trainer_config: TrainerConfig,
-                              loss_weights: LossWeights) -> str:
+                              loss_weights: LossWeights,
+                              feature_file: Path | None = None,
+                              split_manifest_file: Path | None = None,
+                              git_commit_hash: str = "",
+                              target_builder_version: str = "") -> str:
+    """Fingerprint used for completed-run reuse.
+
+    Includes not just config/columns but also hashes of the feature parquet
+    and split manifest — so if the dataset changes under the same column
+    names, the fingerprint invalidates and the run is retrained.
+    """
     payload = {
         "architecture": architecture,
         "preprocessing": preprocessing,
@@ -273,6 +316,10 @@ def _compute_run_fingerprint(*, architecture: str, preprocessing: str,
         "feature_columns": list(feature_columns),
         "trainer_config": asdict(trainer_config),
         "loss_weights": asdict(loss_weights),
+        "feature_file_sha256": _file_sha256(feature_file),
+        "split_manifest_sha256": _file_sha256(split_manifest_file),
+        "git_commit": git_commit_hash,
+        "target_builder_version": target_builder_version,
     }
     encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:16]
@@ -507,6 +554,10 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                ablation_name: str | None = None,
                include_discrete_transition: bool = False,
                dry_run: bool = False,
+               feature_file: Path | None = None,
+               split_manifest_file: Path | None = None,
+               git_commit_hash: str = "",
+               target_builder_version: str = "",
                logger: logging.Logger | None = None) -> FoldResult:
     """Train one fold + seed for the requested architecture.
 
@@ -518,12 +569,23 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
     fold_paths.logs_dir.mkdir(parents=True, exist_ok=True)
     device = resolve_device(config.device)
 
+    # AMP is configured but not implemented — training runs in fp32. Warn
+    # loudly if the caller still asks for AMP so downstream metrics aren't
+    # attributed to a mixed-precision run that never happened.
+    if config.use_amp and logger is not None:
+        log_event(logger, logging.WARNING, "amp_not_implemented",
+                  message="use_amp=True was requested but AMP is not implemented; "
+                          "training will run in fp32.")
+
     # Determine fingerprint early so completed-run reuse can validate it.
     fingerprint = _compute_run_fingerprint(
         architecture=config.architecture, preprocessing=config.preprocessing,
         fold=config.fold, seed=config.seed,
         feature_columns=dataset.feature_columns,
         trainer_config=config, loss_weights=loss_weights,
+        feature_file=feature_file, split_manifest_file=split_manifest_file,
+        git_commit_hash=git_commit_hash,
+        target_builder_version=target_builder_version,
     )
     if not force:
         reused = _try_reuse_completed_run(
@@ -686,6 +748,8 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
     best_epoch = int(checkpoint_state.get("best_epoch", 0))
     patience = int(checkpoint_state.get("patience", 0))
     start_epoch = int(checkpoint_state.get("next_epoch", 0))
+    consecutive_zero_pde_gradients = 0
+    warmup_epochs = int(round(config.curriculum_warmup_fraction * config.max_epochs))
 
     tag = f"[{config.architecture} | {config.preprocessing} | fold {config.fold} | seed {config.seed}]"
     bar = tqdm(range(start_epoch, config.max_epochs), desc=tag, unit="ep",
@@ -830,8 +894,34 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             # Measure PDE-only gradient contribution via autograd BEFORE the
             # composite backward (issue #7).
             grad_pde = 0.0
-            if is_pinn and effective_weights.pde > 0:
-                grad_pde = _pde_gradient_norm(pde_component, list(model.parameters()))
+            physics_active = is_pinn and effective_weights.pde > 0
+            if physics_active:
+                grad_pde = _pde_gradient_norm(
+                    pde_component, list(model.parameters()), logger=logger,
+                )
+                # Enforcement gate: only after curriculum warm-up completes.
+                # A physics-informed model that reports zero PDE gradient for
+                # several consecutive epochs is not actually learning the
+                # differential equation — better to fail loudly than silently
+                # publish a "PINN" that is just a DNN with extra config.
+                if epoch >= warmup_epochs:
+                    if not np.isfinite(grad_pde):
+                        raise FoldTrainingError(
+                            f"non-finite PDE gradient at epoch {epoch}: {grad_pde}"
+                        )
+                    if grad_pde <= config.pde_gradient_min_norm:
+                        consecutive_zero_pde_gradients += 1
+                    else:
+                        consecutive_zero_pde_gradients = 0
+                    if consecutive_zero_pde_gradients >= config.pde_gradient_zero_patience:
+                        raise FoldTrainingError(
+                            f"PDE loss produced negligible gradient (<= "
+                            f"{config.pde_gradient_min_norm}) for "
+                            f"{consecutive_zero_pde_gradients} consecutive "
+                            f"physics-active epochs (last epoch={epoch})"
+                        )
+            else:
+                consecutive_zero_pde_gradients = 0
 
             total_loss.backward()
             grad_total = 0.0
@@ -997,11 +1087,13 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                                  weights_only=False)
         model.load_state_dict(best_state["model"])
 
+    # Inner-train and inner-validation predictions always come from the
+    # inner-training model with the inner-training scaler — that is the model
+    # that produced early-stopping decisions.
     prediction_frames = []
     for indices, split_name in (
         (inner_train_idx, "inner_train"),
         (inner_val_idx, "inner_validation"),
-        (outer_val_idx, "outer_validation"),
     ):
         eval_data = _evaluate(model, dataset, frame, indices, scaler, device,
                                is_pinn, config, config.quadrature_method,
@@ -1019,6 +1111,68 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             ablation_name=ablation_name,
         ))
 
+    # Two-phase outer-training refit: rebuild statistics and model on ALL
+    # outer-training cells, train for best_epoch+1 epochs without early
+    # stopping, and produce the outer-validation predictions from the refit
+    # model. This mirrors the classical model, which is trained on the full
+    # outer-training fold, and stops discarding the inner-validation cells
+    # from the final production model.
+    used_refit = False
+    refit_model = None
+    refit_scaler = scaler
+    if (config.two_phase_refit and np.isfinite(best_val)
+            and best_epoch >= 0):
+        try:
+            refit_model, refit_scaler = _refit_full_outer_train(
+                dataset=dataset, frame=frame, outer_train_idx=outer_train_idx,
+                original_scaler=scaler, best_epoch=best_epoch,
+                config=config, loss_weights=loss_weights,
+                u_max_source=u_max_source, u_max_constant=u_max_constant,
+                u_max_margin=u_max_margin,
+                tolerance_source=tolerance_source,
+                tolerance_constant=tolerance_constant,
+                tolerance_quantile=tolerance_quantile,
+                is_pinn=is_pinn,
+                include_discrete_transition=include_discrete_transition,
+                device=device, logger=logger, ablation_name=ablation_name,
+            )
+            used_refit = True
+            if logger is not None:
+                log_event(logger, logging.INFO, "two_phase_refit_completed",
+                          architecture=config.architecture,
+                          preprocessing=config.preprocessing,
+                          fold=config.fold, seed=config.seed,
+                          refit_epochs=best_epoch + 1)
+        except FoldTrainingError:
+            # Refit failure is a hard failure — do not silently fall back to
+            # the inner-only model, since the reported outer-val MAE would
+            # then be under-trained relative to the classical baseline.
+            raise
+        except Exception as exc:
+            raise FoldTrainingError(
+                f"two-phase refit failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    outer_eval_model = refit_model if used_refit else model
+    outer_eval_scaler = refit_scaler
+    outer_eval_data = _evaluate(
+        outer_eval_model, dataset, frame, outer_val_idx, outer_eval_scaler,
+        device, is_pinn, config, config.quadrature_method,
+        config.quadrature_nodes,
+    )
+    if outer_eval_data:
+        prediction_frames.append(_prediction_frame(
+            config.architecture, config.preprocessing, config.fold, config.seed,
+            "outer_validation", outer_val_idx, dataset, frame,
+            outer_eval_data["u_next"], outer_eval_data["r_next"],
+            outer_eval_data["du_ds"], outer_eval_data["pde_residual"],
+            outer_eval_data["ic_error"], outer_eval_data["integral_error"],
+            outer_eval_data["mono_violation"], outer_eval_data["lower_violation"],
+            outer_eval_data["upper_violation"],
+            stress_std=outer_eval_scaler.stress_std, is_pinn=is_pinn,
+            ablation_name=ablation_name,
+        ))
+
     predictions_frame = (
         pd.concat(prediction_frames, ignore_index=True)
         if prediction_frames else pd.DataFrame()
@@ -1027,10 +1181,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
         atomic_write_parquet(predictions_frame, fold_paths.predictions_path)
 
     physics_summary = _summarize_outer_physics(
-        _evaluate(model, dataset, frame, outer_val_idx, scaler, device,
-                   is_pinn, config, config.quadrature_method,
-                   config.quadrature_nodes),
-        is_pinn=is_pinn,
+        outer_eval_data, is_pinn=is_pinn,
     )
 
     atomic_write_json({
@@ -1047,6 +1198,8 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
         "ablation": ablation_name or "",
         "fingerprint": fingerprint,
         "stress_std": float(scaler.stress_std),
+        "two_phase_refit_used": bool(used_refit),
+        "refit_epochs": int(best_epoch + 1) if used_refit else 0,
     }, fold_paths.status_path)
 
     if logger is not None:
@@ -1074,6 +1227,199 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
         epoch_log=epoch_rows,
         fingerprint=fingerprint,
     )
+
+
+def _refit_full_outer_train(
+    *, dataset: AnchorDataset, frame: pd.DataFrame,
+    outer_train_idx: np.ndarray, original_scaler: FoldScaler,
+    best_epoch: int, config: TrainerConfig, loss_weights: LossWeights,
+    u_max_source: str, u_max_constant: float, u_max_margin: float,
+    tolerance_source: str, tolerance_constant: float, tolerance_quantile: float,
+    is_pinn: bool, include_discrete_transition: bool,
+    device: str, logger: logging.Logger | None, ablation_name: str | None,
+) -> tuple[nn.Module, FoldScaler]:
+    """Fit a fresh model on ALL outer-training rows for ``best_epoch + 1``
+    epochs, with no early stopping and no scheduler patience.
+
+    Returns ``(refit_model, refit_scaler)``. Raises FoldTrainingError if the
+    refit scaler drops features that the inner-training scaler kept (which
+    would silently change model architecture).
+    """
+    outer_train_frame = frame.iloc[outer_train_idx].reset_index(drop=True)
+    # Use the same requested feature set — the refit scaler should keep the
+    # same columns as the inner-training scaler (more data can only add or
+    # match columns, not drop them). If it does drop any that the original
+    # kept, we fail rather than silently mismatching architectures.
+    refit_scaler = FoldScaler().fit(
+        outer_train_frame, dataset.feature_columns,
+        u_max_source=u_max_source, u_max_constant=u_max_constant,
+        u_max_margin=u_max_margin, tolerance_source=tolerance_source,
+        tolerance_constant=tolerance_constant,
+        tolerance_quantile=tolerance_quantile,
+    )
+    original_cols = list(original_scaler.feature_columns_used or [])
+    refit_cols = list(refit_scaler.feature_columns_used or [])
+    missing = [c for c in original_cols if c not in refit_cols]
+    if missing:
+        raise FoldTrainingError(
+            f"refit scaler is missing feature columns kept by inner-training "
+            f"scaler: {missing[:5]}{'...' if len(missing) > 5 else ''}"
+        )
+    # Force the refit scaler to expose exactly the original columns so
+    # feature_dim (and model architecture) matches.
+    if refit_cols != original_cols:
+        refit_scaler.feature_columns_used = original_cols
+
+    set_seeds(config.seed)
+    feature_dim = 2 + len(original_cols)
+    if is_pinn:
+        refit_model = NaPINNQ(
+            feature_dim=feature_dim,
+            solution_hidden_dims=config.solution_hidden_dims,
+            rate_hidden_dims=config.rate_hidden_dims,
+            solution_activation=config.solution_activation,
+            rate_activation=config.rate_activation,
+            rate_uses_u_hat=config.rate_uses_u_hat,
+        )
+    else:
+        refit_model = DNNQ(
+            feature_dim=feature_dim,
+            hidden_dims=config.dnn_solution_hidden_dims,
+            solution_activation=config.solution_activation,
+        )
+    refit_model.to(device)
+    optimizer = _init_optimizer(refit_model, config)
+
+    # Build training tensors on the FULL outer-training frame.
+    features_np = _build_feature_matrix(dataset, outer_train_frame, refit_scaler)
+    stress_current_np = refit_scaler.transform_stress(
+        outer_train_frame["stress_current"].to_numpy(dtype=float))
+    stress_next_np = refit_scaler.transform_stress(
+        outer_train_frame["stress_next"].to_numpy(dtype=float))
+    delta_np = refit_scaler.transform_horizon(
+        outer_train_frame["stress_delta"].to_numpy(dtype=float))
+    u_current_np = outer_train_frame["u_current"].to_numpy(dtype=float)
+    u_true_np = outer_train_frame["u_true_next"].to_numpy(dtype=float)
+    cell_codes, _ = _cell_index(outer_train_frame["cell"])
+
+    features = _tensor(features_np, device)
+    delta = _tensor(delta_np, device)
+    u_current = _tensor(u_current_np, device)
+    u_true = _tensor(u_true_np, device)
+    cell_index = torch.as_tensor(cell_codes, device=device, dtype=torch.long)
+
+    # Reuse the same curriculum schedule so the physics weight ramps in the
+    # same way — best_epoch was selected under this schedule, so the refit
+    # model should see the same weighting per epoch. Cap epochs at best_epoch+1.
+    curriculum = CurriculumSchedule(
+        max_epochs=config.max_epochs,
+        warmup_fraction=config.curriculum_warmup_fraction,
+        ramp_end_fraction=config.curriculum_ramp_end_fraction,
+    )
+    refit_epochs = max(1, best_epoch + 1)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(config.seed)
+
+    for epoch in range(refit_epochs):
+        refit_model.train()
+        optimizer.zero_grad()
+        factor = curriculum.factor(epoch)
+        effective_weights = loss_weights.effective(factor)
+
+        stress_current_tensor = torch.as_tensor(
+            stress_current_np, dtype=torch.float32, device=device,
+        ).clone().requires_grad_(True)
+        stress_next_tensor = torch.as_tensor(
+            stress_next_np, dtype=torch.float32, device=device,
+        ).clone().requires_grad_(True)
+
+        if is_pinn:
+            u_next_hat = refit_model.solution(stress_next_tensor, features)
+            r_next_hat = refit_model.rate(stress_next_tensor, features, u_next_hat)
+            u_anchor_hat = refit_model.solution(stress_current_tensor, features)
+            r_anchor_hat = refit_model.rate(stress_current_tensor, features, u_anchor_hat)
+            du_next = autograd_du_ds(u_next_hat, stress_next_tensor)
+            du_current = autograd_du_ds(u_anchor_hat, stress_current_tensor)
+            residual_anchor = pde_residual(du_current, r_anchor_hat)
+            residual_next = pde_residual(du_next, r_next_hat)
+            collocation = sample_collocation_points(
+                stress_current=stress_current_tensor.detach(),
+                stress_delta=torch.as_tensor(delta_np, dtype=torch.float32, device=device),
+                features=features,
+                cell_index=cell_index,
+                points_per_transition=config.collocation_points,
+                generator=generator if device == "cpu" else None,
+            )
+            collo_stress = collocation.stress.clone().detach().requires_grad_(True)
+            u_collo = refit_model.solution(collo_stress, collocation.features)
+            r_collo = refit_model.rate(collo_stress, collocation.features, u_collo)
+            du_collo = autograd_du_ds(u_collo, collo_stress)
+            residual_collo = pde_residual(du_collo, r_collo)
+            u_integrated = integral_transition(
+                refit_model.solution, refit_model.rate,
+                stress_current_tensor,
+                torch.as_tensor(delta_np, dtype=torch.float32, device=device),
+                features, u_current,
+                method=config.quadrature_method, n_nodes=config.quadrature_nodes,
+            )
+        else:
+            u_next_hat = refit_model(stress_next_tensor, features)
+            u_anchor_hat = refit_model(stress_current_tensor, features)
+            r_next_hat = torch.zeros_like(u_next_hat)
+            r_anchor_hat = torch.zeros_like(u_anchor_hat)
+            residual_anchor = torch.zeros_like(u_anchor_hat)
+            residual_collo = torch.zeros_like(u_next_hat)
+            u_integrated = torch.zeros_like(u_next_hat)
+            collocation = None
+
+        # Train on ALL rows (no train_selector this time).
+        data_l, _ = data_loss(u_next_hat, u_true, cell_index,
+                              delta=config.huber_delta)
+        pde_anchor_l = residual_anchor.new_zeros(())
+        pde_collo_l = residual_collo.new_zeros(()) if is_pinn else residual_anchor.new_zeros(())
+        ic_l = residual_anchor.new_zeros(())
+        integral_l = residual_anchor.new_zeros(())
+        mono_l = residual_anchor.new_zeros(())
+        bounds_l = residual_anchor.new_zeros(())
+        rate_l = residual_anchor.new_zeros(())
+        discrete_l = residual_anchor.new_zeros(())
+        if is_pinn:
+            pde_anchor_l, _ = pde_loss(residual_anchor, cell_index)
+            if collocation is not None and residual_collo.numel():
+                pde_collo_l, _ = pde_loss(residual_collo, collocation.cell_index)
+            ic_l, _ = initial_condition_loss(u_anchor_hat, u_current, cell_index)
+            integral_l, _ = integral_consistency_loss(u_next_hat, u_integrated, cell_index)
+            mono_l, _ = monotonicity_loss(u_next_hat, u_current, cell_index,
+                                           epsilon_rec=refit_scaler.epsilon_rec)
+            bounds_l, _ = bounds_loss(u_next_hat, cell_index,
+                                       u_min=0.0, u_max=refit_scaler.u_max)
+            rate_l, _ = rate_regularization_loss(r_next_hat, cell_index)
+            if include_discrete_transition:
+                discrete_residual = discrete_state_transition_residual(
+                    u_next_hat, u_current, r_anchor_hat,
+                    torch.as_tensor(delta_np, dtype=torch.float32, device=device),
+                )
+                discrete_l, _ = discrete_state_transition_loss(discrete_residual, cell_index)
+
+        total = (
+            effective_weights.data * data_l
+            + effective_weights.pde * (pde_anchor_l + pde_collo_l)
+            + effective_weights.initial_condition * ic_l
+            + effective_weights.integral * integral_l
+            + effective_weights.monotonicity * mono_l
+            + effective_weights.bounds * bounds_l
+            + effective_weights.rate_regularization * rate_l
+            + effective_weights.discrete_state_transition * discrete_l
+        )
+        if not torch.isfinite(total):
+            raise FoldTrainingError(
+                f"non-finite refit loss at refit epoch {epoch}: {total.item()}"
+            )
+        total.backward()
+        torch.nn.utils.clip_grad_norm_(refit_model.parameters(), config.gradient_clip_norm)
+        optimizer.step()
+
+    return refit_model, refit_scaler
 
 
 def _summarize_outer_physics(outer_eval: dict[str, np.ndarray],

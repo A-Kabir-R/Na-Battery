@@ -186,18 +186,115 @@ def _classify_column(column: str) -> tuple[str, str]:
     return "unaudited", "no_positive_signal"
 
 
+def load_provenance_manifest(preprocessing: str, *,
+                              features_dir: Path | None = None,
+                              explicit_path: Path | None = None
+                              ) -> pd.DataFrame | None:
+    """Load a per-preprocessing feature provenance CSV, if present.
+
+    The CSV supersedes the name-based whitelist for any column it lists. Schema
+    (each row describes one feature):
+
+    ``feature``          — column name (must match the parquet).
+    ``source_columns``   — comma-separated raw columns the feature depends on.
+    ``uses_target_rpt``  — bool; True → rejected (target-derived).
+    ``uses_future_rows`` — bool; True → rejected (any forward lookup).
+    ``rolling_direction``— {'backward','none','',NaN} allowed;
+                           {'forward','centered'} → rejected.
+    ``shift_count``      — non-positive → allowed (past only), positive → rejected.
+    ``known_at_anchor``  — bool; False → rejected unless
+                           ``planned_at_inference`` is also True.
+    ``planned_at_inference`` — bool; forecast-horizon-style features may be
+                           unknown at anchor time but planned.
+    ``allowed``          — optional explicit override (bool). If present it wins.
+    """
+    candidate = explicit_path
+    if candidate is None and features_dir is not None:
+        candidate = features_dir / f"{preprocessing}.provenance.csv"
+    if candidate is None or not Path(candidate).exists():
+        return None
+    return pd.read_csv(candidate)
+
+
+def _classify_from_provenance(row: pd.Series) -> tuple[str, str]:
+    """Return ``(status, reason)`` from a provenance manifest row."""
+    def _truthy(v: Any) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, float) and np.isnan(v):
+            return False
+        s = str(v).strip().lower()
+        return s in {"1", "true", "yes", "y", "t"}
+
+    # Explicit override wins.
+    if "allowed" in row.index and pd.notna(row.get("allowed")):
+        if _truthy(row.get("allowed")):
+            return "allowed", "provenance:explicit_allowed"
+        return "rejected", "provenance:explicit_rejected"
+
+    if _truthy(row.get("uses_target_rpt")):
+        return "rejected", "provenance:uses_target_rpt"
+    if _truthy(row.get("uses_future_rows")):
+        return "rejected", "provenance:uses_future_rows"
+
+    direction = str(row.get("rolling_direction", "") or "").strip().lower()
+    if direction in {"forward", "centered", "look_ahead", "lookahead"}:
+        return "rejected", f"provenance:rolling_direction={direction}"
+
+    shift = row.get("shift_count", 0)
+    try:
+        shift_int = int(float(shift)) if shift is not None and str(shift) != "" else 0
+    except (TypeError, ValueError):
+        shift_int = 0
+    if shift_int > 0:
+        return "rejected", f"provenance:shift_count={shift_int}"
+
+    planned = _truthy(row.get("planned_at_inference"))
+    known = _truthy(row.get("known_at_anchor"))
+    if not known and not planned:
+        return "rejected", "provenance:not_known_at_anchor"
+
+    return "allowed", "provenance:causal"
+
+
 def build_temporal_feature_audit(candidate_columns: Iterable[str], *,
                                  preprocessing: str,
-                                 allow_unaudited: bool = False) -> pd.DataFrame:
+                                 allow_unaudited: bool = False,
+                                 provenance: pd.DataFrame | None = None,
+                                 ) -> pd.DataFrame:
     """Classify each candidate feature column as allowed / rejected / unaudited.
 
-    Unaudited columns are permitted only when ``allow_unaudited=True``. The
-    returned frame has one row per input column with ``status``,
-    ``allowed_as_input`` and ``rejection_reason``.
+    When ``provenance`` is supplied (see :func:`load_provenance_manifest`), it
+    is the authoritative source: for any listed feature the provenance row
+    decides the status directly. Columns absent from provenance fall back to
+    the name-based whitelist (with the same ``allow_unaudited`` semantics).
     """
+    provenance_map: dict[str, pd.Series] = {}
+    if provenance is not None and not provenance.empty and "feature" in provenance.columns:
+        provenance_map = {
+            str(row["feature"]): row for _, row in provenance.iterrows()
+        }
+
     rows: list[dict[str, Any]] = []
     for column in candidate_columns:
-        status, reason = _classify_column(column)
+        prov_row = provenance_map.get(column)
+        if prov_row is not None:
+            status, reason = _classify_from_provenance(prov_row)
+            provenance_source = "provenance_manifest"
+            planned_at_inference = bool(
+                str(prov_row.get("planned_at_inference", "")).strip().lower()
+                in {"1", "true", "yes", "y", "t"}
+            )
+            known_at_anchor = bool(
+                str(prov_row.get("known_at_anchor", "")).strip().lower()
+                in {"1", "true", "yes", "y", "t"}
+            )
+        else:
+            status, reason = _classify_column(column)
+            provenance_source = "column_name_registry"
+            planned_at_inference = column in {"next_rpt_horizon_days", "horizon_days_planned"}
+            known_at_anchor = bool(status == "allowed")
+
         if status == "allowed":
             allowed = True
             final_reason = ""
@@ -206,16 +303,16 @@ def build_temporal_feature_audit(candidate_columns: Iterable[str], *,
             final_reason = reason
         else:  # unaudited
             allowed = bool(allow_unaudited)
-            final_reason = "" if allowed else f"unaudited (no positive provenance signal)"
+            final_reason = "" if allowed else "unaudited (no positive provenance signal)"
         rows.append({
             "feature": column,
             "preprocessing": preprocessing,
             "status": status,
-            "provenance_source": "column_name_registry",
+            "provenance_source": provenance_source,
             "measurement_end": "anchor_time_or_earlier" if status == "allowed"
                 else ("future_derived" if status == "rejected" else "unknown"),
-            "known_at_anchor": bool(status == "allowed"),
-            "planned_at_inference": column in {"next_rpt_horizon_days", "horizon_days_planned"},
+            "known_at_anchor": known_at_anchor,
+            "planned_at_inference": planned_at_inference,
             "future_derived": bool(status == "rejected"),
             "allowed_as_input": bool(allowed),
             "rejection_reason": final_reason,
@@ -347,7 +444,9 @@ def build_anchor_dataset(preprocessing_frame: pd.DataFrame, *,
                          preprocessing: str,
                          stress_cfg: Mapping[str, Any],
                          audit_cfg: Mapping[str, Any] | None = None,
-                         audit_path: Path | None = None) -> AnchorDataset:
+                         audit_path: Path | None = None,
+                         provenance_manifest: pd.DataFrame | None = None,
+                         features_dir: Path | None = None) -> AnchorDataset:
     """Filter ``preprocessing_frame`` to eligible anchors and audit features.
 
     ``stress_cfg`` corresponds to ``config.pinn.stress`` and
@@ -418,9 +517,14 @@ def build_anchor_dataset(preprocessing_frame: pd.DataFrame, *,
     ]
 
     allow_unaudited = bool((audit_cfg or {}).get("allow_unaudited", False))
+    if provenance_manifest is None and features_dir is not None:
+        provenance_manifest = load_provenance_manifest(
+            preprocessing, features_dir=features_dir,
+        )
     audit = build_temporal_feature_audit(
         candidate_columns, preprocessing=preprocessing,
         allow_unaudited=allow_unaudited,
+        provenance=provenance_manifest,
     )
     if audit_path is not None:
         audit_path.parent.mkdir(parents=True, exist_ok=True)

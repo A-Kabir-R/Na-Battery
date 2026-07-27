@@ -53,12 +53,20 @@ def main() -> None:
         log_event(logger, logging.INFO, "artifact_loaded", key=key,
                   path=str(results / filename), rows=int(len(loaded[key])))
 
+    # Optional combined-family metrics from the classical+PINN report — used
+    # only for the accuracy comparison bar; skipped silently if not present.
+    combined_metrics_path = (Path(cfg["paths"]["artifacts"]) / "results"
+                              / "combined_classical_pinn"
+                              / "prediction_metrics_combined.csv")
+    combined_metrics = _safe_read(combined_metrics_path) if combined_metrics_path.exists() else None
+
     render_all_pinn_plots(
         epoch_log=loaded["epoch_log"],
         predictions=loaded["predictions"],
         target_metrics=loaded["metrics"],
         ablation_metrics=loaded["ablation"],
         complexity=loaded["complexity"],
+        combined_metrics=combined_metrics,
         output_dir=plots_dir,
     )
     print(f"[pinn.plot] rendered plots into {plots_dir}")

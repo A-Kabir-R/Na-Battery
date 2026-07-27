@@ -168,6 +168,7 @@ def main() -> None:
                 frame, preprocessing=prep, stress_cfg=pinn_cfg["stress"],
                 audit_cfg=pinn_cfg.get("audit"),
                 audit_path=results_dir / f"temporal_feature_audit_{prep}.csv",
+                features_dir=features_dir,
             )
             attached = apply_split_manifest(dataset.frame, split_manifest)
             log_dataset_summary(logger, dataset, attached, preprocessing=prep)
@@ -200,6 +201,11 @@ def main() -> None:
                 maximum_parameters=int(pinn_cfg["model"]["maximum_parameters"]),
                 inner_split_seed=int(pinn_cfg.get("audit", {}).get(
                     "inner_split_seed", 20240117)),
+                two_phase_refit=bool(pinn_cfg["training"].get("two_phase_refit", True)),
+                pde_gradient_min_norm=float(pinn_cfg["training"].get(
+                    "pde_gradient_min_norm", 1.0e-8)),
+                pde_gradient_zero_patience=int(pinn_cfg["training"].get(
+                    "pde_gradient_zero_patience", 5)),
                 log_every_epochs=int(pinn_cfg["logging"]["log_every_epochs"]),
                 save_checkpoint_every_epochs=int(pinn_cfg["logging"]["save_checkpoint_every_epochs"]),
                 log_gpu_memory=bool(pinn_cfg["logging"]["log_gpu_memory"]),
@@ -218,6 +224,11 @@ def main() -> None:
                 tolerance_quantile=float(pinn_cfg["monotonicity"]["tolerance_quantile"]),
                 resume=args.resume, force=args.force,
                 dry_run=args.dry_run,
+                # Fingerprint feeds — file hashes + git commit so a data
+                # refresh invalidates cached completed runs.
+                feature_file=features_dir / f"{prep}.parquet",
+                split_manifest_file=Path(cfg["paths"]["artifacts"]) / "splits" / "split_manifest.parquet",
+                git_commit_hash=str(git_commit(HERE.parent)),
                 logger=logger,
             )
             manifest_rows.append({

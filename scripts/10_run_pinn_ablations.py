@@ -143,6 +143,7 @@ def main() -> None:
         frame, preprocessing=preprocessing, stress_cfg=pinn_cfg["stress"],
         audit_cfg=pinn_cfg.get("audit"),
         audit_path=results / f"temporal_feature_audit_{preprocessing}.csv",
+        features_dir=features_path.parent,
     )
     attached = apply_split_manifest(dataset.frame, split_manifest)
     log_dataset_summary(logger, dataset, attached, preprocessing=preprocessing)
@@ -187,6 +188,11 @@ def main() -> None:
             maximum_parameters=int(pinn_cfg["model"]["maximum_parameters"]),
             inner_split_seed=int(pinn_cfg.get("audit", {}).get(
                 "inner_split_seed", 20240117)),
+            two_phase_refit=bool(pinn_cfg["training"].get("two_phase_refit", True)),
+            pde_gradient_min_norm=float(pinn_cfg["training"].get(
+                "pde_gradient_min_norm", 1.0e-8)),
+            pde_gradient_zero_patience=int(pinn_cfg["training"].get(
+                "pde_gradient_zero_patience", 5)),
             log_every_epochs=int(pinn_cfg["logging"]["log_every_epochs"]),
             save_checkpoint_every_epochs=int(pinn_cfg["logging"]["save_checkpoint_every_epochs"]),
             log_gpu_memory=bool(pinn_cfg["logging"]["log_gpu_memory"]),
@@ -206,6 +212,9 @@ def main() -> None:
                 force=args.force,
                 ablation_name=str(config_row["name"]),
                 include_discrete_transition=include_discrete,
+                feature_file=features_path,
+                split_manifest_file=split_path,
+                git_commit_hash=str(git_commit(HERE.parent)),
                 logger=logger,
             )
             prediction_paths.append(paths.predictions_path)
@@ -224,10 +233,15 @@ def main() -> None:
         raise SystemExit("no ablation predictions produced")
 
     metric_frames = []
-    groups = list(predictions.groupby(
-        ["ablation", "architecture", "preprocessing", "fold", "seed"], dropna=False))
-    for (ablation, arch, prep, fold, seed), group in tqdm(
-            groups, desc="[pinn.ablation] metrics", unit="run"):
+    # Group by evaluation_role too — otherwise training predictions bleed into
+    # the validation MAE that drives A0..A6 comparison.
+    group_columns = ["ablation", "architecture", "preprocessing", "fold", "seed",
+                     "evaluation_role"]
+    if "evaluation_role" not in predictions.columns:
+        group_columns.remove("evaluation_role")
+    groups = list(predictions.groupby(group_columns, dropna=False))
+    for key, group in tqdm(groups, desc="[pinn.ablation] metrics", unit="run"):
+        ablation = key[0]
         rows = target_metric_rows(group)
         rows["ablation"] = ablation
         metric_frames.append(rows)

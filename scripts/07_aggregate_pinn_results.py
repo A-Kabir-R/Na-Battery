@@ -2,6 +2,7 @@
 """Aggregate every PINN fold prediction into publication-ready tables."""
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -22,6 +23,17 @@ from src.pinn.evaluation import (  # noqa: E402
 )
 from src.pinn.logging_utils import get_logger, log_event  # noqa: E402
 from src.pinn.utils import atomic_write_csv, atomic_write_parquet, git_commit  # noqa: E402
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--allow-partial", action="store_true",
+                        help="Aggregate even when the manifest is incomplete "
+                             "(diagnostic only — do not use for publication).")
+    parser.add_argument("--include-failed-logs", action="store_true",
+                        help="Include epoch logs from failed/unknown-status runs "
+                             "in the combined epoch table.")
+    return parser.parse_args()
 
 
 def _results_dir(cfg: dict) -> Path:
@@ -50,30 +62,37 @@ def _iter_prediction_paths(run_root: Path):
         yield predictions
 
 
-def _iter_epoch_logs(run_root: Path):
+def _iter_epoch_logs(run_root: Path, *, include_failed: bool = False):
     for epoch_log in sorted(run_root.rglob("epoch_log.parquet")):
         status_path = epoch_log.parent.parent / "status.json"
         if not status_path.exists():
-            yield epoch_log
+            if include_failed:
+                yield epoch_log
             continue
         try:
             status = json.loads(status_path.read_text())
         except Exception:
-            yield epoch_log
+            if include_failed:
+                yield epoch_log
             continue
         if status.get("status") != "completed":
+            if include_failed:
+                yield epoch_log
             continue
         yield epoch_log
 
 
 def main() -> None:
+    args = _parse_args()
     cfg = load_config()
     results = _results_dir(cfg)
     run_root = results / "runs"
     logger = get_logger("07_aggregate_pinn_results", log_dir=results / "logs")
     log_event(logger, logging.INFO, "script_start",
               script="07_aggregate_pinn_results",
-              git_commit=git_commit(HERE.parent), run_root=str(run_root))
+              git_commit=git_commit(HERE.parent), run_root=str(run_root),
+              allow_partial=args.allow_partial,
+              include_failed_logs=args.include_failed_logs)
 
     if not run_root.exists():
         raise SystemExit(f"no run directory at {run_root}; run scripts/06 first")
@@ -97,9 +116,20 @@ def main() -> None:
               n=len(prediction_paths), expected_completed=expected_completed,
               planned=planned)
     if expected_completed and len(prediction_paths) < expected_completed:
+        msg = (f"[pinn.aggregate] found {len(prediction_paths)} completed "
+               f"prediction files but the manifest expected {expected_completed}")
+        if args.allow_partial:
+            print(f"{msg}; --allow-partial set, continuing with diagnostic aggregation.")
+            log_event(logger, logging.WARNING, "partial_aggregation_allowed",
+                      found=len(prediction_paths), expected=expected_completed)
+        else:
+            raise SystemExit(f"{msg}; refusing to aggregate. Pass --allow-partial "
+                             f"for diagnostic aggregation.")
+    if planned and expected_completed != planned and not args.allow_partial:
         raise SystemExit(
-            f"[pinn.aggregate] found {len(prediction_paths)} completed prediction files "
-            f"but the manifest expected {expected_completed}; refusing to aggregate."
+            f"[pinn.aggregate] experiment manifest lists {planned} planned runs "
+            f"but only {expected_completed} completed; refuse to aggregate a "
+            f"partial sweep. Pass --allow-partial for diagnostic aggregation."
         )
     predictions_frames = []
     for path in tqdm(prediction_paths, desc="[pinn.aggregate] loading", unit="run"):
@@ -123,13 +153,25 @@ def main() -> None:
     physics_rows = []
     horizon_rows = []
     complexity_rows = []
-    groups = list(predictions.groupby(
-        ["architecture", "preprocessing", "fold", "seed"], dropna=False))
-    for (arch, prep, fold, seed), group in tqdm(
-            groups, desc="[pinn.aggregate] metrics", unit="run"):
+    # Group by evaluation_role too — otherwise inner_train, inner_validation
+    # and outer_validation rows collapse into a single metric row per run and
+    # inflate reported validation accuracy (post-Stage-4 correction).
+    group_columns = ["architecture", "preprocessing", "fold", "seed", "evaluation_role"]
+    if "evaluation_role" not in predictions.columns:
+        group_columns.remove("evaluation_role")
+    groups = list(predictions.groupby(group_columns, dropna=False))
+    seen_complexity: set[tuple[object, ...]] = set()
+    for key, group in tqdm(groups, desc="[pinn.aggregate] metrics", unit="run"):
         metric_rows.append(target_metric_rows(group))
         physics_rows.append(physics_metric_rows(group))
         horizon_rows.append(horizon_metric_rows(group))
+        # First four positions are always arch/prep/fold/seed — evaluation_role
+        # is optional, but complexity is per (arch,prep,fold,seed) regardless.
+        arch, prep, fold, seed = key[0], key[1], key[2], key[3]
+        complexity_key = (arch, prep, fold, seed)
+        if complexity_key in seen_complexity:
+            continue
+        seen_complexity.add(complexity_key)
         run_dir = run_root / str(arch) / str(prep) / f"fold_{fold}" / f"seed_{seed}"
         status_path = run_dir / "status.json"
         if status_path.exists():
@@ -191,7 +233,8 @@ def main() -> None:
         )
         atomic_write_csv(ranking, results / "development_cv_model_ranking.csv")
 
-    epoch_paths = list(_iter_epoch_logs(run_root))
+    epoch_paths = list(_iter_epoch_logs(run_root,
+                                         include_failed=args.include_failed_logs))
     if epoch_paths:
         epoch_frames = []
         for path in tqdm(epoch_paths, desc="[pinn.aggregate] epoch logs", unit="run"):

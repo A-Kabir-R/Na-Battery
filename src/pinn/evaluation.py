@@ -14,8 +14,17 @@ TARGET_VIEWS = (
     "delta_next_rpt_SOH_pct",
 )
 
+# Targets for which MAPE is meaningless because typical magnitudes are
+# small enough that any small y_true blows the ratio up.
+_MAPE_DISABLED_TARGETS = frozenset({
+    "delta_next_rpt_Q_Ah",
+    "delta_next_rpt_SOH_pct",
+})
+_MAPE_MIN_ABS = 1e-6  # y_true below this magnitude is masked out of MAPE
 
-def _regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+
+def _regression_metrics(y_true: np.ndarray, y_pred: np.ndarray, *,
+                        target: str | None = None) -> dict[str, float]:
     mask = np.isfinite(y_true) & np.isfinite(y_pred)
     if not mask.any():
         return {"MAE": float("nan"), "RMSE": float("nan"), "R2": float("nan"),
@@ -29,10 +38,14 @@ def _regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, flo
     mean_true = float(np.mean(y_true))
     ss_tot = float(np.sum((y_true - mean_true) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
-    if (y_true == 0).any():
+    if target in _MAPE_DISABLED_TARGETS:
         mape = float("nan")
     else:
-        mape = float(100.0 * np.mean(np.abs(residual / y_true)))
+        stable = np.abs(y_true) >= _MAPE_MIN_ABS
+        if not stable.any():
+            mape = float("nan")
+        else:
+            mape = float(100.0 * np.mean(np.abs(residual[stable] / y_true[stable])))
     return {"MAE": mae, "RMSE": rmse, "R2": r2, "MaxError": max_err,
             "MAPE": mape, "n": int(y_true.size)}
 
@@ -58,6 +71,7 @@ def target_metric_rows(predictions: pd.DataFrame) -> pd.DataFrame:
                 metrics = _regression_metrics(
                     predictions[true_col].to_numpy(dtype=float),
                     predictions[pred_col].to_numpy(dtype=float),
+                    target=target,
                 )
             else:
                 group_col = "cell_id" if aggregation == "cell_macro" else "condition_id"
@@ -66,6 +80,7 @@ def target_metric_rows(predictions: pd.DataFrame) -> pd.DataFrame:
                     per_group.append(_regression_metrics(
                         group[true_col].to_numpy(dtype=float),
                         group[pred_col].to_numpy(dtype=float),
+                        target=target,
                     ))
                 if not per_group:
                     metrics = {"MAE": float("nan"), "RMSE": float("nan"),
@@ -106,6 +121,7 @@ def horizon_metric_rows(predictions: pd.DataFrame,
         metrics = _regression_metrics(
             group["true_next_Q_Ah"].to_numpy(dtype=float),
             group["predicted_next_Q_Ah"].to_numpy(dtype=float),
+            target="next_rpt_Q_Ah",
         )
         rows.append({"horizon_bin": str(bin_label), **metrics,
                      "architecture": predictions["architecture"].iloc[0] if "architecture" in predictions.columns else "",
@@ -215,7 +231,12 @@ def cell_paired_bootstrap(a: pd.DataFrame, b: pd.DataFrame, *, metric: str = "MA
                           replicates: int = 1000, seed: int = 42) -> dict[str, float]:
     """Cell-level paired bootstrap of ``metric(a) - metric(b)``.
 
-    Both frames must share the ``cell_id`` axis and refer to the same target.
+    The correct paired procedure is to compute one per-cell metric difference
+    ``d_cell = metric(a|cell) - metric(b|cell)`` and then resample the
+    difference vector with replacement. Sampling cells and then row-filtering
+    with ``isin`` silently deduplicates: cell drawn three times contributes
+    the same rows once, so the "bootstrap" no longer resamples with proper
+    multiplicity.
     """
     target_to_columns = {
         "next_rpt_Q_Ah": ("true_next_Q_Ah", "predicted_next_Q_Ah"),
@@ -228,29 +249,43 @@ def cell_paired_bootstrap(a: pd.DataFrame, b: pd.DataFrame, *, metric: str = "MA
     if not common_cells:
         return {"mean": float("nan"), "median": float("nan"),
                 "ci_low": float("nan"), "ci_high": float("nan"),
-                "win_fraction": float("nan")}
+                "win_fraction": float("nan"),
+                "n_cells": 0, "replicates": int(replicates)}
+
+    # Precompute one metric difference per cell.
+    a_by_cell = {str(cid): grp for cid, grp in a.groupby(a["cell_id"].astype(str))}
+    b_by_cell = {str(cid): grp for cid, grp in b.groupby(b["cell_id"].astype(str))}
+    cell_diffs: list[float] = []
+    for cell in common_cells:
+        grp_a = a_by_cell[cell]
+        grp_b = b_by_cell[cell]
+        m_a = _regression_metrics(
+            grp_a[true_col].to_numpy(dtype=float),
+            grp_a[pred_col].to_numpy(dtype=float),
+            target=target,
+        )[metric]
+        m_b = _regression_metrics(
+            grp_b[true_col].to_numpy(dtype=float),
+            grp_b[pred_col].to_numpy(dtype=float),
+            target=target,
+        )[metric]
+        cell_diffs.append(m_a - m_b)
+    cell_diffs_arr = np.asarray(cell_diffs, dtype=float)
+
     rng = np.random.default_rng(seed)
-    diffs = []
-    for _ in range(int(replicates)):
-        sample = rng.choice(common_cells, size=len(common_cells), replace=True)
-        subset_a = a[a["cell_id"].astype(str).isin(sample)]
-        subset_b = b[b["cell_id"].astype(str).isin(sample)]
-        metric_a = _regression_metrics(
-            subset_a[true_col].to_numpy(dtype=float),
-            subset_a[pred_col].to_numpy(dtype=float),
-        )[metric]
-        metric_b = _regression_metrics(
-            subset_b[true_col].to_numpy(dtype=float),
-            subset_b[pred_col].to_numpy(dtype=float),
-        )[metric]
-        diffs.append(metric_a - metric_b)
-    diffs_arr = np.asarray(diffs, dtype=float)
+    n_cells = cell_diffs_arr.size
+    replicate_means = np.empty(int(replicates), dtype=float)
+    for i in range(int(replicates)):
+        idx = rng.integers(0, n_cells, size=n_cells)  # sampling with replacement
+        replicate_means[i] = float(np.nanmean(cell_diffs_arr[idx]))
     return {
-        "mean": float(np.nanmean(diffs_arr)),
-        "median": float(np.nanmedian(diffs_arr)),
-        "ci_low": float(np.nanpercentile(diffs_arr, 2.5)),
-        "ci_high": float(np.nanpercentile(diffs_arr, 97.5)),
-        "win_fraction": float(np.mean(diffs_arr < 0)),
+        "mean": float(np.nanmean(replicate_means)),
+        "median": float(np.nanmedian(replicate_means)),
+        "ci_low": float(np.nanpercentile(replicate_means, 2.5)),
+        "ci_high": float(np.nanpercentile(replicate_means, 97.5)),
+        "win_fraction": float(np.mean(replicate_means < 0)),
+        "n_cells": int(n_cells),
+        "replicates": int(replicates),
     }
 
 

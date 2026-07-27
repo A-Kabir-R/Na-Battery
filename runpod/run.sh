@@ -59,9 +59,12 @@ echo "[run] r2.env loaded  R2_BUCKET=${R2_BUCKET:-<unset>}  STOP_MODE=${STOP_MOD
 : "${R2_PREFIX:=sodium_ion_battery}"
 : "${RUN_STAGES:=canonical,build,degradation,experiments,aggregate,plot}"
 
-# Expand the alias 'all' to the full classical + PINN pipeline.
+# Expand the alias 'all' to the full classical + PINN pipeline. pinn_ablation
+# must precede pinn_plot: the plotting script reads ablation_metrics.csv, and
+# without the earlier ordering the ablation bar was silently absent from the
+# published figure set.
 if [[ "$RUN_STAGES" == "all" ]]; then
-  RUN_STAGES="canonical,build,degradation,experiments,aggregate,plot,pinn,pinn_aggregate,pinn_plot,pinn_ablation,combined_report"
+  RUN_STAGES="canonical,build,degradation,experiments,aggregate,plot,pinn,pinn_aggregate,pinn_ablation,pinn_plot,combined_report"
 fi
 
 log(){ printf '\n[run %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -184,12 +187,26 @@ for stage in "${STAGES[@]}"; do
     pinn_plot)        run_stage pinn_plot        scripts/08_plot_pinn_results.py ;;
     pinn_ablation)    run_stage pinn_ablation    scripts/10_run_pinn_ablations.py ;;
     combined_report)
-      # --require-classical if the classical pipeline actually ran in this
-      # session; otherwise skip the strict flag so a PINN-only R2 upload is
-      # still produced.
+      # Resolve the classical results directory from config.yaml (via the
+      # loaded config) rather than duplicating the YAML default in Bash — the
+      # classical pipeline writes to experiment.results_subdir which is
+      # 'extratrees_preprocessing_selection', not the legacy fallback.
+      CLASSICAL_RESULTS_DIR="$(python - <<'PY'
+from pathlib import Path
+from src.io.loaders import load_config
+cfg = load_config()
+subdir = (cfg.get("experiment") or {}).get("results_subdir") or ""
+print(Path(cfg["paths"]["artifacts"]) / "results" / subdir)
+PY
+)"
       COMBINED_ARGS=""
-      if [[ -f "${SIB_ARTIFACTS}/results/${SIB_EXPERIMENT_SUBDIR:-standard_cycling}/raw_results.csv" ]]; then
-        COMBINED_ARGS="--require-classical"
+      if [[ -f "${CLASSICAL_RESULTS_DIR}/raw_results.csv" ]]; then
+        # If both pipelines are part of the requested run, require both.
+        if [[ ",${RUN_STAGES}," == *",pinn,"* || "${RUN_STAGES}" == "all" ]]; then
+          COMBINED_ARGS="--require-classical --require-pinn"
+        else
+          COMBINED_ARGS="--require-classical"
+        fi
       fi
       log "===== stage: combined_report -> python scripts/09_combine_classical_pinn_results.py ${COMBINED_ARGS} ====="
       t0=$SECONDS
