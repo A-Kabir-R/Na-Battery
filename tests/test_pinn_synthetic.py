@@ -34,7 +34,13 @@ def _train_synthetic(stress_np, u_true_np, features_np, *, epochs: int = 800,
 
 
 def test_synthetic_linear_recovery() -> None:
-    """u(s) = 1 - k*s => du/ds = -k, r_hat ~= k."""
+    """u(s) = 1 - k*s => du/ds = -k, rate_hat should recover k pointwise.
+
+    Tolerances verify physics recovery, not just that training executed:
+    - mean rate within 20 % of k_true (rel) and within 0.005 (abs)
+    - trajectory RMSE < 0.01 (model must fit the data well)
+    - PDE RMSE < 0.01 (du/ds + r must be near zero everywhere)
+    """
     import numpy as np
     k_true = 0.02
     stress = np.linspace(0.0, 5.0, 60, dtype="float32")
@@ -47,13 +53,25 @@ def test_synthetic_linear_recovery() -> None:
         u_hat = model.solution(s, torch.tensor(features))
         r_hat = model.rate(s, torch.tensor(features), u_hat)
         du = autograd_du_ds(u_hat, s)
-    residual = du + r_hat
-    assert torch.mean(r_hat).item() == pytest.approx(k_true, abs=5e-2)
-    assert float(residual.pow(2).mean().sqrt().item()) < 1e-1
+
+    residual = du + r_hat  # PDE residual: should be ~0
+    mean_rate = torch.mean(r_hat).item()
+    trajectory_rmse = float((u_hat.detach() - torch.tensor(u_true)).pow(2).mean().sqrt().item())
+    pde_rmse = float(residual.pow(2).mean().sqrt().item())
+
+    assert mean_rate == pytest.approx(k_true, rel=0.20, abs=0.005)
+    assert trajectory_rmse < 0.01
+    assert pde_rmse < 0.01
 
 
 def test_synthetic_nonlinear_recovery() -> None:
-    """du/ds = -k*u => u(s) = u0 * exp(-k*s)."""
+    """du/ds = -k*u => u(s) = u0 * exp(-k*s), r_hat should recover k*u.
+
+    Tolerances verify the model recovers the known physical rate law:
+    - rate RMSE vs k*u_true < 0.02 (rate field should match the true pointwise rate)
+    - trajectory RMSE < 0.015 (model must fit the exponential decay)
+    - PDE RMSE < 0.02 (du/ds + r must be near zero everywhere)
+    """
     import numpy as np
     k_true = 0.05
     stress = np.linspace(0.0, 4.0, 60, dtype="float32")
@@ -66,6 +84,13 @@ def test_synthetic_nonlinear_recovery() -> None:
         u_hat = model.solution(s, torch.tensor(features))
         r_hat = model.rate(s, torch.tensor(features), u_hat)
         du = autograd_du_ds(u_hat, s)
-    assert (r_hat >= -1e-3).all()
-    residual = du + r_hat
-    assert float(residual.pow(2).mean().sqrt().item()) < 2e-1
+
+    expected_rate = torch.tensor(k_true * u_true, dtype=torch.float32)
+    residual = du + r_hat  # PDE residual
+    rate_rmse = float((r_hat.detach() - expected_rate).pow(2).mean().sqrt().item())
+    trajectory_rmse = float((u_hat.detach() - torch.tensor(u_true)).pow(2).mean().sqrt().item())
+    pde_rmse = float(residual.pow(2).mean().sqrt().item())
+
+    assert rate_rmse < 0.02
+    assert trajectory_rmse < 0.015
+    assert pde_rmse < 0.02

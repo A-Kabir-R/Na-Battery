@@ -149,22 +149,50 @@ def main() -> None:
 
     atomic_write_csv(combined_raw, combined_dir / "raw_results_combined.csv")
 
-    # Publication main table: cell-macro outer-validation MAE by
-    # architecture × preprocessing × target. Restricting to outer_validation is
-    # required — otherwise inner-training / inner-validation rows from the PINN
-    # aggregator are averaged into the headline number.
-    if {"metric", "value", "architecture", "preprocessing", "target"}.issubset(combined_raw.columns):
-        main_mae = combined_raw[combined_raw["metric"] == "MAE"]
-        if "aggregation" in main_mae.columns:
-            main_mae = main_mae[main_mae["aggregation"].fillna("").isin(["cell_macro", ""])]
-        if "evaluation_role" in main_mae.columns:
-            main_mae = main_mae[
-                main_mae["evaluation_role"].fillna("").astype(str)
-                .isin(["outer_validation", ""])
-            ]
+    # Publication main table: built from prediction_metrics.csv, not raw_results.csv,
+    # so the source already carries exactly one evaluation_role per row.
+    # Classical: cv_oof cell-macro MAE (out-of-fold cross-validation predictions).
+    # PINN:      outer_validation cell-macro MAE.
+    # No blank-fill fallback is used; mixing roles would average training MAE
+    # with validation MAE and invalidate the headline comparison.
+    classical_pm = _read_csv(classical_dir / "prediction_metrics.csv")
+    pinn_pm = _read_csv(pinn_dir / "prediction_metrics.csv")
+    pub_parts: list[pd.DataFrame] = []
+    _pm_required = {"evaluation_role", "aggregation", "metric", "value"}
+    if not classical_pm.empty and _pm_required.issubset(classical_pm.columns):
+        classical_main = classical_pm[
+            classical_pm["evaluation_role"].eq("cv_oof")
+            & classical_pm["aggregation"].eq("cell_macro")
+            & classical_pm["metric"].eq("MAE")
+        ].copy()
+        classical_main = _normalize_classical(classical_main)
+        classical_main["model_family"] = classical_main.apply(_classify_family, axis=1)
+        pub_parts.append(classical_main)
+    else:
+        log_event(logger, logging.WARNING, "classical_prediction_metrics_missing_or_incomplete",
+                  path=str(classical_dir / "prediction_metrics.csv"))
+        print(f"[combine] WARNING: classical prediction_metrics.csv missing or lacks required "
+              f"columns; classical rows omitted from publication_main_table.csv.")
+    # Prefer prediction_metrics.csv for PINN (already in long format with clean roles);
+    # fall back to raw_results.csv only when prediction_metrics.csv is absent.
+    pinn_source = (
+        pinn_pm if (not pinn_pm.empty and _pm_required.issubset(pinn_pm.columns))
+        else pinn_raw
+    )
+    if not pinn_source.empty and _pm_required.issubset(pinn_source.columns):
+        pinn_main = pinn_source[
+            pinn_source["evaluation_role"].eq("outer_validation")
+            & pinn_source["aggregation"].eq("cell_macro")
+            & pinn_source["metric"].eq("MAE")
+        ].copy()
+        pinn_main["model_family"] = pinn_main.apply(_classify_family, axis=1)
+        pub_parts.append(pinn_main)
+    if pub_parts:
+        pub_combined = pd.concat(pub_parts, ignore_index=True, sort=False)
         pub_table = (
-            main_mae.groupby(["model_family", "architecture", "preprocessing", "target"],
-                             dropna=False)
+            pub_combined
+            .groupby(["model_family", "architecture", "preprocessing", "target"],
+                     dropna=False)
             ["value"].mean().reset_index()
         )
         atomic_write_csv(pub_table, combined_dir / "publication_main_table.csv")

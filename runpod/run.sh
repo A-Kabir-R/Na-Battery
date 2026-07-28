@@ -187,6 +187,10 @@ for stage in "${STAGES[@]}"; do
     pinn_plot)        run_stage pinn_plot        scripts/08_plot_pinn_results.py ;;
     pinn_ablation)    run_stage pinn_ablation    scripts/10_run_pinn_ablations.py ;;
     combined_report)
+      if [[ $PIPELINE_RC -ne 0 ]]; then
+        log "skipping combined_report — earlier stage failed"
+        break
+      fi
       # Resolve the classical results directory from config.yaml (via the
       # loaded config) rather than duplicating the YAML default in Bash — the
       # classical pipeline writes to experiment.results_subdir which is

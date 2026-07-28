@@ -117,15 +117,20 @@ def horizon_metric_rows(predictions: pd.DataFrame,
     binned = pd.cut(predictions["horizon_days"].astype(float),
                     bins=bins, labels=labels, include_lowest=True)
     rows = []
+    _metadata_columns = ["architecture", "preprocessing", "fold", "seed",
+                         "evaluation_role", "ablation"]
     for bin_label, group in predictions.groupby(binned, dropna=False, observed=False):
         metrics = _regression_metrics(
             group["true_next_Q_Ah"].to_numpy(dtype=float),
             group["predicted_next_Q_Ah"].to_numpy(dtype=float),
             target="next_rpt_Q_Ah",
         )
-        rows.append({"horizon_bin": str(bin_label), **metrics,
-                     "architecture": predictions["architecture"].iloc[0] if "architecture" in predictions.columns else "",
-                     "preprocessing": predictions["preprocessing"].iloc[0] if "preprocessing" in predictions.columns else ""})
+        metadata: dict[str, object] = {}
+        for col in _metadata_columns:
+            if col in predictions.columns:
+                values = predictions[col].dropna().astype(str).unique()
+                metadata[col] = values[0] if len(values) == 1 else ";".join(values)
+        rows.append({"horizon_bin": str(bin_label), **metadata, **metrics})
     return pd.DataFrame(rows)
 
 

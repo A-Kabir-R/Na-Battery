@@ -170,6 +170,14 @@ class FoldPaths:
         return self.root / "scaler.json"
 
     @property
+    def final_model(self) -> Path:
+        return self.checkpoint_dir / "final_refit_model.pt"
+
+    @property
+    def final_scaler(self) -> Path:
+        return self.root / "final_refit_scaler.json"
+
+    @property
     def config_snapshot(self) -> Path:
         return self.root / "config_snapshot.json"
 
@@ -1137,6 +1145,23 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                 device=device, logger=logger, ablation_name=ablation_name,
             )
             used_refit = True
+            atomic_write_torch(
+                {
+                    "model": refit_model.state_dict(),
+                    "architecture": config.architecture,
+                    "preprocessing": config.preprocessing,
+                    "fold": config.fold,
+                    "seed": config.seed,
+                    "refit_epochs": best_epoch + 1,
+                    "fingerprint": fingerprint,
+                },
+                fold_paths.final_model,
+            )
+            atomic_write_json(refit_scaler.state_dict(), fold_paths.final_scaler)
+            manifest["selection_checkpoint"] = "checkpoints/best_model.pt"
+            manifest["final_checkpoint"] = "checkpoints/final_refit_model.pt"
+            manifest["final_scaler"] = "final_refit_scaler.json"
+            atomic_write_json(manifest, fold_paths.manifest_path)
             if logger is not None:
                 log_event(logger, logging.INFO, "two_phase_refit_completed",
                           architecture=config.architecture,
@@ -1197,7 +1222,9 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
         "physics_metrics": physics_summary,
         "ablation": ablation_name or "",
         "fingerprint": fingerprint,
-        "stress_std": float(scaler.stress_std),
+        "inner_stress_std": float(scaler.stress_std),
+        "final_refit_stress_std": float(outer_eval_scaler.stress_std),
+        "stress_std": float(outer_eval_scaler.stress_std),
         "two_phase_refit_used": bool(used_refit),
         "refit_epochs": int(best_epoch + 1) if used_refit else 0,
     }, fold_paths.status_path)
@@ -1246,29 +1273,29 @@ def _refit_full_outer_train(
     would silently change model architecture).
     """
     outer_train_frame = frame.iloc[outer_train_idx].reset_index(drop=True)
-    # Use the same requested feature set — the refit scaler should keep the
-    # same columns as the inner-training scaler (more data can only add or
-    # match columns, not drop them). If it does drop any that the original
-    # kept, we fail rather than silently mismatching architectures.
+    # Fit on the exact columns selected during inner training so that the
+    # refit scaler's statistical arrays (mean, std, medians) and its
+    # feature_columns_used are always built together and always aligned.
+    # Fitting on the full candidate set and then overwriting feature_columns_used
+    # is unsafe: the statistical arrays would still index refit_cols, not
+    # original_cols, causing broadcasting errors or silent column mismatches
+    # for sparse P3 waveform features that appear only on the larger dataset.
+    original_cols = list(original_scaler.feature_columns_used or [])
+    if not original_cols:
+        raise FoldTrainingError(
+            "inner-training scaler retained no features"
+        )
     refit_scaler = FoldScaler().fit(
-        outer_train_frame, dataset.feature_columns,
+        outer_train_frame, original_cols,
         u_max_source=u_max_source, u_max_constant=u_max_constant,
         u_max_margin=u_max_margin, tolerance_source=tolerance_source,
         tolerance_constant=tolerance_constant,
         tolerance_quantile=tolerance_quantile,
     )
-    original_cols = list(original_scaler.feature_columns_used or [])
-    refit_cols = list(refit_scaler.feature_columns_used or [])
-    missing = [c for c in original_cols if c not in refit_cols]
-    if missing:
+    if refit_scaler.feature_columns_used != original_cols:
         raise FoldTrainingError(
-            f"refit scaler is missing feature columns kept by inner-training "
-            f"scaler: {missing[:5]}{'...' if len(missing) > 5 else ''}"
+            "full outer-training refit changed the selected feature schema"
         )
-    # Force the refit scaler to expose exactly the original columns so
-    # feature_dim (and model architecture) matches.
-    if refit_cols != original_cols:
-        refit_scaler.feature_columns_used = original_cols
 
     set_seeds(config.seed)
     feature_dim = 2 + len(original_cols)

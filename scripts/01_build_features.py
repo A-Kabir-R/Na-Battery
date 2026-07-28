@@ -25,6 +25,65 @@ from src.targets.next_rpt import add_target as add_next_rpt
 from src.targets.rul import add_target as add_rul
 
 
+# Columns that are never features: identifiers, metadata, targets, and
+# physics-coordinate columns that are computed by the PINN trainer at
+# training time rather than stored in the feature parquets.
+_NON_FEATURE_COLUMNS: frozenset[str] = frozenset({
+    "condition", "cell", "file_id", "visit", "test_id", "cycle_in_file",
+    "anchor_id", "is_prediction_anchor", "split", "rpt_qc_status",
+    "target_unavailable_reason", "file_start_time", "path",
+    # Target columns — must never appear as input features
+    "next_rpt_Q_Ah", "next_rpt_SOH_pct", "delta_next_rpt_Q_Ah", "delta_next_rpt_SOH_pct",
+    "next_rpt_visit", "next_rpt_horizon_days",
+    "rul", "time_to_failure", "is_failed", "failure_type",
+    # RPT-derived columns that are not features but ride along in the frame
+    "reference_capacity_Ah", "rpt_SOH_pct", "initial_rpt_Q_Ah",
+    "previous_rpt_Q_Ah", "delta_rpt_Q_Ah", "delta_rpt_SOH_pct",
+    # PINN physics-coordinate columns (computed at training time)
+    "stress_current", "stress_next", "stress_delta", "u_current", "u_true_next",
+    "q0_column", "q_current_column",
+})
+
+
+def _write_provenance(df: pd.DataFrame, path: Path, preprocessing: str) -> None:
+    """Write a provenance CSV with one row per numeric feature column in df.
+
+    Attributes are derived conservatively from column naming conventions.
+    All P1/P2/P3 features are marked uses_target_rpt=False and
+    uses_future_rows=False — they must be causal quantities computed only
+    from cycling data available at the anchor cycle.
+    """
+    rows = []
+    for col in df.columns:
+        if col in _NON_FEATURE_COLUMNS:
+            continue
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        rolling_direction = ""
+        shift_count = 0
+        col_lower = col.lower()
+        if any(kw in col_lower for kw in ("rolling", "window", "lag", "shift")):
+            rolling_direction = "backward"
+            # Extract shift count from trailing integer, e.g. "_w5" -> 5
+            import re as _re
+            m = _re.search(r"_w(\d+)$", col)
+            if m:
+                shift_count = int(m.group(1))
+        rows.append({
+            "feature": col,
+            "source_columns": col,
+            "preprocessing": preprocessing,
+            "uses_target_rpt": False,
+            "uses_future_rows": False,
+            "rolling_direction": rolling_direction,
+            "shift_count": shift_count,
+            "known_at_anchor": True,
+            "planned_at_inference": True,
+            "allowed": True,
+        })
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
 def _attach_targets(df: pd.DataFrame, cu_cache: pd.DataFrame) -> pd.DataFrame:
     df = add_rul(df)
     df = add_next_rpt(df, cu_cache=cu_cache)
@@ -157,6 +216,7 @@ def main() -> None:
     p1 = build_p1(cm)
     p1 = _attach_targets(p1, cu_cache)
     p1.to_parquet(out / "p1.parquet")
+    _write_provenance(p1, out / "p1.provenance.csv", "P1")
     tqdm.write(f"[build] P1: {p1.shape} ({time.time()-t0:.1f}s)")
     pbar.update(1)
 
@@ -166,6 +226,7 @@ def main() -> None:
     p2 = build_p2(cm)
     p2 = _attach_targets(p2, cu_cache)
     p2.to_parquet(out / "p2.parquet")
+    _write_provenance(p2, out / "p2.provenance.csv", "P2")
     anchors = p2[p2.get("is_prediction_anchor", False)].copy()
     anchors.to_parquet(out / "anchor_samples.parquet", index=False)
     anchors[anchors["next_rpt_Q_Ah"].notna()].to_parquet(
@@ -207,6 +268,7 @@ def main() -> None:
             f"P3 merged cycle coverage {matched_fraction:.3f} is below {required_fraction:.3f}"
         )
     p3.to_parquet(out / "p3.parquet")
+    _write_provenance(p3, out / "p3.provenance.csv", "P3")
     tqdm.write(f"[build] P3 final: {p3.shape}")
     pbar.update(1)
     pbar.close()
