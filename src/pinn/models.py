@@ -1,24 +1,14 @@
 """NaPINN-Q solution and degradation-dynamics networks.
 
-Stage-2 diagnosis fixes:
-
 * :class:`RateNet` accepts a ``uses_u_hat`` flag. When ``False`` the rate
   network does NOT receive ``u_hat`` as an input; the PDE residual
   ``H = du/ds + r`` can then no longer be trivially satisfied by learning
-  ``r ≈ -∂u/∂s`` (Stage 2 diagnosis fix #14).
-* :class:`DNNQ` exposes an independent ``hidden_dims`` so that the
-  data-only baseline can be widened to approximately match NaPINN-Q's
-  trainable parameter count (Stage 2 diagnosis fix #11).
-
-Stage-3 diagnosis fixes:
-
-* Networks now support ``dropout`` between hidden layers so a ~500-parameter
-  model can still be regularized when trained on ~120 anchor samples.
-* Both :class:`DNNQ` and :class:`NaPINNQ` support ``predict_delta_u``.
-  When set, the SolutionNet output is interpreted as ``Δu`` and the caller
-  reconstructs ``u_next = u_current + Δu``. This enforces the initial
-  condition by construction and keeps typical network outputs near 0
-  (residual predictor).
+  ``r ≈ -∂u/∂s``.
+* Networks support ``dropout`` between hidden layers.
+* :class:`NaPINNQ` supports ``predict_delta_u``. When set, the SolutionNet
+  output is interpreted as ``Δu`` and the caller reconstructs
+  ``u_next = u_current + Δu`` — enforcing the initial condition by
+  construction and keeping typical outputs near 0.
 """
 from __future__ import annotations
 
@@ -78,6 +68,11 @@ class SolutionNet(nn.Module):
         self.predict_delta_u = bool(predict_delta_u)
         self.body = _stack_mlp(feature_dim + 1, hidden_dims, activation,
                                 dropout=dropout, output_dim=1)
+        # Zero-init the final residual layer so initial Δu predictions are ~0.
+        if self.predict_delta_u:
+            final_linear = self.body[-1]
+            nn.init.zeros_(final_linear.weight)
+            nn.init.zeros_(final_linear.bias)
 
     def raw(self, stress: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
         """Return the raw MLP output (Δu when predict_delta_u, else u_hat)."""
@@ -157,32 +152,6 @@ class NaPINNQ(nn.Module):
         u_hat = self.solution(stress, features, u_current)
         r_hat = self.rate(stress, features, u_hat)
         return u_hat, r_hat
-
-
-class DNNQ(nn.Module):
-    """Parameter-matched data-only baseline."""
-
-    def __init__(self, feature_dim: int,
-                 hidden_dims: Iterable[int] | None = None,
-                 solution_activation: str = "tanh",
-                 solution_hidden_dims: Iterable[int] | None = None,
-                 solution_dropout: float = 0.0,
-                 predict_delta_u: bool = False) -> None:
-        super().__init__()
-        # ``solution_hidden_dims`` is the pre-rewrite alias kept for
-        # backward-compatible tests. Prefer ``hidden_dims``.
-        if hidden_dims is None:
-            hidden_dims = solution_hidden_dims if solution_hidden_dims is not None else (16, 16)
-        self.solution = SolutionNet(feature_dim, hidden_dims,
-                                     solution_activation,
-                                     dropout=solution_dropout,
-                                     predict_delta_u=predict_delta_u)
-        self.feature_dim = int(feature_dim)
-        self.predict_delta_u = bool(predict_delta_u)
-
-    def forward(self, stress: torch.Tensor, features: torch.Tensor,
-                 u_current: torch.Tensor | None = None) -> torch.Tensor:
-        return self.solution(stress, features, u_current)
 
 
 def count_parameters(module: nn.Module) -> int:

@@ -89,7 +89,7 @@ evaluation:
     delta_next_rpt_SOH_pct: [-100.0, 100.0]
 
 plotting:
-  formats: ["png", "pdf"]
+  formats: ["png"]
   dpi: 300
 
 experiment:
@@ -112,6 +112,8 @@ models:
   enabled_regressors:
     - DummyMean
     - PreviousRPT
+    - Ridge
+    - SVR-RBF
     - ExtraTrees
 
 # ---------------------------------------------------------------------------
@@ -130,13 +132,10 @@ pinn:
     - p3
 
   architectures:
-    - DNN-Q
     - NaPINN-Q
 
   seeds:
-    - 17
     - 42
-    - 73
 
   derive_all_targets_from_capacity: true
   reuse_existing_folds: true
@@ -170,7 +169,6 @@ pinn:
     # the initial condition is enforced by construction.
     solution_hidden_dims: [16, 16]
     rate_hidden_dims: [8, 8]
-    dnn_solution_hidden_dims: [16, 16]
     solution_activation: "tanh"
     rate_activation: "tanh"
     rate_output_activation: "softplus"
@@ -180,7 +178,7 @@ pinn:
     # produces the constrained-rate variant used in ablation A6, which
     # prevents H = du/ds + r ≈ 0 from being satisfied tautologically
     # (Stage 2 diagnosis fix #14).
-    rate_uses_u_hat: true
+    rate_uses_u_hat: false
     # Predict Δu = u_next − u_current instead of absolute u_next. The model's
     # output is added to u_current at inference, so IC error is zero by
     # construction and typical outputs live near 0 (~0.001–0.02).
@@ -202,7 +200,7 @@ pinn:
     learning_rate: 0.001
     # Stage-3 fix #2: 100× stronger L2 regularization to counter the
     # ~120-sample overfitting regime.
-    weight_decay: 0.01
+    weight_decay: 0.001
     # Stage-3 fix #3: shorter training budget & tighter patience so the
     # physics curriculum can plausibly activate before early stopping fires.
     maximum_epochs: 800
@@ -221,6 +219,8 @@ pinn:
     use_amp: false
     physics_float32: true
     batch_mode: "cell_balanced"
+    # Balance data and physics losses via EMA of their gradient magnitudes.
+    use_gradient_balance: true
     # Two-phase outer-training refit: after inner train/val chooses best_epoch,
     # discard the temporary model and retrain a fresh one on ALL outer-training
     # cells for exactly best_epoch+1 epochs. Matches how the classical model
@@ -281,33 +281,27 @@ pinn:
   ablation:
     enabled: true
     configurations:
-      - name: "A0_DNN"
-        architecture: "DNN-Q"
+      - name: "A0_Data_Only"
+        architecture: "NaPINN-Q"
         weights: {data: 1.0, pde: 0.0, initial_condition: 0.0, integral: 0.0,
                   monotonicity: 0.0, bounds: 0.0, rate_regularization: 0.0}
-      - name: "A1_Constrained_NN"
+      - name: "A1_No_PDE"
         architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.0, initial_condition: 0.1, integral: 0.0,
-                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 0.0}
-      - name: "A2_PINN_PDE"
+        weights: {data: 1.0, pde: 0.0, initial_condition: 0.1, integral: 0.005,
+                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4}
+      - name: "A2_No_Integral"
         architecture: "NaPINN-Q"
         weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.0,
-                  monotonicity: 0.0, bounds: 0.0, rate_regularization: 1.0e-4}
-      - name: "A3_PINN_PDE_integral"
-        architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.005,
-                  monotonicity: 0.0, bounds: 0.0, rate_regularization: 1.0e-4}
-      - name: "A4_Full_NaPINN_Q"
-        architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.005,
                   monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4}
-      - name: "A5_Discrete_State_Transition"
+      - name: "A3_No_Monotonicity"
         architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.0, initial_condition: 0.1, integral: 0.0,
-                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4,
-                  discrete_state_transition: 0.05}
-      - name: "A6_Constrained_Rate_No_UHat"
+        weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.005,
+                  monotonicity: 0.0, bounds: 0.5, rate_regularization: 1.0e-4}
+      - name: "A4_No_Bounds"
         architecture: "NaPINN-Q"
-        rate_uses_u_hat: false
+        weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.005,
+                  monotonicity: 0.5, bounds: 0.0, rate_regularization: 1.0e-4}
+      - name: "A5_Full_NaPINN_Q"
+        architecture: "NaPINN-Q"
         weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.005,
                   monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4}

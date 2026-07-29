@@ -511,6 +511,9 @@ def build_anchor_dataset(preprocessing_frame: pd.DataFrame, *,
         "initial_rpt_Q_Ah", "previous_rpt_Q_Ah", "previous_rpt_SOH_pct",
         "q_current_Ah", "u_current", "u_true_next",
         "stress_current", "stress_delta", "stress_next",
+        # Exclude the raw stress column so it does not appear both as the
+        # model's stress input AND inside the feature matrix.
+        raw_stress_column,
     }
     candidate_columns = [
         c for c in numeric if c not in identifiers and c not in TARGETS

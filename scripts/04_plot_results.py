@@ -411,7 +411,7 @@ def main() -> None:
     out = results / "plots"
     out.mkdir(parents=True, exist_ok=True)
     plotting = cfg.get("plotting", {})
-    formats = [str(value) for value in plotting.get("formats", ["png", "pdf"])]
+    formats = ["png"]  # PNG-only per publication figure spec.
     dpi = int(plotting.get("dpi", 300))
     for extension in formats:
         for stale in out.glob(f"*.{extension}"):
@@ -421,29 +421,21 @@ def main() -> None:
     metrics = _read_csv(results / "prediction_metrics.csv")
     prediction_path = results / "all_predictions.parquet"
     predictions = pd.read_parquet(prediction_path) if prediction_path.exists() else pd.DataFrame()
-    raw = _read_csv(results / "raw_results.csv")
     group_metrics = _read_csv(results / "group_metrics.csv")
-    horizon = _read_csv(results / "horizon_metrics.csv")
-    plausibility = _read_csv(results / "prediction_plausibility.csv")
 
+    # Pruned figure set: only the plots required by the publication spec.
     if not metrics.empty:
-        _metric_heatmaps(metrics, out, formats, dpi)
         _r2_forests(metrics, out, formats, dpi)
     if not predictions.empty:
         _parity_and_residual_plots(predictions, out, formats, dpi)
-    if not raw.empty:
-        _fold_r2(raw, out, formats, dpi)
-        _r2_fit_evaluation(raw, out, formats, dpi)
     if not group_metrics.empty:
         _condition_r2(group_metrics, out, formats, dpi)
-        _cell_r2_distributions(group_metrics, out, formats, dpi)
-    if not horizon.empty:
-        _horizon_plots(horizon, out, formats, dpi)
-    if not plausibility.empty:
-        _plausibility_plot(plausibility, out, formats, dpi)
-    _feature_importance_plots(results, out, formats, dpi)
-    _loss_curves(artifacts / "loss_curves", out, formats, dpi, raw)
+    # Retain the per-cell SOH / capacity trajectory figures from _dataset_plots.
     _dataset_plots(artifacts, out, formats, dpi)
+    # Loss / LR curves → supplementary material only.
+    supp = out / "supplementary"
+    supp.mkdir(parents=True, exist_ok=True)
+    _loss_curves(artifacts / "loss_curves", supp, formats, dpi, _read_csv(results / "raw_results.csv"))
     print(f"[plot] wrote publication figures to {out}")
 
 

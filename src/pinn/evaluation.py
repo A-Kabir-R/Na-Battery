@@ -208,11 +208,7 @@ def _nan_safe_frac(series: pd.Series, predicate) -> float:
 
 def physics_metric_rows(predictions: pd.DataFrame) -> pd.DataFrame:
     """Compute physics diagnostics per run, reporting normalized AND physical
-    residual/derivative magnitudes side by side (Stage 2 fix #9).
-
-    DNN-Q rows have ``NaN`` PDE/integral/rate columns and are handled with
-    NaN-safe reducers so a family comparison plot doesn't crash (Stage 2
-    fix #10).
+    residual/derivative magnitudes side by side.
     """
     if predictions.empty:
         return pd.DataFrame()

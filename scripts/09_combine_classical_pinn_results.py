@@ -96,8 +96,6 @@ def _classify_family(row: pd.Series) -> str:
         return CLASSICAL_FAMILY_MAP[architecture]
     if architecture == "NaPINN-Q":
         return "physics_informed_neural_network"
-    if architecture == "DNN-Q":
-        return "data_driven_neural_network"
     return "unknown"
 
 

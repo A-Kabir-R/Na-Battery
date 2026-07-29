@@ -29,7 +29,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 
-FORMATS = ("png", "pdf")
+FORMATS = ("png",)
 DEFAULT_ROLE = "outer_validation"
 
 
@@ -348,7 +348,7 @@ def plot_residuals_by_condition(predictions: pd.DataFrame, output_dir: Path,
         if not groups:
             continue
         fig, ax = plt.subplots(figsize=(6, 3.5))
-        ax.boxplot(groups, labels=labels, showfliers=False)
+        ax.boxplot(groups, tick_labels=labels, showfliers=False)
         ax.set_xlabel(xlabel)
         ax.set_ylabel("|residual| capacity (Ah)")
         ax.set_title(f"Residuals vs {column} (outer validation)")
@@ -386,7 +386,7 @@ def plot_rate_by_condition(predictions: pd.DataFrame, output_dir: Path) -> None:
         if not groups:
             continue
         fig, ax = plt.subplots(figsize=(6, 3.5))
-        ax.boxplot(groups, labels=labels, showfliers=False)
+        ax.boxplot(groups, tick_labels=labels, showfliers=False)
         ax.set_xlabel(xlabel)
         ax.set_ylabel(rate_col)
         ax.set_title(f"Degradation rate vs {column} (outer validation)")
@@ -496,7 +496,7 @@ def plot_combined_family_bar(combined_metrics: pd.DataFrame, output_dir: Path,
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.bar(summary["architecture"].astype(str), summary[metric])
     ax.set_ylabel(f"mean {metric} (outer validation, cell macro)")
-    ax.set_title("Model family comparison (ExtraTrees + DNN-Q + NaPINN-Q)")
+    ax.set_title("Model family comparison (ExtraTrees + NaPINN-Q)")
     plt.xticks(rotation=20, ha="right")
     _save(fig, output_dir / f"combined_family_{metric.lower()}")
 
@@ -508,24 +508,40 @@ def render_all_pinn_plots(*, epoch_log: pd.DataFrame,
                           output_dir: Path,
                           complexity: pd.DataFrame | None = None,
                           combined_metrics: pd.DataFrame | None = None) -> None:
-    """Render every PINN plot into ``output_dir``."""
+    """Render the pruned publication plot set into ``output_dir``.
+
+    Removed plots (residual distribution, degradation-rate, seed stability,
+    model complexity, accuracy-vs-runtime, rate-by-condition, condition
+    trajectories) are intentionally not rendered. Training-history curves
+    are routed to ``output_dir / "supplementary"``.
+    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    plot_epoch_curves(epoch_log, output_dir)
+    supp_dir = output_dir / "supplementary"
+    supp_dir.mkdir(parents=True, exist_ok=True)
+    # Training / validation / LR history → supplementary material only.
+    plot_epoch_curves(epoch_log, supp_dir)
+    # Predicted vs actual capacity + SOH (same routine plots both when the
+    # aggregator supplies the SOH columns).
     plot_predicted_vs_true(predictions, output_dir)
-    plot_residual_distribution(predictions, output_dir)
-    plot_per_cell_trajectories(predictions, output_dir)
-    plot_condition_trajectories(predictions, output_dir)
-    plot_degradation_rate(predictions, output_dir)
+    # Observed vs predicted trajectories for unseen cells (capacity + SOH).
+    plot_per_cell_trajectories(predictions, output_dir,
+                                target_col="predicted_next_Q_Ah",
+                                true_col="true_next_Q_Ah")
+    if "predicted_next_SOH_pct" in predictions.columns and "true_next_SOH_pct" in predictions.columns:
+        plot_per_cell_trajectories(
+            predictions, output_dir / "soh",
+            target_col="predicted_next_SOH_pct",
+            true_col="true_next_SOH_pct",
+        )
+    # PDE-residual + integral-consistency figures.
     plot_pde_residual(predictions, output_dir)
     plot_pde_residual_vs_stress(predictions, output_dir)
-    plot_residuals_by_condition(predictions, output_dir)
-    plot_rate_by_condition(predictions, output_dir)
     plot_integral_consistency(predictions, output_dir)
+    # Error analysis across temperature, DOD, C-rate.
+    plot_residuals_by_condition(predictions, output_dir)
+    # Ablation results.
     plot_ablation_bar(ablation_metrics, output_dir)
-    plot_seed_stability(target_metrics, output_dir)
-    if complexity is not None:
-        plot_model_complexity(complexity, output_dir)
-        plot_accuracy_vs_runtime(complexity, target_metrics, output_dir)
+    # Baseline family comparison.
     if combined_metrics is not None:
         plot_combined_family_bar(combined_metrics, output_dir)

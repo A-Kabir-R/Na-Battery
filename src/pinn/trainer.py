@@ -1,32 +1,8 @@
-"""Fold-level trainer for DNN-Q and NaPINN-Q.
+"""Fold-level trainer for NaPINN-Q.
 
 Implements the composite cell-balanced loss, physics-weight curriculum,
 autograd-based governing residual, unlabeled collocation points, checkpointing
 and resume, plus per-epoch physics + validation metrics.
-
-Stage-2/3 diagnosis fixes applied here:
-
-* :func:`_pde_gradient_norm` computes the PDE-component gradient contribution
-  via ``torch.autograd.grad`` (issue #7).
-* Training exceptions raise :class:`FoldTrainingError` so failed runs are
-  never written as ``status=completed`` (issue #8).
-* Prediction rows carry both normalized-coordinate and physical-coordinate
-  ``du/ds`` and ``predicted_degradation_rate`` (issue #9).
-* DNN-Q physics diagnostics (rate, PDE residual, integral consistency,
-  negative-rate fraction, IC error) are ``NaN`` rather than fake zeros
-  (issue #10).
-* :class:`FoldScaler` is fit on inner-training rows only, never on inner-
-  validation rows (issue #12).
-* Inner split is drawn from :attr:`TrainerConfig.inner_split_seed`, decoupled
-  from the model training seed (issue #13).
-* :class:`DNNQ` receives an independent ``dnn_solution_hidden_dims`` so it
-  can be widened to approximately match NaPINN-Q's trainable parameter count
-  (issue #11).
-* Checkpoints record ``next_epoch = epoch + 1`` and ``resume`` restarts from
-  that value, removing the off-by-one that trained the checkpointed epoch
-  twice (issue #17).
-* Completed-run reuse verifies the checkpoint, predictions and fingerprint
-  before returning early (issue #18).
 """
 from __future__ import annotations
 
@@ -55,7 +31,7 @@ from .losses import (
     data_loss, discrete_state_transition_loss, initial_condition_loss,
     integral_consistency_loss, monotonicity_loss, pde_loss, rate_regularization_loss,
 )
-from .models import DNNQ, NaPINNQ, count_parameters
+from .models import NaPINNQ, count_parameters
 from .physics import (
     autograd_du_ds, discrete_state_transition_residual, integral_transition,
     pde_residual,
@@ -107,7 +83,6 @@ class TrainerConfig:
     quadrature_nodes: int = 8
     solution_hidden_dims: tuple[int, ...] = (16, 16)
     rate_hidden_dims: tuple[int, ...] = (8, 8)
-    dnn_solution_hidden_dims: tuple[int, ...] = (16, 16)
     solution_activation: str = "tanh"
     rate_activation: str = "tanh"
     solution_dropout: float = 0.2
@@ -137,6 +112,8 @@ class TrainerConfig:
     # that isn't actually learning physics.
     pde_gradient_min_norm: float = 1.0e-8
     pde_gradient_zero_patience: int = 5
+    # Balance data and physics losses using EMA of gradient magnitudes.
+    use_gradient_balance: bool = True
 
 
 @dataclass
@@ -383,7 +360,7 @@ def _prediction_frame(architecture: str, preprocessing: str, fold: int, seed: in
                       ic_err: np.ndarray, integral_err: np.ndarray,
                       mono_viol: np.ndarray, lower_viol: np.ndarray,
                       upper_viol: np.ndarray, *,
-                      stress_std: float, is_pinn: bool,
+                      stress_std: float,
                       ablation_name: str | None = None) -> pd.DataFrame:
     sub = frame.iloc[indices].reset_index(drop=True)
     q0 = sub[dataset.q0_column].to_numpy(dtype=float)
@@ -393,20 +370,10 @@ def _prediction_frame(architecture: str, preprocessing: str, fold: int, seed: in
     predicted_delta_q = predicted_q_next - q_current
     predicted_delta_soh = predicted_soh_next - (100.0 * q_current / q0)
 
-    # Physical-unit conversion (Stage 2 diagnosis fix #9).
     stress_std = float(stress_std) if stress_std else 1.0
     du_ds_physical = du_ds_norm / stress_std
     pde_res_physical = pde_res_norm / stress_std
-    if is_pinn:
-        predicted_r_physical = predicted_r_norm / stress_std
-    else:
-        # DNN-Q reports NaN rate — no physics-informed rate exists.
-        predicted_r_norm = np.full_like(du_ds_norm, np.nan, dtype=float)
-        predicted_r_physical = predicted_r_norm.copy()
-        pde_res_norm = np.full_like(du_ds_norm, np.nan, dtype=float)
-        pde_res_physical = pde_res_norm.copy()
-        ic_err = np.full_like(du_ds_norm, np.nan, dtype=float)
-        integral_err = np.full_like(du_ds_norm, np.nan, dtype=float)
+    predicted_r_physical = predicted_r_norm / stress_std
 
     frame_out = pd.DataFrame({
         "run_id": [run_fingerprint(architecture=architecture,
@@ -471,7 +438,7 @@ def _prediction_frame(architecture: str, preprocessing: str, fold: int, seed: in
 
 def _evaluate(model, dataset: AnchorDataset, frame: pd.DataFrame,
                indices: np.ndarray, scaler: FoldScaler, device: str,
-               is_pinn: bool, config: TrainerConfig, quadrature_method: str,
+               config: TrainerConfig, quadrature_method: str,
                quadrature_nodes: int) -> dict[str, np.ndarray]:
     """Compute predictions + physics diagnostics for one split."""
     if indices.size == 0:
@@ -492,34 +459,22 @@ def _evaluate(model, dataset: AnchorDataset, frame: pd.DataFrame,
 
     model.eval()
     with torch.enable_grad():
-        if is_pinn:
-            u_next = model.solution(stress_next, features, u_current)
-            r_next = model.rate(stress_next, features, u_next)
-            u_anchor = model.solution(stress_current, features, u_current)
-            du_next = autograd_du_ds(u_next, stress_next)
-            residual = pde_residual(du_next, r_next)
-            u_integrated = integral_transition(
-                model.solution, model.rate, stress_current, delta, features,
-                u_current, method=quadrature_method, n_nodes=quadrature_nodes,
-            )
-        else:
-            u_next = model(stress_next, features, u_current)
-            u_anchor = model(stress_current, features, u_current)
-            r_next = torch.full_like(u_next, float("nan"))
-            du_next = autograd_du_ds(u_next, stress_next)
-            residual = torch.full_like(u_next, float("nan"))
-            u_integrated = torch.full_like(u_next, float("nan"))
+        u_next = model.solution(stress_next, features, u_current)
+        r_next = model.rate(stress_next, features, u_next)
+        u_anchor = model.solution(stress_current, features, u_current)
+        du_next = autograd_du_ds(u_next, stress_next)
+        residual = pde_residual(du_next, r_next)
+        u_integrated = integral_transition(
+            model.solution, model.rate, stress_current, delta, features,
+            u_current, method=quadrature_method, n_nodes=quadrature_nodes,
+        )
 
     u_next_np = u_next.detach().cpu().numpy()
     r_next_np = r_next.detach().cpu().numpy()
     du_ds_np = du_next.detach().cpu().numpy()
     residual_np = residual.detach().cpu().numpy()
     ic_err_np = (u_anchor.detach().cpu().numpy() - u_current_np)
-    if is_pinn:
-        integral_err_np = (u_next_np - u_integrated.detach().cpu().numpy())
-    else:
-        integral_err_np = np.full_like(u_next_np, np.nan)
-        ic_err_np = np.full_like(u_next_np, np.nan)
+    integral_err_np = (u_next_np - u_integrated.detach().cpu().numpy())
     mono_viol_np = np.maximum(u_next_np - u_current_np - scaler.epsilon_rec, 0.0)
     lower_viol_np = np.maximum(0.0 - u_next_np, 0.0)
     upper_viol_np = np.maximum(u_next_np - scaler.u_max, 0.0)
@@ -664,28 +619,22 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             device=device,
         )
 
-    is_pinn = config.architecture == "NaPINN-Q"
-    feature_dim = 2 + len(scaler.feature_columns_used or [])
-    if is_pinn:
-        model = NaPINNQ(
-            feature_dim=feature_dim,
-            solution_hidden_dims=config.solution_hidden_dims,
-            rate_hidden_dims=config.rate_hidden_dims,
-            solution_activation=config.solution_activation,
-            rate_activation=config.rate_activation,
-            solution_dropout=config.solution_dropout,
-            rate_dropout=config.rate_dropout,
-            rate_uses_u_hat=config.rate_uses_u_hat,
-            predict_delta_u=config.predict_delta_u,
+    if config.architecture != "NaPINN-Q":
+        raise FoldTrainingError(
+            f"unsupported architecture: {config.architecture} (only NaPINN-Q is supported)"
         )
-    elif config.architecture == "DNN-Q":
-        model = DNNQ(feature_dim=feature_dim,
-                     hidden_dims=config.dnn_solution_hidden_dims,
-                     solution_activation=config.solution_activation,
-                     solution_dropout=config.solution_dropout,
-                     predict_delta_u=config.predict_delta_u)
-    else:
-        raise FoldTrainingError(f"unknown architecture: {config.architecture}")
+    feature_dim = 2 + len(scaler.feature_columns_used or [])
+    model = NaPINNQ(
+        feature_dim=feature_dim,
+        solution_hidden_dims=config.solution_hidden_dims,
+        rate_hidden_dims=config.rate_hidden_dims,
+        solution_activation=config.solution_activation,
+        rate_activation=config.rate_activation,
+        solution_dropout=config.solution_dropout,
+        rate_dropout=config.rate_dropout,
+        rate_uses_u_hat=config.rate_uses_u_hat,
+        predict_delta_u=config.predict_delta_u,
+    )
 
     trainable_parameters = count_parameters(model)
     if trainable_parameters > config.maximum_parameters:
@@ -807,6 +756,9 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
     start_epoch = int(checkpoint_state.get("next_epoch", 0))
     consecutive_zero_pde_gradients = 0
     warmup_epochs = int(round(config.curriculum_warmup_fraction * config.max_epochs))
+    # EMA of gradient magnitudes for data / PDE loss balancing.
+    ema_grad_data_bal = 1.0
+    ema_grad_pde_bal = 1.0
 
     tag = f"[{config.architecture} | {config.preprocessing} | fold {config.fold} | seed {config.seed}]"
     bar = tqdm(range(start_epoch, config.max_epochs), desc=tag, unit="ep",
@@ -881,47 +833,34 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                 stress_current_tensor = stress_current_dev.detach().requires_grad_(True)
                 stress_next_tensor = stress_next_dev.detach().requires_grad_(True)
 
-                if is_pinn:
-                    u_next_hat = model.solution(stress_next_tensor, features, u_current)
-                    r_next_hat = model.rate(stress_next_tensor, features, u_next_hat)
-                    u_anchor_hat = model.solution(stress_current_tensor, features, u_current)
-                    r_anchor_hat = model.rate(stress_current_tensor, features, u_anchor_hat)
-                    du_next = autograd_du_ds(u_next_hat, stress_next_tensor)
-                    du_current = autograd_du_ds(u_anchor_hat, stress_current_tensor)
-                    residual_anchor = pde_residual(du_current, r_anchor_hat)
-                    residual_next = pde_residual(du_next, r_next_hat)
-                    collocation = sample_collocation_points(
-                        stress_current=stress_current_tensor.detach(),
-                        stress_delta=delta_full,
-                        features=features,
-                        cell_index=cell_index,
-                        points_per_transition=config.collocation_points,
-                        generator=generator if device == "cpu" else None,
-                    )
-                    collo_stress = collocation.stress.clone().detach().requires_grad_(True)
-                    collo_u_current = u_current[collocation.row_index]
-                    u_collo = model.solution(collo_stress, collocation.features, collo_u_current)
-                    r_collo = model.rate(collo_stress, collocation.features, u_collo)
-                    du_collo = autograd_du_ds(u_collo, collo_stress)
-                    residual_collo = pde_residual(du_collo, r_collo)
-                    u_integrated = integral_transition(
-                        model.solution, model.rate,
-                        stress_current_tensor, delta_full,
-                        features, u_current,
-                        method=config.quadrature_method, n_nodes=config.quadrature_nodes,
-                    )
-                else:
-                    u_next_hat = model(stress_next_tensor, features, u_current)
-                    u_anchor_hat = model(stress_current_tensor, features, u_current)
-                    r_next_hat = torch.zeros_like(u_next_hat)
-                    r_anchor_hat = torch.zeros_like(u_anchor_hat)
-                    du_next = autograd_du_ds(u_next_hat, stress_next_tensor)
-                    du_current = autograd_du_ds(u_anchor_hat, stress_current_tensor)
-                    residual_anchor = torch.zeros_like(u_anchor_hat)
-                    residual_next = torch.zeros_like(u_next_hat)
-                    residual_collo = torch.zeros_like(u_next_hat)
-                    u_integrated = torch.zeros_like(u_next_hat)
-                    collocation = None
+                u_next_hat = model.solution(stress_next_tensor, features, u_current)
+                r_next_hat = model.rate(stress_next_tensor, features, u_next_hat)
+                u_anchor_hat = model.solution(stress_current_tensor, features, u_current)
+                r_anchor_hat = model.rate(stress_current_tensor, features, u_anchor_hat)
+                du_next = autograd_du_ds(u_next_hat, stress_next_tensor)
+                du_current = autograd_du_ds(u_anchor_hat, stress_current_tensor)
+                residual_anchor = pde_residual(du_current, r_anchor_hat)
+                residual_next = pde_residual(du_next, r_next_hat)
+                collocation = sample_collocation_points(
+                    stress_current=stress_current_tensor.detach(),
+                    stress_delta=delta_full,
+                    features=features,
+                    cell_index=cell_index,
+                    points_per_transition=config.collocation_points,
+                    generator=generator if device == "cpu" else None,
+                )
+                collo_stress = collocation.stress.clone().detach().requires_grad_(True)
+                collo_u_current = u_current[collocation.row_index]
+                u_collo = model.solution(collo_stress, collocation.features, collo_u_current)
+                r_collo = model.rate(collo_stress, collocation.features, u_collo)
+                du_collo = autograd_du_ds(u_collo, collo_stress)
+                residual_collo = pde_residual(du_collo, r_collo)
+                u_integrated = integral_transition(
+                    model.solution, model.rate,
+                    stress_current_tensor, delta_full,
+                    features, u_current,
+                    method=config.quadrature_method, n_nodes=config.quadrature_nodes,
+                )
 
                 train_pred = u_next_hat[batch_positions]
                 train_true = u_true[batch_positions]
@@ -948,46 +887,75 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                 discrete_val = residual_anchor.new_zeros(())
                 discrete_row = 0.0
 
-                if is_pinn:
-                    pde_anchor_loss, pde_anchor_row = pde_loss(
-                        residual_anchor[batch_positions], train_cells,
+                pde_anchor_loss, pde_anchor_row = pde_loss(
+                    residual_anchor[batch_positions], train_cells,
+                )
+                if collocation is not None and residual_collo.numel():
+                    collo_cells = collocation.cell_index
+                    batch_selector_collo = torch.isin(
+                        collocation.row_index, batch_positions,
                     )
-                    if collocation is not None and residual_collo.numel():
-                        collo_cells = collocation.cell_index
-                        batch_selector_collo = torch.isin(
-                            collocation.row_index, batch_positions,
-                        )
-                        pde_collo_loss, pde_collo_row = pde_loss(
-                            residual_collo[batch_selector_collo],
-                            collo_cells[batch_selector_collo],
-                        )
-                    pde_row_mean = 0.5 * (pde_anchor_row + pde_collo_row)
-                    ic_loss, ic_row = initial_condition_loss(
-                        u_anchor_hat[batch_positions], u_current[batch_positions], train_cells,
+                    pde_collo_loss, pde_collo_row = pde_loss(
+                        residual_collo[batch_selector_collo],
+                        collo_cells[batch_selector_collo],
                     )
-                    integral_loss, integral_row = integral_consistency_loss(
-                        u_next_hat[batch_positions], u_integrated[batch_positions], train_cells,
+                pde_row_mean = 0.5 * (pde_anchor_row + pde_collo_row)
+                ic_loss, ic_row = initial_condition_loss(
+                    u_anchor_hat[batch_positions], u_current[batch_positions], train_cells,
+                )
+                integral_loss, integral_row = integral_consistency_loss(
+                    u_next_hat[batch_positions], u_integrated[batch_positions], train_cells,
+                )
+                mono_loss_val, mono_row = monotonicity_loss(
+                    u_next_hat[batch_positions], u_current[batch_positions], train_cells,
+                    epsilon_rec=scaler.epsilon_rec,
+                )
+                bounds_val, bounds_row = bounds_loss(
+                    u_next_hat[batch_positions], train_cells,
+                    u_min=0.0, u_max=scaler.u_max,
+                )
+                rate_val, rate_row = rate_regularization_loss(
+                    r_next_hat[batch_positions], train_cells,
+                )
+                if include_discrete_transition:
+                    discrete_residual = discrete_state_transition_residual(
+                        u_next_hat, u_current, r_anchor_hat, delta_full,
                     )
-                    mono_loss_val, mono_row = monotonicity_loss(
-                        u_next_hat[batch_positions], u_current[batch_positions], train_cells,
-                        epsilon_rec=scaler.epsilon_rec,
+                    discrete_val, discrete_row = discrete_state_transition_loss(
+                        discrete_residual[batch_positions], train_cells,
                     )
-                    bounds_val, bounds_row = bounds_loss(
-                        u_next_hat[batch_positions], train_cells,
-                        u_min=0.0, u_max=scaler.u_max,
-                    )
-                    rate_val, rate_row = rate_regularization_loss(
-                        r_next_hat[batch_positions], train_cells,
-                    )
-                    if include_discrete_transition:
-                        discrete_residual = discrete_state_transition_residual(
-                            u_next_hat, u_current, r_anchor_hat, delta_full,
-                        )
-                        discrete_val, discrete_row = discrete_state_transition_loss(
-                            discrete_residual[batch_positions], train_cells,
-                        )
 
-                pde_component = effective_weights.pde * (pde_anchor_loss + pde_collo_loss)
+                pde_anchor_and_collo = pde_anchor_loss + pde_collo_loss
+                physics_active = effective_weights.pde > 0
+
+                # Measure PDE-only gradient contribution via autograd BEFORE the
+                # composite backward. Also measure data gradient (post-warmup)
+                # so the two loss components can be balanced by their magnitudes.
+                grad_pde = 0.0
+                balance_scale = 1.0
+                if physics_active:
+                    pde_comp_probe = effective_weights.pde * pde_anchor_and_collo
+                    grad_pde = _pde_gradient_norm(
+                        pde_comp_probe, list(model.parameters()), logger=logger,
+                    )
+                    if epoch >= warmup_epochs and not np.isfinite(grad_pde):
+                        raise FoldTrainingError(
+                            f"non-finite PDE gradient at epoch {epoch}: {grad_pde}"
+                        )
+                    if (config.use_gradient_balance and epoch >= warmup_epochs
+                            and grad_pde > 0):
+                        data_grad_val = _pde_gradient_norm(
+                            effective_weights.data * train_data_loss,
+                            list(model.parameters()), logger=None,
+                        )
+                        if np.isfinite(data_grad_val) and data_grad_val > 0:
+                            ema_grad_data_bal = 0.95 * ema_grad_data_bal + 0.05 * data_grad_val
+                            ema_grad_pde_bal = 0.95 * ema_grad_pde_bal + 0.05 * grad_pde
+                            balance_scale = float(np.clip(
+                                ema_grad_data_bal / ema_grad_pde_bal, 0.01, 100.0,
+                            ))
+
+                pde_component = effective_weights.pde * balance_scale * pde_anchor_and_collo
                 total_loss = (
                     effective_weights.data * train_data_loss
                     + pde_component
@@ -1003,20 +971,6 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                     raise FoldTrainingError(
                         f"non-finite total loss at epoch {epoch} batch {b}: {total_loss.item()}"
                     )
-
-                # Measure PDE-only gradient contribution via autograd BEFORE the
-                # composite backward (issue #7).
-                grad_pde = 0.0
-                physics_active = is_pinn and effective_weights.pde > 0
-                if physics_active:
-                    grad_pde = _pde_gradient_norm(
-                        pde_component, list(model.parameters()), logger=logger,
-                    )
-                    if epoch >= warmup_epochs:
-                        if not np.isfinite(grad_pde):
-                            raise FoldTrainingError(
-                                f"non-finite PDE gradient at epoch {epoch}: {grad_pde}"
-                            )
 
                 total_loss.backward()
                 # ``clip_grad_norm_`` already returns the pre-clip total gradient
@@ -1051,7 +1005,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                 n_rows_seen += int(bw)
 
             # ---- end of batch loop; PDE-gradient enforcement is epoch-level.
-            physics_active = is_pinn and effective_weights.pde > 0
+            physics_active = effective_weights.pde > 0
             if physics_active and epoch >= warmup_epochs:
                 if grad_pde_epoch <= config.pde_gradient_min_norm:
                     consecutive_zero_pde_gradients += 1
@@ -1090,10 +1044,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             # cached ``val_true_tensor_cached`` / ``val_ss_tot_cached``.
             model.eval()
             with torch.no_grad():
-                if is_pinn:
-                    val_u = model.solution(stress_next_dev, features, u_current)
-                else:
-                    val_u = model(stress_next_dev, features, u_current)
+                val_u = model.solution(stress_next_dev, features, u_current)
                 val_pred = val_u[val_selector]
                 if val_n:
                     val_error_t = val_pred - val_true_tensor_cached
@@ -1129,7 +1080,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             du_det = du_next.detach()
             has_u = u_next_hat.numel() > 0
             has_du = du_next.numel() > 0
-            has_res = is_pinn and residual_next.numel() > 0
+            has_res = residual_next.numel() > 0
             if has_res:
                 res_det = residual_next.detach()
                 pde_mae_t = res_det.abs().mean()
@@ -1214,7 +1165,11 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                                         or epoch == config.max_epochs - 1):
                 log_epoch_summary(logger, epoch_row)
 
-            if val_mae + 1e-9 < best_val:
+            # Only accept checkpoints and count early-stopping patience once
+            # physics has become active; during warmup the model has not seen
+            # the full loss landscape yet, so an early "best" would freeze in
+            # a data-only fit.
+            if val_mae + 1e-9 < best_val and epoch >= warmup_epochs:
                 best_val = val_mae
                 best_epoch = epoch
                 patience = 0
@@ -1225,7 +1180,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                      "patience": patience},
                     fold_paths.best_model,
                 )
-            else:
+            elif epoch >= warmup_epochs:
                 patience += 1
 
             bar.set_postfix({
@@ -1291,7 +1246,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
         (inner_val_idx, "inner_validation"),
     ):
         eval_data = _evaluate(model, dataset, frame, indices, scaler, device,
-                               is_pinn, config, config.quadrature_method,
+                               config, config.quadrature_method,
                                config.quadrature_nodes)
         if not eval_data:
             continue
@@ -1302,7 +1257,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             eval_data["pde_residual"], eval_data["ic_error"],
             eval_data["integral_error"], eval_data["mono_violation"],
             eval_data["lower_violation"], eval_data["upper_violation"],
-            stress_std=scaler.stress_std, is_pinn=is_pinn,
+            stress_std=scaler.stress_std,
             ablation_name=ablation_name,
         ))
 
@@ -1327,7 +1282,6 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                 tolerance_source=tolerance_source,
                 tolerance_constant=tolerance_constant,
                 tolerance_quantile=tolerance_quantile,
-                is_pinn=is_pinn,
                 include_discrete_transition=include_discrete_transition,
                 device=device, logger=logger, ablation_name=ablation_name,
             )
@@ -1369,7 +1323,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
     outer_eval_scaler = refit_scaler
     outer_eval_data = _evaluate(
         outer_eval_model, dataset, frame, outer_val_idx, outer_eval_scaler,
-        device, is_pinn, config, config.quadrature_method,
+        device, config, config.quadrature_method,
         config.quadrature_nodes,
     )
     if outer_eval_data:
@@ -1381,7 +1335,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             outer_eval_data["ic_error"], outer_eval_data["integral_error"],
             outer_eval_data["mono_violation"], outer_eval_data["lower_violation"],
             outer_eval_data["upper_violation"],
-            stress_std=outer_eval_scaler.stress_std, is_pinn=is_pinn,
+            stress_std=outer_eval_scaler.stress_std,
             ablation_name=ablation_name,
         ))
 
@@ -1392,9 +1346,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
     if not predictions_frame.empty:
         atomic_write_parquet(predictions_frame, fold_paths.predictions_path)
 
-    physics_summary = _summarize_outer_physics(
-        outer_eval_data, is_pinn=is_pinn,
-    )
+    physics_summary = _summarize_outer_physics(outer_eval_data)
 
     atomic_write_json({
         "status": "completed",
@@ -1449,7 +1401,7 @@ def _refit_full_outer_train(
     best_epoch: int, config: TrainerConfig, loss_weights: LossWeights,
     u_max_source: str, u_max_constant: float, u_max_margin: float,
     tolerance_source: str, tolerance_constant: float, tolerance_quantile: float,
-    is_pinn: bool, include_discrete_transition: bool,
+    include_discrete_transition: bool,
     device: str, logger: logging.Logger | None, ablation_name: str | None,
 ) -> tuple[nn.Module, FoldScaler]:
     """Fit a fresh model on ALL outer-training rows for ``best_epoch + 1``
@@ -1486,26 +1438,17 @@ def _refit_full_outer_train(
 
     set_seeds(config.seed)
     feature_dim = 2 + len(original_cols)
-    if is_pinn:
-        refit_model = NaPINNQ(
-            feature_dim=feature_dim,
-            solution_hidden_dims=config.solution_hidden_dims,
-            rate_hidden_dims=config.rate_hidden_dims,
-            solution_activation=config.solution_activation,
-            rate_activation=config.rate_activation,
-            solution_dropout=config.solution_dropout,
-            rate_dropout=config.rate_dropout,
-            rate_uses_u_hat=config.rate_uses_u_hat,
-            predict_delta_u=config.predict_delta_u,
-        )
-    else:
-        refit_model = DNNQ(
-            feature_dim=feature_dim,
-            hidden_dims=config.dnn_solution_hidden_dims,
-            solution_activation=config.solution_activation,
-            solution_dropout=config.solution_dropout,
-            predict_delta_u=config.predict_delta_u,
-        )
+    refit_model = NaPINNQ(
+        feature_dim=feature_dim,
+        solution_hidden_dims=config.solution_hidden_dims,
+        rate_hidden_dims=config.rate_hidden_dims,
+        solution_activation=config.solution_activation,
+        rate_activation=config.rate_activation,
+        solution_dropout=config.solution_dropout,
+        rate_dropout=config.rate_dropout,
+        rate_uses_u_hat=config.rate_uses_u_hat,
+        predict_delta_u=config.predict_delta_u,
+    )
     refit_model.to(device)
     optimizer = _init_optimizer(refit_model, config)
 
@@ -1577,82 +1520,71 @@ def _refit_full_outer_train(
             stress_current_tensor = stress_current_dev.detach().requires_grad_(True)
             stress_next_tensor = stress_next_dev.detach().requires_grad_(True)
 
-            if is_pinn:
-                u_next_hat = refit_model.solution(stress_next_tensor, features, u_current)
-                r_next_hat = refit_model.rate(stress_next_tensor, features, u_next_hat)
-                u_anchor_hat = refit_model.solution(stress_current_tensor, features, u_current)
-                r_anchor_hat = refit_model.rate(stress_current_tensor, features, u_anchor_hat)
-                du_next = autograd_du_ds(u_next_hat, stress_next_tensor)
-                du_current = autograd_du_ds(u_anchor_hat, stress_current_tensor)
-                residual_anchor = pde_residual(du_current, r_anchor_hat)
-                residual_next = pde_residual(du_next, r_next_hat)
-                collocation = sample_collocation_points(
-                    stress_current=stress_current_tensor.detach(),
-                    stress_delta=delta_full,
-                    features=features,
-                    cell_index=cell_index,
-                    points_per_transition=config.collocation_points,
-                    generator=generator if device == "cpu" else None,
-                )
-                collo_stress = collocation.stress.clone().detach().requires_grad_(True)
-                collo_u_current = u_current[collocation.row_index]
-                u_collo = refit_model.solution(collo_stress, collocation.features, collo_u_current)
-                r_collo = refit_model.rate(collo_stress, collocation.features, u_collo)
-                du_collo = autograd_du_ds(u_collo, collo_stress)
-                residual_collo = pde_residual(du_collo, r_collo)
-                u_integrated = integral_transition(
-                    refit_model.solution, refit_model.rate,
-                    stress_current_tensor, delta_full,
-                    features, u_current,
-                    method=config.quadrature_method, n_nodes=config.quadrature_nodes,
-                )
-            else:
-                u_next_hat = refit_model(stress_next_tensor, features, u_current)
-                u_anchor_hat = refit_model(stress_current_tensor, features, u_current)
-                r_next_hat = torch.zeros_like(u_next_hat)
-                r_anchor_hat = torch.zeros_like(u_anchor_hat)
-                residual_anchor = torch.zeros_like(u_anchor_hat)
-                residual_collo = torch.zeros_like(u_next_hat)
-                u_integrated = torch.zeros_like(u_next_hat)
-                collocation = None
+            u_next_hat = refit_model.solution(stress_next_tensor, features, u_current)
+            r_next_hat = refit_model.rate(stress_next_tensor, features, u_next_hat)
+            u_anchor_hat = refit_model.solution(stress_current_tensor, features, u_current)
+            r_anchor_hat = refit_model.rate(stress_current_tensor, features, u_anchor_hat)
+            du_next = autograd_du_ds(u_next_hat, stress_next_tensor)
+            du_current = autograd_du_ds(u_anchor_hat, stress_current_tensor)
+            residual_anchor = pde_residual(du_current, r_anchor_hat)
+            residual_next = pde_residual(du_next, r_next_hat)
+            collocation = sample_collocation_points(
+                stress_current=stress_current_tensor.detach(),
+                stress_delta=delta_full,
+                features=features,
+                cell_index=cell_index,
+                points_per_transition=config.collocation_points,
+                generator=generator if device == "cpu" else None,
+            )
+            collo_stress = collocation.stress.clone().detach().requires_grad_(True)
+            collo_u_current = u_current[collocation.row_index]
+            u_collo = refit_model.solution(collo_stress, collocation.features, collo_u_current)
+            r_collo = refit_model.rate(collo_stress, collocation.features, u_collo)
+            du_collo = autograd_du_ds(u_collo, collo_stress)
+            residual_collo = pde_residual(du_collo, r_collo)
+            u_integrated = integral_transition(
+                refit_model.solution, refit_model.rate,
+                stress_current_tensor, delta_full,
+                features, u_current,
+                method=config.quadrature_method, n_nodes=config.quadrature_nodes,
+            )
 
             batch_cells = cell_index[batch_positions]
             data_l, _ = data_loss(u_next_hat[batch_positions], u_true[batch_positions],
                                     batch_cells, delta=config.huber_delta)
             pde_anchor_l = residual_anchor.new_zeros(())
-            pde_collo_l = residual_collo.new_zeros(()) if is_pinn else residual_anchor.new_zeros(())
+            pde_collo_l = residual_collo.new_zeros(())
             ic_l = residual_anchor.new_zeros(())
             integral_l = residual_anchor.new_zeros(())
             mono_l = residual_anchor.new_zeros(())
             bounds_l = residual_anchor.new_zeros(())
             rate_l = residual_anchor.new_zeros(())
             discrete_l = residual_anchor.new_zeros(())
-            if is_pinn:
-                pde_anchor_l, _ = pde_loss(residual_anchor[batch_positions], batch_cells)
-                if collocation is not None and residual_collo.numel():
-                    batch_selector_collo = torch.isin(collocation.row_index, batch_positions)
-                    pde_collo_l, _ = pde_loss(
-                        residual_collo[batch_selector_collo],
-                        collocation.cell_index[batch_selector_collo],
-                    )
-                ic_l, _ = initial_condition_loss(u_anchor_hat[batch_positions],
-                                                   u_current[batch_positions], batch_cells)
-                integral_l, _ = integral_consistency_loss(u_next_hat[batch_positions],
-                                                            u_integrated[batch_positions],
-                                                            batch_cells)
-                mono_l, _ = monotonicity_loss(u_next_hat[batch_positions],
-                                                u_current[batch_positions], batch_cells,
-                                                epsilon_rec=refit_scaler.epsilon_rec)
-                bounds_l, _ = bounds_loss(u_next_hat[batch_positions], batch_cells,
-                                            u_min=0.0, u_max=refit_scaler.u_max)
-                rate_l, _ = rate_regularization_loss(r_next_hat[batch_positions], batch_cells)
-                if include_discrete_transition:
-                    discrete_residual = discrete_state_transition_residual(
-                        u_next_hat, u_current, r_anchor_hat, delta_full,
-                    )
-                    discrete_l, _ = discrete_state_transition_loss(
-                        discrete_residual[batch_positions], batch_cells,
-                    )
+            pde_anchor_l, _ = pde_loss(residual_anchor[batch_positions], batch_cells)
+            if collocation is not None and residual_collo.numel():
+                batch_selector_collo = torch.isin(collocation.row_index, batch_positions)
+                pde_collo_l, _ = pde_loss(
+                    residual_collo[batch_selector_collo],
+                    collocation.cell_index[batch_selector_collo],
+                )
+            ic_l, _ = initial_condition_loss(u_anchor_hat[batch_positions],
+                                               u_current[batch_positions], batch_cells)
+            integral_l, _ = integral_consistency_loss(u_next_hat[batch_positions],
+                                                        u_integrated[batch_positions],
+                                                        batch_cells)
+            mono_l, _ = monotonicity_loss(u_next_hat[batch_positions],
+                                            u_current[batch_positions], batch_cells,
+                                            epsilon_rec=refit_scaler.epsilon_rec)
+            bounds_l, _ = bounds_loss(u_next_hat[batch_positions], batch_cells,
+                                        u_min=0.0, u_max=refit_scaler.u_max)
+            rate_l, _ = rate_regularization_loss(r_next_hat[batch_positions], batch_cells)
+            if include_discrete_transition:
+                discrete_residual = discrete_state_transition_residual(
+                    u_next_hat, u_current, r_anchor_hat, delta_full,
+                )
+                discrete_l, _ = discrete_state_transition_loss(
+                    discrete_residual[batch_positions], batch_cells,
+                )
 
             total = (
                 effective_weights.data * data_l
@@ -1675,32 +1607,9 @@ def _refit_full_outer_train(
     return refit_model, refit_scaler
 
 
-def _summarize_outer_physics(outer_eval: dict[str, np.ndarray],
-                              *, is_pinn: bool) -> dict[str, float]:
+def _summarize_outer_physics(outer_eval: dict[str, np.ndarray]) -> dict[str, float]:
     if not outer_eval:
         return {}
-    if not is_pinn:
-        # DNN-Q has no physics-informed rate; report NaN so the aggregator
-        # and combined report do not compare apples to oranges.
-        nan = float("nan")
-        return {
-            "pde_residual_MAE": nan, "pde_residual_RMSE": nan,
-            "positive_derivative_fraction":
-                float((outer_eval["du_ds"] > 0).mean()) if outer_eval["du_ds"].size else nan,
-            "monotonicity_violation_fraction":
-                float((outer_eval["mono_violation"] > 0).mean()),
-            "mean_monotonicity_violation": float(outer_eval["mono_violation"].mean()),
-            "max_monotonicity_violation": float(outer_eval["mono_violation"].max())
-                if outer_eval["mono_violation"].size else nan,
-            "initial_condition_MAE": nan,
-            "integral_consistency_MAE": nan,
-            "lower_bound_violation_fraction":
-                float((outer_eval["lower_violation"] > 0).mean()),
-            "upper_bound_violation_fraction":
-                float((outer_eval["upper_violation"] > 0).mean()),
-            "negative_rate_fraction": nan,
-            "mean_r": nan, "std_r": nan,
-        }
     return {
         "pde_residual_MAE": float(np.mean(np.abs(outer_eval["pde_residual"]))),
         "pde_residual_RMSE": float(np.sqrt(np.mean(outer_eval["pde_residual"] ** 2))),

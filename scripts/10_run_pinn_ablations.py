@@ -180,8 +180,6 @@ def main() -> None:
             quadrature_nodes=int(pinn_cfg["quadrature"]["nodes"]),
             solution_hidden_dims=tuple(int(h) for h in pinn_cfg["model"]["solution_hidden_dims"]),
             rate_hidden_dims=tuple(int(h) for h in pinn_cfg["model"]["rate_hidden_dims"]),
-            dnn_solution_hidden_dims=tuple(int(h) for h in pinn_cfg["model"].get(
-                "dnn_solution_hidden_dims", pinn_cfg["model"]["solution_hidden_dims"])),
             solution_activation=str(pinn_cfg["model"]["solution_activation"]),
             rate_activation=str(pinn_cfg["model"]["rate_activation"]),
             solution_dropout=float(pinn_cfg["model"].get("solution_dropout", 0.0)),
@@ -197,6 +195,8 @@ def main() -> None:
                 "pde_gradient_min_norm", 1.0e-8)),
             pde_gradient_zero_patience=int(pinn_cfg["training"].get(
                 "pde_gradient_zero_patience", 5)),
+            use_gradient_balance=bool(pinn_cfg["training"].get(
+                "use_gradient_balance", True)),
             log_every_epochs=int(pinn_cfg["logging"]["log_every_epochs"]),
             save_checkpoint_every_epochs=int(pinn_cfg["logging"]["save_checkpoint_every_epochs"]),
             log_gpu_memory=bool(pinn_cfg["logging"]["log_gpu_memory"]),
