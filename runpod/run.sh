@@ -57,7 +57,7 @@ echo "[run] r2.env loaded  R2_BUCKET=${R2_BUCKET:-<unset>}  STOP_MODE=${STOP_MOD
 : "${POD_CODE_DIR:=${CODE_DIR}}"
 : "${STOP_MODE:=terminate}"
 : "${R2_PREFIX:=sodium_ion_battery}"
-: "${RUN_STAGES:=canonical,build,degradation,experiments,aggregate,plot}"
+: "${RUN_STAGES:=all}"
 
 # Expand the alias 'all' to the full classical + PINN pipeline. pinn_ablation
 # must precede pinn_plot: the plotting script reads ablation_metrics.csv, and

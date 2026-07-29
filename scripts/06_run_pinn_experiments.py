@@ -197,7 +197,11 @@ def main() -> None:
                     "dnn_solution_hidden_dims", pinn_cfg["model"]["solution_hidden_dims"])),
                 solution_activation=str(pinn_cfg["model"]["solution_activation"]),
                 rate_activation=str(pinn_cfg["model"]["rate_activation"]),
+                solution_dropout=float(pinn_cfg["model"].get("solution_dropout", 0.0)),
+                rate_dropout=float(pinn_cfg["model"].get("rate_dropout", 0.0)),
                 rate_uses_u_hat=bool(pinn_cfg["model"].get("rate_uses_u_hat", True)),
+                predict_delta_u=bool(pinn_cfg["model"].get("predict_delta_u", False)),
+                batch_size=int(pinn_cfg["training"].get("batch_size", 0)),
                 maximum_parameters=int(pinn_cfg["model"]["maximum_parameters"]),
                 inner_split_seed=int(pinn_cfg.get("audit", {}).get(
                     "inner_split_seed", 20240117)),

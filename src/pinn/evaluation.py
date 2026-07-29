@@ -50,12 +50,51 @@ def _regression_metrics(y_true: np.ndarray, y_pred: np.ndarray, *,
             "MAPE": mape, "n": int(y_true.size)}
 
 
+def _pooled_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Compute R² from pooled residuals (single global mean baseline)."""
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true = y_true[mask]; y_pred = y_pred[mask]
+    if y_true.size < 2:
+        return float("nan")
+    ss_res = float(np.sum((y_pred - y_true) ** 2))
+    ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
+    return 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+
+def _within_cell_rmse_ratio(predictions: pd.DataFrame, true_col: str,
+                             pred_col: str, group_col: str) -> float:
+    """Bounded generalization metric that never blows up on tiny groups.
+
+    Numerator: overall pooled RMSE.
+    Denominator: standard deviation of y_true across ALL rows (not per-cell).
+    Result is on [0, ∞); ratio < 1 means predictions beat the global mean.
+    """
+    y = pd.to_numeric(predictions[true_col], errors="coerce").to_numpy(dtype=float)
+    p = pd.to_numeric(predictions[pred_col], errors="coerce").to_numpy(dtype=float)
+    mask = np.isfinite(y) & np.isfinite(p)
+    if mask.sum() < 2:
+        return float("nan")
+    y = y[mask]; p = p[mask]
+    rmse = float(np.sqrt(np.mean((p - y) ** 2)))
+    std_y = float(np.std(y))
+    if std_y <= 0:
+        return float("nan")
+    return rmse / std_y
+
+
 def target_metric_rows(predictions: pd.DataFrame) -> pd.DataFrame:
-    """Compute per-target metrics for pooled, cell-macro and condition-macro."""
+    """Compute per-target metrics for pooled, cell-macro and condition-macro.
+
+    Stage-3 fix #5: for cell_macro and condition_macro:
+      * MAE / RMSE / MaxError / MAPE remain mean-of-per-group.
+      * R² is now the *pooled* R² across all rows (bounded, stable on
+        tiny groups). The historical mean-of-per-group R² is preserved as
+        ``R2_group_mean`` for backwards compatibility with older plots.
+    A new column ``within_cell_rmse_ratio`` is added: RMSE / std(y_true)
+    over all rows, bounded on [0, ∞).
+    """
     rows: list[dict[str, object]] = []
     for target in TARGET_VIEWS:
-        pred_col = f"predicted_{target.replace('next_rpt_', 'next_').replace('delta_next_rpt_', 'delta_')}"
-        # Direct column name lookup
         target_to_columns = {
             "next_rpt_Q_Ah": ("true_next_Q_Ah", "predicted_next_Q_Ah"),
             "next_rpt_SOH_pct": ("true_next_SOH_pct", "predicted_next_SOH_pct"),
@@ -66,13 +105,16 @@ def target_metric_rows(predictions: pd.DataFrame) -> pd.DataFrame:
         if true_col not in predictions.columns or pred_col not in predictions.columns:
             continue
 
+        y_true_all = predictions[true_col].to_numpy(dtype=float)
+        y_pred_all = predictions[pred_col].to_numpy(dtype=float)
+        pooled_r2 = _pooled_r2(y_true_all, y_pred_all)
+
         for aggregation in ("pooled", "cell_macro", "condition_macro"):
             if aggregation == "pooled":
-                metrics = _regression_metrics(
-                    predictions[true_col].to_numpy(dtype=float),
-                    predictions[pred_col].to_numpy(dtype=float),
-                    target=target,
-                )
+                metrics = _regression_metrics(y_true_all, y_pred_all,
+                                               target=target)
+                metrics["R2_group_mean"] = float("nan")
+                group_col = None
             else:
                 group_col = "cell_id" if aggregation == "cell_macro" else "condition_id"
                 per_group = []
@@ -85,17 +127,27 @@ def target_metric_rows(predictions: pd.DataFrame) -> pd.DataFrame:
                 if not per_group:
                     metrics = {"MAE": float("nan"), "RMSE": float("nan"),
                                "R2": float("nan"), "MaxError": float("nan"),
-                               "MAPE": float("nan"), "n": 0}
+                               "MAPE": float("nan"), "n": 0,
+                               "R2_group_mean": float("nan")}
                 else:
                     metrics = {
                         key: float(np.nanmean([row[key] for row in per_group]))
                         if key != "n" else int(sum(row["n"] for row in per_group))
-                        for key in ("MAE", "RMSE", "R2", "MaxError", "MAPE", "n")
+                        for key in ("MAE", "RMSE", "MaxError", "MAPE", "n")
                     }
+                    # Preserve the legacy mean-of-per-group R² for reference,
+                    # but promote the pooled R² to the primary column.
+                    metrics["R2_group_mean"] = float(
+                        np.nanmean([row["R2"] for row in per_group])
+                    )
+                    metrics["R2"] = pooled_r2
             row = {
                 "target": target,
                 "aggregation": aggregation,
                 **metrics,
+                "within_cell_rmse_ratio":
+                    _within_cell_rmse_ratio(predictions, true_col, pred_col,
+                                              group_col or "cell_id"),
             }
             for column in ("architecture", "preprocessing", "fold", "seed",
                            "evaluation_role", "ablation"):

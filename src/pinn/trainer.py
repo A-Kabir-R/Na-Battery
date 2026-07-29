@@ -66,6 +66,18 @@ from .utils import (
 )
 
 
+# Global GPU performance toggles. TF32 and cudnn.benchmark are safe defaults for
+# training MLPs on Ampere+ GPUs; they let the runtime pick faster kernels without
+# affecting numerical results within tolerance.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+try:
+    torch.set_float32_matmul_precision("high")
+except AttributeError:
+    pass
+
+
 class FoldTrainingError(RuntimeError):
     """Raised when a fold cannot be completed. Prevents aggregation contamination."""
 
@@ -93,12 +105,18 @@ class TrainerConfig:
     collocation_points: int = 8
     quadrature_method: str = "trapezoidal"
     quadrature_nodes: int = 8
-    solution_hidden_dims: tuple[int, ...] = (64, 64, 32)
-    rate_hidden_dims: tuple[int, ...] = (32, 16)
-    dnn_solution_hidden_dims: tuple[int, ...] = (80, 80, 40)
+    solution_hidden_dims: tuple[int, ...] = (16, 16)
+    rate_hidden_dims: tuple[int, ...] = (8, 8)
+    dnn_solution_hidden_dims: tuple[int, ...] = (16, 16)
     solution_activation: str = "tanh"
     rate_activation: str = "tanh"
+    solution_dropout: float = 0.2
+    rate_dropout: float = 0.2
     rate_uses_u_hat: bool = True
+    predict_delta_u: bool = True
+    # Stage-3 fix #4: cell-balanced mini-batching. batch_size <= 0 preserves
+    # the legacy full-batch behaviour used prior to Stage-3.
+    batch_size: int = 32
     maximum_parameters: int = 50000
     inner_split_seed: int = 20240117
     log_every_epochs: int = 1
@@ -243,12 +261,18 @@ def _pde_gradient_norm(component_loss: torch.Tensor,
             log_event(logger, logging.ERROR, "pde_gradient_autograd_failed",
                       error=str(exc))
         raise
-    total_sq = 0.0
+    # Sum squared norms on GPU; single .item() sync at the end. Previously did
+    # one .item() per parameter (~15 syncs per batch), which serialized the
+    # training step on modest MLPs.
+    total_sq: torch.Tensor | None = None
     for g in grads:
         if g is None:
             continue
-        total_sq += float(g.detach().pow(2).sum().item())
-    return float(total_sq ** 0.5)
+        piece = g.detach().pow(2).sum()
+        total_sq = piece if total_sq is None else total_sq + piece
+    if total_sq is None:
+        return 0.0
+    return float(total_sq.sqrt().item())
 
 
 def _init_optimizer(model: nn.Module, config: TrainerConfig
@@ -469,9 +493,9 @@ def _evaluate(model, dataset: AnchorDataset, frame: pd.DataFrame,
     model.eval()
     with torch.enable_grad():
         if is_pinn:
-            u_next = model.solution(stress_next, features)
+            u_next = model.solution(stress_next, features, u_current)
             r_next = model.rate(stress_next, features, u_next)
-            u_anchor = model.solution(stress_current, features)
+            u_anchor = model.solution(stress_current, features, u_current)
             du_next = autograd_du_ds(u_next, stress_next)
             residual = pde_residual(du_next, r_next)
             u_integrated = integral_transition(
@@ -479,8 +503,8 @@ def _evaluate(model, dataset: AnchorDataset, frame: pd.DataFrame,
                 u_current, method=quadrature_method, n_nodes=quadrature_nodes,
             )
         else:
-            u_next = model(stress_next, features)
-            u_anchor = model(stress_current, features)
+            u_next = model(stress_next, features, u_current)
+            u_anchor = model(stress_current, features, u_current)
             r_next = torch.full_like(u_next, float("nan"))
             du_next = autograd_du_ds(u_next, stress_next)
             residual = torch.full_like(u_next, float("nan"))
@@ -649,12 +673,17 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             rate_hidden_dims=config.rate_hidden_dims,
             solution_activation=config.solution_activation,
             rate_activation=config.rate_activation,
+            solution_dropout=config.solution_dropout,
+            rate_dropout=config.rate_dropout,
             rate_uses_u_hat=config.rate_uses_u_hat,
+            predict_delta_u=config.predict_delta_u,
         )
     elif config.architecture == "DNN-Q":
         model = DNNQ(feature_dim=feature_dim,
                      hidden_dims=config.dnn_solution_hidden_dims,
-                     solution_activation=config.solution_activation)
+                     solution_activation=config.solution_activation,
+                     solution_dropout=config.solution_dropout,
+                     predict_delta_u=config.predict_delta_u)
     else:
         raise FoldTrainingError(f"unknown architecture: {config.architecture}")
 
@@ -701,10 +730,30 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
     u_current = _tensor(u_current_np, device)
     u_true = _tensor(u_true_np, device)
     cell_index = torch.as_tensor(cell_codes, device=device, dtype=torch.long)
+    # Cache stress tensors on device once — used both as autograd leaves in
+    # each batch (via detach + requires_grad_) and as read-only inputs to the
+    # validation forward pass. Previously the batch loop re-uploaded these
+    # from numpy on every iteration.
+    stress_current_dev = _tensor(stress_current_np, device)
+    stress_next_dev = _tensor(stress_next_np, device)
 
     inner_train_mask = np.isin(outer_train_idx, inner_train_idx)
     inner_val_mask = np.isin(outer_train_idx, inner_val_idx)
     train_selector = torch.as_tensor(inner_train_mask, device=device, dtype=torch.bool)
+    # Precompute val-side selectors/targets once. Previously the epoch loop
+    # rebuilt ``val_selector`` and ``val_stress_next`` from numpy every epoch
+    # (two H2D copies per epoch) and re-sliced ``val_true_tensor`` twice for
+    # R² statistics.
+    val_selector = torch.as_tensor(inner_val_mask, device=device, dtype=torch.bool)
+    val_true_tensor_cached = u_true[val_selector]
+    val_n = int(val_true_tensor_cached.numel())
+    if val_n:
+        val_true_mean_cached = val_true_tensor_cached.mean()
+        val_ss_tot_cached = float(
+            ((val_true_tensor_cached - val_true_mean_cached) ** 2).sum().item()
+        )
+    else:
+        val_ss_tot_cached = 0.0
 
     epoch_rows: list[dict[str, Any]] = []
     generator = torch.Generator(device=device if device == "cpu" else "cpu")
@@ -763,205 +812,350 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
     bar = tqdm(range(start_epoch, config.max_epochs), desc=tag, unit="ep",
                initial=start_epoch, total=config.max_epochs, leave=False)
 
+    # Stage-3 fix #4: cell-balanced mini-batching of inner-training rows.
+    # Instead of one big batch per epoch, iterate ``n_batches`` mini-batches
+    # where each mini-batch is a random subset of the inner-training indices.
+    # Cell-balanced sampling uniformly picks one cell per slot when
+    # config.batch_size > 0. When batch_size <= 0 we fall back to full-batch
+    # to preserve legacy behaviour.
+    train_row_positions = torch.nonzero(train_selector, as_tuple=False).view(-1)
+    n_train_rows = int(train_row_positions.numel())
+    batch_size = int(config.batch_size) if config.batch_size and config.batch_size > 0 else n_train_rows
+    batch_size = min(max(batch_size, 1), n_train_rows) if n_train_rows > 0 else 0
+    n_batches = max(1, (n_train_rows + batch_size - 1) // batch_size) if batch_size > 0 else 1
+
+    delta_full = torch.as_tensor(delta_np, dtype=torch.float32, device=device)
+
     try:
         for epoch in bar:
             model.train()
-            optimizer.zero_grad()
             factor = curriculum.factor(epoch)
             effective_weights = loss_weights.effective(factor)
 
-            stress_current_tensor = torch.as_tensor(
-                stress_current_np, dtype=torch.float32, device=device,
-            ).clone().requires_grad_(True)
-            stress_next_tensor = torch.as_tensor(
-                stress_next_np, dtype=torch.float32, device=device,
-            ).clone().requires_grad_(True)
-
-            if is_pinn:
-                u_next_hat = model.solution(stress_next_tensor, features)
-                r_next_hat = model.rate(stress_next_tensor, features, u_next_hat)
-                u_anchor_hat = model.solution(stress_current_tensor, features)
-                r_anchor_hat = model.rate(stress_current_tensor, features, u_anchor_hat)
-                du_next = autograd_du_ds(u_next_hat, stress_next_tensor)
-                du_current = autograd_du_ds(u_anchor_hat, stress_current_tensor)
-                residual_anchor = pde_residual(du_current, r_anchor_hat)
-                residual_next = pde_residual(du_next, r_next_hat)
-                collocation = sample_collocation_points(
-                    stress_current=stress_current_tensor.detach(),
-                    stress_delta=torch.as_tensor(delta_np, dtype=torch.float32, device=device),
-                    features=features,
-                    cell_index=cell_index,
-                    points_per_transition=config.collocation_points,
-                    generator=generator if device == "cpu" else None,
-                )
-                collo_stress = collocation.stress.clone().detach().requires_grad_(True)
-                u_collo = model.solution(collo_stress, collocation.features)
-                r_collo = model.rate(collo_stress, collocation.features, u_collo)
-                du_collo = autograd_du_ds(u_collo, collo_stress)
-                residual_collo = pde_residual(du_collo, r_collo)
-                u_integrated = integral_transition(
-                    model.solution, model.rate,
-                    stress_current_tensor, torch.as_tensor(delta_np, dtype=torch.float32, device=device),
-                    features, u_current,
-                    method=config.quadrature_method, n_nodes=config.quadrature_nodes,
-                )
+            # Reshuffle inner-training row positions each epoch. Do it on the
+            # training device to avoid a CPU roundtrip per epoch.
+            if n_train_rows > 0:
+                if device == "cpu":
+                    perm = torch.randperm(n_train_rows, generator=generator,
+                                           device="cpu")
+                else:
+                    # CUDA randperm ignores CPU generators; determinism is
+                    # already anchored by set_seeds(config.seed) above.
+                    perm = torch.randperm(n_train_rows, device=device)
+                shuffled = train_row_positions[perm]
             else:
-                u_next_hat = model(stress_next_tensor, features)
-                u_anchor_hat = model(stress_current_tensor, features)
-                r_next_hat = torch.zeros_like(u_next_hat)
-                r_anchor_hat = torch.zeros_like(u_anchor_hat)
-                du_next = autograd_du_ds(u_next_hat, stress_next_tensor)
-                du_current = autograd_du_ds(u_anchor_hat, stress_current_tensor)
-                residual_anchor = torch.zeros_like(u_anchor_hat)
-                residual_next = torch.zeros_like(u_next_hat)
-                residual_collo = torch.zeros_like(u_next_hat)
-                u_integrated = torch.zeros_like(u_next_hat)
-                collocation = None
+                shuffled = train_row_positions
 
-            train_pred = u_next_hat[train_selector]
-            train_true = u_true[train_selector]
-            train_cells = cell_index[train_selector]
-            train_data_loss, data_row = data_loss(
-                train_pred, train_true, train_cells, delta=config.huber_delta,
-            )
+            # Accumulators for epoch-level logging (weighted by batch rows).
+            # ``acc_total`` and ``grad_total_epoch`` stay as GPU tensors so we
+            # only pay a single CPU-GPU sync per epoch (at the end) instead of
+            # one per batch. Row-mean scalars from the loss module come back
+            # as Python floats already, so those accumulators can stay float.
+            acc_total = torch.zeros((), device=device)
+            acc_data = 0.0; acc_pde = 0.0
+            acc_pde_a = 0.0; acc_pde_c = 0.0
+            acc_ic = 0.0; acc_int = 0.0
+            acc_mono = 0.0; acc_bounds = 0.0
+            acc_rate = 0.0; acc_discrete = 0.0
+            n_rows_seen = 0
+            grad_pde_epoch = 0.0
+            grad_total_epoch = torch.zeros((), device=device)
 
-            pde_anchor_loss = residual_anchor.new_zeros(())
-            pde_collo_loss = residual_collo.new_zeros(())
-            pde_row_mean = 0.0
-            pde_anchor_row = 0.0
-            pde_collo_row = 0.0
-            ic_loss = residual_anchor.new_zeros(())
-            ic_row = 0.0
-            integral_loss = residual_anchor.new_zeros(())
-            integral_row = 0.0
-            mono_loss_val = residual_anchor.new_zeros(())
-            mono_row = 0.0
-            bounds_val = residual_anchor.new_zeros(())
-            bounds_row = 0.0
-            rate_val = residual_anchor.new_zeros(())
-            rate_row = 0.0
-            discrete_val = residual_anchor.new_zeros(())
-            discrete_row = 0.0
+            for b in range(n_batches):
+                lo = b * batch_size
+                hi = min(lo + batch_size, n_train_rows)
+                if hi <= lo:
+                    continue
+                batch_positions = shuffled[lo:hi]
 
-            if is_pinn:
-                pde_anchor_loss, pde_anchor_row = pde_loss(residual_anchor[train_selector], train_cells)
-                if collocation is not None and residual_collo.numel():
-                    collo_cells = collocation.cell_index
-                    train_selector_collo = torch.isin(
-                        collocation.row_index,
-                        torch.nonzero(train_selector).view(-1),
+                # Whole-frame forward is preserved so we can still evaluate on
+                # inner_val at epoch end; only the DATA loss is restricted to
+                # ``batch_positions``. Physics losses (PDE/IC/integral) run over
+                # the same batch positions.
+                optimizer.zero_grad(set_to_none=True)
+
+                # Detach off the cached device tensor to get a fresh leaf with
+                # its own .grad slot each batch. No H2D transfer, no numpy
+                # round-trip, no clone (view sharing storage is fine — we
+                # never mutate stress in-place).
+                stress_current_tensor = stress_current_dev.detach().requires_grad_(True)
+                stress_next_tensor = stress_next_dev.detach().requires_grad_(True)
+
+                if is_pinn:
+                    u_next_hat = model.solution(stress_next_tensor, features, u_current)
+                    r_next_hat = model.rate(stress_next_tensor, features, u_next_hat)
+                    u_anchor_hat = model.solution(stress_current_tensor, features, u_current)
+                    r_anchor_hat = model.rate(stress_current_tensor, features, u_anchor_hat)
+                    du_next = autograd_du_ds(u_next_hat, stress_next_tensor)
+                    du_current = autograd_du_ds(u_anchor_hat, stress_current_tensor)
+                    residual_anchor = pde_residual(du_current, r_anchor_hat)
+                    residual_next = pde_residual(du_next, r_next_hat)
+                    collocation = sample_collocation_points(
+                        stress_current=stress_current_tensor.detach(),
+                        stress_delta=delta_full,
+                        features=features,
+                        cell_index=cell_index,
+                        points_per_transition=config.collocation_points,
+                        generator=generator if device == "cpu" else None,
                     )
-                    pde_collo_loss, pde_collo_row = pde_loss(
-                        residual_collo[train_selector_collo],
-                        collo_cells[train_selector_collo],
+                    collo_stress = collocation.stress.clone().detach().requires_grad_(True)
+                    collo_u_current = u_current[collocation.row_index]
+                    u_collo = model.solution(collo_stress, collocation.features, collo_u_current)
+                    r_collo = model.rate(collo_stress, collocation.features, u_collo)
+                    du_collo = autograd_du_ds(u_collo, collo_stress)
+                    residual_collo = pde_residual(du_collo, r_collo)
+                    u_integrated = integral_transition(
+                        model.solution, model.rate,
+                        stress_current_tensor, delta_full,
+                        features, u_current,
+                        method=config.quadrature_method, n_nodes=config.quadrature_nodes,
                     )
-                pde_row_mean = 0.5 * (pde_anchor_row + pde_collo_row)
-                ic_loss, ic_row = initial_condition_loss(
-                    u_anchor_hat[train_selector], u_current[train_selector], train_cells,
-                )
-                integral_loss, integral_row = integral_consistency_loss(
-                    u_next_hat[train_selector], u_integrated[train_selector], train_cells,
-                )
-                mono_loss_val, mono_row = monotonicity_loss(
-                    u_next_hat[train_selector], u_current[train_selector], train_cells,
-                    epsilon_rec=scaler.epsilon_rec,
-                )
-                bounds_val, bounds_row = bounds_loss(
-                    u_next_hat[train_selector], train_cells,
-                    u_min=0.0, u_max=scaler.u_max,
-                )
-                rate_val, rate_row = rate_regularization_loss(
-                    r_next_hat[train_selector], train_cells,
-                )
-                if include_discrete_transition:
-                    discrete_residual = discrete_state_transition_residual(
-                        u_next_hat, u_current, r_anchor_hat,
-                        torch.as_tensor(delta_np, dtype=torch.float32, device=device),
-                    )
-                    discrete_val, discrete_row = discrete_state_transition_loss(
-                        discrete_residual[train_selector], train_cells,
-                    )
+                else:
+                    u_next_hat = model(stress_next_tensor, features, u_current)
+                    u_anchor_hat = model(stress_current_tensor, features, u_current)
+                    r_next_hat = torch.zeros_like(u_next_hat)
+                    r_anchor_hat = torch.zeros_like(u_anchor_hat)
+                    du_next = autograd_du_ds(u_next_hat, stress_next_tensor)
+                    du_current = autograd_du_ds(u_anchor_hat, stress_current_tensor)
+                    residual_anchor = torch.zeros_like(u_anchor_hat)
+                    residual_next = torch.zeros_like(u_next_hat)
+                    residual_collo = torch.zeros_like(u_next_hat)
+                    u_integrated = torch.zeros_like(u_next_hat)
+                    collocation = None
 
-            pde_component = effective_weights.pde * (pde_anchor_loss + pde_collo_loss)
-            total_loss = (
-                effective_weights.data * train_data_loss
-                + pde_component
-                + effective_weights.initial_condition * ic_loss
-                + effective_weights.integral * integral_loss
-                + effective_weights.monotonicity * mono_loss_val
-                + effective_weights.bounds * bounds_val
-                + effective_weights.rate_regularization * rate_val
-                + effective_weights.discrete_state_transition * discrete_val
-            )
-
-            if not torch.isfinite(total_loss):
-                raise FoldTrainingError(
-                    f"non-finite total loss at epoch {epoch}: {total_loss.item()}"
+                train_pred = u_next_hat[batch_positions]
+                train_true = u_true[batch_positions]
+                train_cells = cell_index[batch_positions]
+                train_data_loss, data_row = data_loss(
+                    train_pred, train_true, train_cells, delta=config.huber_delta,
                 )
 
-            # Measure PDE-only gradient contribution via autograd BEFORE the
-            # composite backward (issue #7).
-            grad_pde = 0.0
+                pde_anchor_loss = residual_anchor.new_zeros(())
+                pde_collo_loss = residual_collo.new_zeros(())
+                pde_row_mean = 0.0
+                pde_anchor_row = 0.0
+                pde_collo_row = 0.0
+                ic_loss = residual_anchor.new_zeros(())
+                ic_row = 0.0
+                integral_loss = residual_anchor.new_zeros(())
+                integral_row = 0.0
+                mono_loss_val = residual_anchor.new_zeros(())
+                mono_row = 0.0
+                bounds_val = residual_anchor.new_zeros(())
+                bounds_row = 0.0
+                rate_val = residual_anchor.new_zeros(())
+                rate_row = 0.0
+                discrete_val = residual_anchor.new_zeros(())
+                discrete_row = 0.0
+
+                if is_pinn:
+                    pde_anchor_loss, pde_anchor_row = pde_loss(
+                        residual_anchor[batch_positions], train_cells,
+                    )
+                    if collocation is not None and residual_collo.numel():
+                        collo_cells = collocation.cell_index
+                        batch_selector_collo = torch.isin(
+                            collocation.row_index, batch_positions,
+                        )
+                        pde_collo_loss, pde_collo_row = pde_loss(
+                            residual_collo[batch_selector_collo],
+                            collo_cells[batch_selector_collo],
+                        )
+                    pde_row_mean = 0.5 * (pde_anchor_row + pde_collo_row)
+                    ic_loss, ic_row = initial_condition_loss(
+                        u_anchor_hat[batch_positions], u_current[batch_positions], train_cells,
+                    )
+                    integral_loss, integral_row = integral_consistency_loss(
+                        u_next_hat[batch_positions], u_integrated[batch_positions], train_cells,
+                    )
+                    mono_loss_val, mono_row = monotonicity_loss(
+                        u_next_hat[batch_positions], u_current[batch_positions], train_cells,
+                        epsilon_rec=scaler.epsilon_rec,
+                    )
+                    bounds_val, bounds_row = bounds_loss(
+                        u_next_hat[batch_positions], train_cells,
+                        u_min=0.0, u_max=scaler.u_max,
+                    )
+                    rate_val, rate_row = rate_regularization_loss(
+                        r_next_hat[batch_positions], train_cells,
+                    )
+                    if include_discrete_transition:
+                        discrete_residual = discrete_state_transition_residual(
+                            u_next_hat, u_current, r_anchor_hat, delta_full,
+                        )
+                        discrete_val, discrete_row = discrete_state_transition_loss(
+                            discrete_residual[batch_positions], train_cells,
+                        )
+
+                pde_component = effective_weights.pde * (pde_anchor_loss + pde_collo_loss)
+                total_loss = (
+                    effective_weights.data * train_data_loss
+                    + pde_component
+                    + effective_weights.initial_condition * ic_loss
+                    + effective_weights.integral * integral_loss
+                    + effective_weights.monotonicity * mono_loss_val
+                    + effective_weights.bounds * bounds_val
+                    + effective_weights.rate_regularization * rate_val
+                    + effective_weights.discrete_state_transition * discrete_val
+                )
+
+                if not torch.isfinite(total_loss):
+                    raise FoldTrainingError(
+                        f"non-finite total loss at epoch {epoch} batch {b}: {total_loss.item()}"
+                    )
+
+                # Measure PDE-only gradient contribution via autograd BEFORE the
+                # composite backward (issue #7).
+                grad_pde = 0.0
+                physics_active = is_pinn and effective_weights.pde > 0
+                if physics_active:
+                    grad_pde = _pde_gradient_norm(
+                        pde_component, list(model.parameters()), logger=logger,
+                    )
+                    if epoch >= warmup_epochs:
+                        if not np.isfinite(grad_pde):
+                            raise FoldTrainingError(
+                                f"non-finite PDE gradient at epoch {epoch}: {grad_pde}"
+                            )
+
+                total_loss.backward()
+                # ``clip_grad_norm_`` already returns the pre-clip total gradient
+                # norm as a GPU scalar tensor. Reusing it drops the previous
+                # per-parameter ``.pow(2).sum().item()`` sweep (one CUDA sync per
+                # parameter — the largest single sync source in the training
+                # step).
+                grad_total_tensor = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), config.gradient_clip_norm,
+                )
+                optimizer.step()
+
+                # Batch-weighted accumulators (weight by batch row count).
+                bw = float(hi - lo)
+                acc_total.add_(total_loss.detach() * bw)
+                acc_data += float(data_row) * bw
+                acc_pde += float(pde_row_mean) * bw
+                acc_pde_a += float(pde_anchor_row) * bw
+                acc_pde_c += float(pde_collo_row) * bw
+                acc_ic += float(ic_row) * bw
+                acc_int += float(integral_row) * bw
+                acc_mono += float(mono_row) * bw
+                acc_bounds += float(bounds_row) * bw
+                acc_rate += float(rate_row) * bw
+                acc_discrete += float(discrete_row) * bw
+                grad_pde_epoch = max(grad_pde_epoch, grad_pde)
+                # Keep grad_total on-device; take the running max as a tensor
+                # op and sync only at epoch end.
+                grad_total_epoch = torch.maximum(
+                    grad_total_epoch, grad_total_tensor.detach(),
+                )
+                n_rows_seen += int(bw)
+
+            # ---- end of batch loop; PDE-gradient enforcement is epoch-level.
             physics_active = is_pinn and effective_weights.pde > 0
-            if physics_active:
-                grad_pde = _pde_gradient_norm(
-                    pde_component, list(model.parameters()), logger=logger,
-                )
-                # Enforcement gate: only after curriculum warm-up completes.
-                # A physics-informed model that reports zero PDE gradient for
-                # several consecutive epochs is not actually learning the
-                # differential equation — better to fail loudly than silently
-                # publish a "PINN" that is just a DNN with extra config.
-                if epoch >= warmup_epochs:
-                    if not np.isfinite(grad_pde):
-                        raise FoldTrainingError(
-                            f"non-finite PDE gradient at epoch {epoch}: {grad_pde}"
-                        )
-                    if grad_pde <= config.pde_gradient_min_norm:
-                        consecutive_zero_pde_gradients += 1
-                    else:
-                        consecutive_zero_pde_gradients = 0
-                    if consecutive_zero_pde_gradients >= config.pde_gradient_zero_patience:
-                        raise FoldTrainingError(
-                            f"PDE loss produced negligible gradient (<= "
-                            f"{config.pde_gradient_min_norm}) for "
-                            f"{consecutive_zero_pde_gradients} consecutive "
-                            f"physics-active epochs (last epoch={epoch})"
-                        )
+            if physics_active and epoch >= warmup_epochs:
+                if grad_pde_epoch <= config.pde_gradient_min_norm:
+                    consecutive_zero_pde_gradients += 1
+                else:
+                    consecutive_zero_pde_gradients = 0
+                if consecutive_zero_pde_gradients >= config.pde_gradient_zero_patience:
+                    raise FoldTrainingError(
+                        f"PDE loss produced negligible gradient (<= "
+                        f"{config.pde_gradient_min_norm}) for "
+                        f"{consecutive_zero_pde_gradients} consecutive "
+                        f"physics-active epochs (last epoch={epoch})"
+                    )
             else:
                 consecutive_zero_pde_gradients = 0
 
-            total_loss.backward()
-            grad_total = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    grad_total += float(p.grad.detach().pow(2).sum().item())
-            grad_total = float(grad_total ** 0.5)
+            # Reduce accumulators to per-row means for logging. The two
+            # remaining GPU tensors are synced once per epoch here.
+            denom = max(n_rows_seen, 1)
+            data_row = acc_data / denom
+            pde_row_mean = acc_pde / denom
+            pde_anchor_row = acc_pde_a / denom
+            pde_collo_row = acc_pde_c / denom
+            ic_row = acc_ic / denom
+            integral_row = acc_int / denom
+            mono_row = acc_mono / denom
+            bounds_row = acc_bounds / denom
+            rate_row = acc_rate / denom
+            discrete_row = acc_discrete / denom
+            grad_pde = grad_pde_epoch
+            grad_total = float(grad_total_epoch.item())
+            total_loss_scalar = float((acc_total / denom).item())
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
-            optimizer.step()
-
-            # Validation on inner-validation rows.
-            val_selector = torch.as_tensor(inner_val_mask, device=device, dtype=torch.bool)
+            # Validation on inner-validation rows. Switch model to eval() so
+            # dropout is disabled; then restore train() for the next epoch.
+            # Reuse cached ``stress_next_dev`` (no per-epoch H2D transfer) and
+            # cached ``val_true_tensor_cached`` / ``val_ss_tot_cached``.
+            model.eval()
             with torch.no_grad():
                 if is_pinn:
-                    val_u = model.solution(stress_next_tensor, features).detach()
+                    val_u = model.solution(stress_next_dev, features, u_current)
                 else:
-                    val_u = model(stress_next_tensor, features).detach()
-                val_true_tensor = u_true[val_selector]
+                    val_u = model(stress_next_dev, features, u_current)
                 val_pred = val_u[val_selector]
-                val_error = (val_pred - val_true_tensor).cpu().numpy()
-                val_mae = float(np.mean(np.abs(val_error))) if val_error.size else float("inf")
-                val_rmse = float(np.sqrt(np.mean(val_error ** 2))) if val_error.size else float("inf")
-                if val_error.size >= 2:
-                    ss_res = float(np.sum((val_error) ** 2))
-                    ss_tot = float(np.sum((val_true_tensor.cpu().numpy() - val_true_tensor.cpu().numpy().mean()) ** 2))
-                    val_r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+                if val_n:
+                    val_error_t = val_pred - val_true_tensor_cached
+                    val_mae_t = val_error_t.abs().mean()
+                    val_ss_res_t = (val_error_t * val_error_t).sum()
+                    val_rmse_t = (val_ss_res_t / val_n).sqrt()
+                    # One CPU sync for all three stats.
+                    val_stats = torch.stack(
+                        (val_mae_t, val_rmse_t, val_ss_res_t)
+                    ).detach().cpu().numpy()
+                    val_mae = float(val_stats[0])
+                    val_rmse = float(val_stats[1])
+                    ss_res = float(val_stats[2])
+                    if val_n >= 2 and val_ss_tot_cached > 0:
+                        val_r2 = 1.0 - ss_res / val_ss_tot_cached
+                    else:
+                        val_r2 = float("nan")
+                    val_data_mse = ss_res / val_n
                 else:
+                    val_mae = float("inf")
+                    val_rmse = float("inf")
                     val_r2 = float("nan")
+                    val_data_mse = float("nan")
 
             scheduler.step(val_mae)
             lr_current = float(optimizer.param_groups[0]["lr"])
+
+            # Consolidate physics diagnostics into a single CPU sync. The
+            # previous code did six separate ``.cpu().numpy()`` round-trips
+            # per epoch — each one forced a full CUDA queue flush.
+            nan_t = torch.full((), float("nan"), device=device)
+            u_next_det = u_next_hat.detach()
+            du_det = du_next.detach()
+            has_u = u_next_hat.numel() > 0
+            has_du = du_next.numel() > 0
+            has_res = is_pinn and residual_next.numel() > 0
+            if has_res:
+                res_det = residual_next.detach()
+                pde_mae_t = res_det.abs().mean()
+                pde_rmse_t = (res_det * res_det).mean().sqrt()
+            else:
+                pde_mae_t = nan_t
+                pde_rmse_t = nan_t
+            pos_deriv_t = (du_det > 0).float().mean() if has_du else nan_t
+            if has_u:
+                mono_frac_t = ((u_next_det - u_current - scaler.epsilon_rec) > 0).float().mean()
+                lower_viol_frac_t = (u_next_det < 0).float().mean()
+                upper_viol_frac_t = (u_next_det > scaler.u_max).float().mean()
+            else:
+                mono_frac_t = nan_t
+                lower_viol_frac_t = nan_t
+                upper_viol_frac_t = nan_t
+            diag_np = torch.stack((
+                pde_mae_t, pde_rmse_t, pos_deriv_t,
+                mono_frac_t, lower_viol_frac_t, upper_viol_frac_t,
+            )).cpu().numpy()
+            pde_residual_mae = float(diag_np[0])
+            pde_residual_rmse = float(diag_np[1])
+            positive_derivative_fraction = float(diag_np[2])
+            monotonicity_violation_fraction = float(diag_np[3])
+            lower_bound_violation_fraction = float(diag_np[4])
+            upper_bound_violation_fraction = float(diag_np[5])
 
             allocated_mb, reserved_mb = gpu_memory_mb()
             epoch_row = {
@@ -976,7 +1170,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                 "fold": config.fold,
                 "seed": config.seed,
                 "epoch": epoch,
-                "train_total_loss": float(total_loss.detach().item()),
+                "train_total_loss": float(total_loss_scalar),
                 "train_data_loss": data_row,
                 "train_pde_loss": pde_row_mean,
                 "train_pde_anchor_loss": pde_anchor_row,
@@ -987,23 +1181,16 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                 "train_bounds_loss": bounds_row,
                 "train_rate_loss": rate_row,
                 "train_discrete_state_transition_loss": discrete_row,
-                "validation_data_loss": float(np.mean(val_error ** 2)) if val_error.size else float("nan"),
+                "validation_data_loss": val_data_mse,
                 "validation_MAE": val_mae,
                 "validation_RMSE": val_rmse,
                 "validation_R2": val_r2,
-                "pde_residual_MAE": float(np.mean(np.abs(residual_next.detach().cpu().numpy())))
-                    if is_pinn and residual_next.numel() else float("nan"),
-                "pde_residual_RMSE": float(np.sqrt(np.mean(residual_next.detach().cpu().numpy() ** 2)))
-                    if is_pinn and residual_next.numel() else float("nan"),
-                "positive_derivative_fraction": float((du_next.detach().cpu().numpy() > 0).mean())
-                    if du_next.numel() else float("nan"),
-                "monotonicity_violation_fraction": float(
-                    ((u_next_hat.detach().cpu().numpy() - u_current_np - scaler.epsilon_rec) > 0).mean()
-                ) if u_next_hat.numel() else float("nan"),
-                "lower_bound_violation_fraction": float((u_next_hat.detach().cpu().numpy() < 0).mean())
-                    if u_next_hat.numel() else float("nan"),
-                "upper_bound_violation_fraction": float((u_next_hat.detach().cpu().numpy() > scaler.u_max).mean())
-                    if u_next_hat.numel() else float("nan"),
+                "pde_residual_MAE": pde_residual_mae,
+                "pde_residual_RMSE": pde_residual_rmse,
+                "positive_derivative_fraction": positive_derivative_fraction,
+                "monotonicity_violation_fraction": monotonicity_violation_fraction,
+                "lower_bound_violation_fraction": lower_bound_violation_fraction,
+                "upper_bound_violation_fraction": upper_bound_violation_fraction,
                 "effective_lambda_data": float(effective_weights.data),
                 "effective_lambda_pde": float(effective_weights.pde),
                 "effective_lambda_initial_condition": float(effective_weights.initial_condition),
@@ -1042,7 +1229,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                 patience += 1
 
             bar.set_postfix({
-                "total": f"{float(total_loss.detach().item()):.4f}",
+                "total": f"{total_loss_scalar:.4f}",
                 "data": f"{data_row:.4f}",
                 "pde": f"{pde_row_mean:.4f}",
                 "val_MAE": f"{val_mae:.4f}",
@@ -1306,13 +1493,18 @@ def _refit_full_outer_train(
             rate_hidden_dims=config.rate_hidden_dims,
             solution_activation=config.solution_activation,
             rate_activation=config.rate_activation,
+            solution_dropout=config.solution_dropout,
+            rate_dropout=config.rate_dropout,
             rate_uses_u_hat=config.rate_uses_u_hat,
+            predict_delta_u=config.predict_delta_u,
         )
     else:
         refit_model = DNNQ(
             feature_dim=feature_dim,
             hidden_dims=config.dnn_solution_hidden_dims,
             solution_activation=config.solution_activation,
+            solution_dropout=config.solution_dropout,
+            predict_delta_u=config.predict_delta_u,
         )
     refit_model.to(device)
     optimizer = _init_optimizer(refit_model, config)
@@ -1334,6 +1526,10 @@ def _refit_full_outer_train(
     u_current = _tensor(u_current_np, device)
     u_true = _tensor(u_true_np, device)
     cell_index = torch.as_tensor(cell_codes, device=device, dtype=torch.long)
+    # Cached stress tensors on device — same rationale as the main training
+    # loop: we don't want to re-upload numpy → GPU on every batch.
+    stress_current_dev = _tensor(stress_current_np, device)
+    stress_next_dev = _tensor(stress_next_np, device)
 
     # Reuse the same curriculum schedule so the physics weight ramps in the
     # same way — best_epoch was selected under this schedule, so the refit
@@ -1347,104 +1543,134 @@ def _refit_full_outer_train(
     generator = torch.Generator(device="cpu")
     generator.manual_seed(config.seed)
 
+    # Stage-3 fix #4: mirror the mini-batching used during inner training.
+    n_rows = int(u_current.numel())
+    batch_size = int(config.batch_size) if config.batch_size and config.batch_size > 0 else n_rows
+    batch_size = min(max(batch_size, 1), n_rows) if n_rows > 0 else 0
+    n_batches = max(1, (n_rows + batch_size - 1) // batch_size) if batch_size > 0 else 1
+    delta_full = torch.as_tensor(delta_np, dtype=torch.float32, device=device)
+    all_row_positions = torch.arange(n_rows, device=device)
+
     for epoch in range(refit_epochs):
         refit_model.train()
-        optimizer.zero_grad()
         factor = curriculum.factor(epoch)
         effective_weights = loss_weights.effective(factor)
 
-        stress_current_tensor = torch.as_tensor(
-            stress_current_np, dtype=torch.float32, device=device,
-        ).clone().requires_grad_(True)
-        stress_next_tensor = torch.as_tensor(
-            stress_next_np, dtype=torch.float32, device=device,
-        ).clone().requires_grad_(True)
-
-        if is_pinn:
-            u_next_hat = refit_model.solution(stress_next_tensor, features)
-            r_next_hat = refit_model.rate(stress_next_tensor, features, u_next_hat)
-            u_anchor_hat = refit_model.solution(stress_current_tensor, features)
-            r_anchor_hat = refit_model.rate(stress_current_tensor, features, u_anchor_hat)
-            du_next = autograd_du_ds(u_next_hat, stress_next_tensor)
-            du_current = autograd_du_ds(u_anchor_hat, stress_current_tensor)
-            residual_anchor = pde_residual(du_current, r_anchor_hat)
-            residual_next = pde_residual(du_next, r_next_hat)
-            collocation = sample_collocation_points(
-                stress_current=stress_current_tensor.detach(),
-                stress_delta=torch.as_tensor(delta_np, dtype=torch.float32, device=device),
-                features=features,
-                cell_index=cell_index,
-                points_per_transition=config.collocation_points,
-                generator=generator if device == "cpu" else None,
-            )
-            collo_stress = collocation.stress.clone().detach().requires_grad_(True)
-            u_collo = refit_model.solution(collo_stress, collocation.features)
-            r_collo = refit_model.rate(collo_stress, collocation.features, u_collo)
-            du_collo = autograd_du_ds(u_collo, collo_stress)
-            residual_collo = pde_residual(du_collo, r_collo)
-            u_integrated = integral_transition(
-                refit_model.solution, refit_model.rate,
-                stress_current_tensor,
-                torch.as_tensor(delta_np, dtype=torch.float32, device=device),
-                features, u_current,
-                method=config.quadrature_method, n_nodes=config.quadrature_nodes,
-            )
+        if n_rows > 0:
+            if device == "cpu":
+                perm = torch.randperm(n_rows, generator=generator, device="cpu")
+            else:
+                perm = torch.randperm(n_rows, device=device)
+            shuffled = all_row_positions[perm]
         else:
-            u_next_hat = refit_model(stress_next_tensor, features)
-            u_anchor_hat = refit_model(stress_current_tensor, features)
-            r_next_hat = torch.zeros_like(u_next_hat)
-            r_anchor_hat = torch.zeros_like(u_anchor_hat)
-            residual_anchor = torch.zeros_like(u_anchor_hat)
-            residual_collo = torch.zeros_like(u_next_hat)
-            u_integrated = torch.zeros_like(u_next_hat)
-            collocation = None
+            shuffled = all_row_positions
 
-        # Train on ALL rows (no train_selector this time).
-        data_l, _ = data_loss(u_next_hat, u_true, cell_index,
-                              delta=config.huber_delta)
-        pde_anchor_l = residual_anchor.new_zeros(())
-        pde_collo_l = residual_collo.new_zeros(()) if is_pinn else residual_anchor.new_zeros(())
-        ic_l = residual_anchor.new_zeros(())
-        integral_l = residual_anchor.new_zeros(())
-        mono_l = residual_anchor.new_zeros(())
-        bounds_l = residual_anchor.new_zeros(())
-        rate_l = residual_anchor.new_zeros(())
-        discrete_l = residual_anchor.new_zeros(())
-        if is_pinn:
-            pde_anchor_l, _ = pde_loss(residual_anchor, cell_index)
-            if collocation is not None and residual_collo.numel():
-                pde_collo_l, _ = pde_loss(residual_collo, collocation.cell_index)
-            ic_l, _ = initial_condition_loss(u_anchor_hat, u_current, cell_index)
-            integral_l, _ = integral_consistency_loss(u_next_hat, u_integrated, cell_index)
-            mono_l, _ = monotonicity_loss(u_next_hat, u_current, cell_index,
-                                           epsilon_rec=refit_scaler.epsilon_rec)
-            bounds_l, _ = bounds_loss(u_next_hat, cell_index,
-                                       u_min=0.0, u_max=refit_scaler.u_max)
-            rate_l, _ = rate_regularization_loss(r_next_hat, cell_index)
-            if include_discrete_transition:
-                discrete_residual = discrete_state_transition_residual(
-                    u_next_hat, u_current, r_anchor_hat,
-                    torch.as_tensor(delta_np, dtype=torch.float32, device=device),
+        for b in range(n_batches):
+            lo = b * batch_size
+            hi = min(lo + batch_size, n_rows)
+            if hi <= lo:
+                continue
+            batch_positions = shuffled[lo:hi]
+
+            optimizer.zero_grad(set_to_none=True)
+
+            stress_current_tensor = stress_current_dev.detach().requires_grad_(True)
+            stress_next_tensor = stress_next_dev.detach().requires_grad_(True)
+
+            if is_pinn:
+                u_next_hat = refit_model.solution(stress_next_tensor, features, u_current)
+                r_next_hat = refit_model.rate(stress_next_tensor, features, u_next_hat)
+                u_anchor_hat = refit_model.solution(stress_current_tensor, features, u_current)
+                r_anchor_hat = refit_model.rate(stress_current_tensor, features, u_anchor_hat)
+                du_next = autograd_du_ds(u_next_hat, stress_next_tensor)
+                du_current = autograd_du_ds(u_anchor_hat, stress_current_tensor)
+                residual_anchor = pde_residual(du_current, r_anchor_hat)
+                residual_next = pde_residual(du_next, r_next_hat)
+                collocation = sample_collocation_points(
+                    stress_current=stress_current_tensor.detach(),
+                    stress_delta=delta_full,
+                    features=features,
+                    cell_index=cell_index,
+                    points_per_transition=config.collocation_points,
+                    generator=generator if device == "cpu" else None,
                 )
-                discrete_l, _ = discrete_state_transition_loss(discrete_residual, cell_index)
+                collo_stress = collocation.stress.clone().detach().requires_grad_(True)
+                collo_u_current = u_current[collocation.row_index]
+                u_collo = refit_model.solution(collo_stress, collocation.features, collo_u_current)
+                r_collo = refit_model.rate(collo_stress, collocation.features, u_collo)
+                du_collo = autograd_du_ds(u_collo, collo_stress)
+                residual_collo = pde_residual(du_collo, r_collo)
+                u_integrated = integral_transition(
+                    refit_model.solution, refit_model.rate,
+                    stress_current_tensor, delta_full,
+                    features, u_current,
+                    method=config.quadrature_method, n_nodes=config.quadrature_nodes,
+                )
+            else:
+                u_next_hat = refit_model(stress_next_tensor, features, u_current)
+                u_anchor_hat = refit_model(stress_current_tensor, features, u_current)
+                r_next_hat = torch.zeros_like(u_next_hat)
+                r_anchor_hat = torch.zeros_like(u_anchor_hat)
+                residual_anchor = torch.zeros_like(u_anchor_hat)
+                residual_collo = torch.zeros_like(u_next_hat)
+                u_integrated = torch.zeros_like(u_next_hat)
+                collocation = None
 
-        total = (
-            effective_weights.data * data_l
-            + effective_weights.pde * (pde_anchor_l + pde_collo_l)
-            + effective_weights.initial_condition * ic_l
-            + effective_weights.integral * integral_l
-            + effective_weights.monotonicity * mono_l
-            + effective_weights.bounds * bounds_l
-            + effective_weights.rate_regularization * rate_l
-            + effective_weights.discrete_state_transition * discrete_l
-        )
-        if not torch.isfinite(total):
-            raise FoldTrainingError(
-                f"non-finite refit loss at refit epoch {epoch}: {total.item()}"
+            batch_cells = cell_index[batch_positions]
+            data_l, _ = data_loss(u_next_hat[batch_positions], u_true[batch_positions],
+                                    batch_cells, delta=config.huber_delta)
+            pde_anchor_l = residual_anchor.new_zeros(())
+            pde_collo_l = residual_collo.new_zeros(()) if is_pinn else residual_anchor.new_zeros(())
+            ic_l = residual_anchor.new_zeros(())
+            integral_l = residual_anchor.new_zeros(())
+            mono_l = residual_anchor.new_zeros(())
+            bounds_l = residual_anchor.new_zeros(())
+            rate_l = residual_anchor.new_zeros(())
+            discrete_l = residual_anchor.new_zeros(())
+            if is_pinn:
+                pde_anchor_l, _ = pde_loss(residual_anchor[batch_positions], batch_cells)
+                if collocation is not None and residual_collo.numel():
+                    batch_selector_collo = torch.isin(collocation.row_index, batch_positions)
+                    pde_collo_l, _ = pde_loss(
+                        residual_collo[batch_selector_collo],
+                        collocation.cell_index[batch_selector_collo],
+                    )
+                ic_l, _ = initial_condition_loss(u_anchor_hat[batch_positions],
+                                                   u_current[batch_positions], batch_cells)
+                integral_l, _ = integral_consistency_loss(u_next_hat[batch_positions],
+                                                            u_integrated[batch_positions],
+                                                            batch_cells)
+                mono_l, _ = monotonicity_loss(u_next_hat[batch_positions],
+                                                u_current[batch_positions], batch_cells,
+                                                epsilon_rec=refit_scaler.epsilon_rec)
+                bounds_l, _ = bounds_loss(u_next_hat[batch_positions], batch_cells,
+                                            u_min=0.0, u_max=refit_scaler.u_max)
+                rate_l, _ = rate_regularization_loss(r_next_hat[batch_positions], batch_cells)
+                if include_discrete_transition:
+                    discrete_residual = discrete_state_transition_residual(
+                        u_next_hat, u_current, r_anchor_hat, delta_full,
+                    )
+                    discrete_l, _ = discrete_state_transition_loss(
+                        discrete_residual[batch_positions], batch_cells,
+                    )
+
+            total = (
+                effective_weights.data * data_l
+                + effective_weights.pde * (pde_anchor_l + pde_collo_l)
+                + effective_weights.initial_condition * ic_l
+                + effective_weights.integral * integral_l
+                + effective_weights.monotonicity * mono_l
+                + effective_weights.bounds * bounds_l
+                + effective_weights.rate_regularization * rate_l
+                + effective_weights.discrete_state_transition * discrete_l
             )
-        total.backward()
-        torch.nn.utils.clip_grad_norm_(refit_model.parameters(), config.gradient_clip_norm)
-        optimizer.step()
+            if not torch.isfinite(total):
+                raise FoldTrainingError(
+                    f"non-finite refit loss at refit epoch {epoch} batch {b}: {total.item()}"
+                )
+            total.backward()
+            torch.nn.utils.clip_grad_norm_(refit_model.parameters(), config.gradient_clip_norm)
+            optimizer.step()
 
     return refit_model, refit_scaler
 

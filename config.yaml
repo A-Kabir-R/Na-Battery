@@ -164,20 +164,27 @@ pinn:
     inner_split_seed: 20240117
 
   model:
-    solution_hidden_dims: [64, 64, 32]
-    rate_hidden_dims: [32, 16]
-    # DNN-Q shares SolutionNet architecture but has no rate head; widening
-    # brings its trainable parameter count into rough parity with the full
-    # NaPINN-Q (Stage 2 diagnosis fix #11).
-    dnn_solution_hidden_dims: [80, 80, 40]
+    # Stage-3 diagnosis fixes for the ~175-sample development set: shrink both
+    # heads by an order of magnitude so trainable params fall from ~11-13k to
+    # ~500, and predict Δu (u_next − u_current) instead of u_next directly so
+    # the initial condition is enforced by construction.
+    solution_hidden_dims: [16, 16]
+    rate_hidden_dims: [8, 8]
+    dnn_solution_hidden_dims: [16, 16]
     solution_activation: "tanh"
     rate_activation: "tanh"
     rate_output_activation: "softplus"
+    solution_dropout: 0.2
+    rate_dropout: 0.2
     # When true, the rate network receives u_hat as an input. Setting false
     # produces the constrained-rate variant used in ablation A6, which
     # prevents H = du/ds + r ≈ 0 from being satisfied tautologically
     # (Stage 2 diagnosis fix #14).
     rate_uses_u_hat: true
+    # Predict Δu = u_next − u_current instead of absolute u_next. The model's
+    # output is added to u_current at inference, so IC error is zero by
+    # construction and typical outputs live near 0 (~0.001–0.02).
+    predict_delta_u: true
     maximum_parameters: 50000
 
   collocation:
@@ -193,15 +200,21 @@ pinn:
   training:
     optimizer: "adamw"
     learning_rate: 0.001
-    weight_decay: 0.0001
-    maximum_epochs: 2000
-    minimum_epochs: 200
-    early_stopping_patience: 200
+    # Stage-3 fix #2: 100× stronger L2 regularization to counter the
+    # ~120-sample overfitting regime.
+    weight_decay: 0.01
+    # Stage-3 fix #3: shorter training budget & tighter patience so the
+    # physics curriculum can plausibly activate before early stopping fires.
+    maximum_epochs: 800
+    minimum_epochs: 80
+    early_stopping_patience: 80
     scheduler: "reduce_on_plateau"
     scheduler_factor: 0.5
-    scheduler_patience: 60
+    scheduler_patience: 30
     minimum_learning_rate: 1.0e-6
     gradient_clip_norm: 1.0
+    # Stage-3 fix #4: cell-balanced mini-batching (see trainer.py).
+    batch_size: 32
     # AMP is not implemented — mixed precision breaks the fp32 autograd path
     # used for du/ds and the PDE residual. Keep this false until an
     # autocast/GradScaler wrapper that preserves fp32 physics is added.
@@ -218,12 +231,15 @@ pinn:
     pde_gradient_zero_patience: 5
 
   losses:
+    # Stage-3 fix #7: physics as a soft prior. On ~120 samples the PDE/integral
+    # losses fight the data fit and hurt generalization; monotonicity+bounds
+    # are cheap sanity constraints and get promoted instead.
     data: 1.0
-    pde: 0.5
-    initial_condition: 0.5
-    integral: 0.25
-    monotonicity: 0.1
-    bounds: 0.1
+    pde: 0.01
+    initial_condition: 0.1
+    integral: 0.005
+    monotonicity: 0.5
+    bounds: 0.5
     rate_regularization: 1.0e-4
     huber_delta: 1.0
 
@@ -239,8 +255,11 @@ pinn:
     tolerance_quantile: 0.95
 
   curriculum:
-    warmup_fraction: 0.10
-    ramp_end_fraction: 0.30
+    # Stage-3 fix #3: physics ramps in inside the actual training horizon.
+    # With maximum_epochs=800 this activates by epoch 16 and fully saturates
+    # by epoch 80 — well before typical early-stopping triggers.
+    warmup_fraction: 0.02
+    ramp_end_fraction: 0.10
 
   evaluation:
     bootstrap_replicates_development: 100
@@ -268,27 +287,27 @@ pinn:
                   monotonicity: 0.0, bounds: 0.0, rate_regularization: 0.0}
       - name: "A1_Constrained_NN"
         architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.0, initial_condition: 0.5, integral: 0.0,
-                  monotonicity: 0.1, bounds: 0.1, rate_regularization: 0.0}
+        weights: {data: 1.0, pde: 0.0, initial_condition: 0.1, integral: 0.0,
+                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 0.0}
       - name: "A2_PINN_PDE"
         architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.5, initial_condition: 0.5, integral: 0.0,
+        weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.0,
                   monotonicity: 0.0, bounds: 0.0, rate_regularization: 1.0e-4}
       - name: "A3_PINN_PDE_integral"
         architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.5, initial_condition: 0.5, integral: 0.25,
+        weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.005,
                   monotonicity: 0.0, bounds: 0.0, rate_regularization: 1.0e-4}
       - name: "A4_Full_NaPINN_Q"
         architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.5, initial_condition: 0.5, integral: 0.25,
-                  monotonicity: 0.1, bounds: 0.1, rate_regularization: 1.0e-4}
+        weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.005,
+                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4}
       - name: "A5_Discrete_State_Transition"
         architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.0, initial_condition: 0.5, integral: 0.0,
-                  monotonicity: 0.1, bounds: 0.1, rate_regularization: 1.0e-4,
-                  discrete_state_transition: 0.5}
+        weights: {data: 1.0, pde: 0.0, initial_condition: 0.1, integral: 0.0,
+                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4,
+                  discrete_state_transition: 0.05}
       - name: "A6_Constrained_Rate_No_UHat"
         architecture: "NaPINN-Q"
         rate_uses_u_hat: false
-        weights: {data: 1.0, pde: 0.5, initial_condition: 0.5, integral: 0.25,
-                  monotonicity: 0.1, bounds: 0.1, rate_regularization: 1.0e-4}
+        weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.005,
+                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4}

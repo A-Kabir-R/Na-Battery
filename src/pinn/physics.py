@@ -70,7 +70,7 @@ def _quadrature_nodes(method: str, n_nodes: int, device: torch.device,
     raise ValueError(f"unknown quadrature method: {method}")
 
 
-def integral_transition(solution_forward: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+def integral_transition(solution_forward: Callable[..., torch.Tensor],
                         rate_forward: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
                         stress_current: torch.Tensor,
                         stress_delta: torch.Tensor,
@@ -78,7 +78,14 @@ def integral_transition(solution_forward: Callable[[torch.Tensor, torch.Tensor],
                         u_current: torch.Tensor, *,
                         method: str = "trapezoidal",
                         n_nodes: int = 8) -> torch.Tensor:
-    """Approximate ``u(s_{k+1}) = u_k - int r(s, x, u) ds`` by quadrature."""
+    """Approximate ``u(s_{k+1}) = u_k - int r(s, x, u) ds`` by quadrature.
+
+    ``solution_forward`` may be a plain ``(stress, features) -> u_hat`` callable
+    (legacy path) or a Δu-aware ``(stress, features, u_current) -> u_hat`` one.
+    We detect the latter by inspecting whether the module exposes a
+    ``predict_delta_u`` attribute — for such modules we broadcast ``u_current``
+    to match the collocation grid and forward it in.
+    """
     device = stress_current.device
     dtype = stress_current.dtype
     xi, weights = _quadrature_nodes(method, n_nodes, device, dtype)
@@ -90,7 +97,12 @@ def integral_transition(solution_forward: Callable[[torch.Tensor, torch.Tensor],
     n, j, f = features_bc.shape
     s_flat = s_grid.reshape(-1, 1)
     x_flat = features_bc.reshape(-1, f)
-    u_flat = solution_forward(s_flat, x_flat)
+    predicts_delta = bool(getattr(solution_forward, "predict_delta_u", False))
+    if predicts_delta:
+        u_current_bc = u_current.unsqueeze(-1).expand(-1, xi.size(0))  # (N, J)
+        u_flat = solution_forward(s_flat, x_flat, u_current_bc.reshape(-1))
+    else:
+        u_flat = solution_forward(s_flat, x_flat)
     r_flat = rate_forward(s_flat, x_flat, u_flat)
     r_grid = r_flat.view(n, j)
     integrand = (weights.unsqueeze(0) * r_grid).sum(dim=-1)  # (N,)
