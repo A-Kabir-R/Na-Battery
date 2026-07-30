@@ -39,6 +39,11 @@ CLF_TARGETS = list(CLASSIFICATION_TARGETS)
 
 def _load_pipeline(name: str, features_dir: Path) -> pd.DataFrame:
     p = features_dir / f"{name}.parquet"
+    if not p.exists():
+        raise FileNotFoundError(
+            f"feature table '{name}.parquet' missing at {p}. "
+            f"Run  scripts/01_build_features.py --unified-only  first."
+        )
     return pd.read_parquet(p)
 
 

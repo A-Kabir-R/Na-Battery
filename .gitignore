@@ -5,3 +5,8 @@ logs/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.venv/
+runpod/pod.env
+.fuse_hidden*
+*.pt
+*.pth
