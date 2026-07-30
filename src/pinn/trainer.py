@@ -28,7 +28,8 @@ from .dataset import (
     inner_split_indices,
 )
 from .logging_utils import (
-    log_epoch_summary, log_event, log_failure, log_fold_summary,
+    log_epoch_summary, log_event, log_failure, log_fold_curriculum_state,
+    log_fold_summary,
 )
 from .losses import (
     BALANCED_COMPONENTS, CurriculumSchedule, GradientBalancer, LossWeights,
@@ -1843,6 +1844,18 @@ def _refit_full_outer_train(
             total.backward()
             torch.nn.utils.clip_grad_norm_(refit_model.parameters(), config.gradient_clip_norm)
             optimizer.step()
+
+        if logger is not None and (epoch % max(1, config.log_every_epochs) == 0
+                                    or epoch == refit_epochs - 1):
+            log_fold_curriculum_state(
+                logger,
+                epoch=epoch,
+                curriculum_factor=factor,
+                physics_full_epoch=refit_physics_full_epoch,
+                effective_weights=effective_weights.as_dict(),
+                balancer_state=balancer.state() if config.use_gradient_balance else {},
+                is_refit=True,
+            )
 
     if n_full_physics_epochs <= 0:
         raise FoldTrainingError(
