@@ -179,6 +179,34 @@ def log_epoch_summary(logger: logging.Logger, row: dict[str, Any]) -> None:
     log_event(logger, logging.DEBUG, "epoch", **row)
 
 
+def log_fold_curriculum_state(
+    logger: logging.Logger, *,
+    epoch: int,
+    curriculum_factor: float,
+    physics_full_epoch: int,
+    effective_weights: dict[str, float],
+    balancer_state: dict[str, float],
+    is_refit: bool = False,
+) -> None:
+    """Emit a structured log of the active curriculum and gradient-balance state.
+
+    Called once per epoch. Records the curriculum factor, whether physics is
+    fully active, all effective loss weights, and the gradient-norm EMA and
+    adaptive multiplier for every balanced component. This makes the effective
+    loss at each epoch reproducible from the logs without re-running training.
+    """
+    log_event(
+        logger, logging.DEBUG, "curriculum_state",
+        epoch=epoch,
+        curriculum_factor=round(float(curriculum_factor), 6),
+        physics_active=curriculum_factor >= 1.0,
+        physics_full_epoch=physics_full_epoch,
+        is_refit=is_refit,
+        effective_weights=effective_weights,
+        **balancer_state,
+    )
+
+
 def log_failure(logger: logging.Logger, message: str, exc: BaseException,
                 **fields: Any) -> None:
     logger.exception(message, extra={"structured": {**fields,

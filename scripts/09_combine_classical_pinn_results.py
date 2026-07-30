@@ -43,6 +43,9 @@ def _parse_args() -> argparse.Namespace:
                         help="Exit non-zero when classical raw_results.csv is missing.")
     parser.add_argument("--require-pinn", action="store_true",
                         help="Exit non-zero when the PINN raw_results.csv is missing.")
+    parser.add_argument("--require-matching-preprocessing", action="store_true",
+                        help="Exit non-zero when classical or PINN results use a "
+                             "preprocessing level other than 'unified'.")
     return parser.parse_args()
 
 
@@ -144,6 +147,37 @@ def main() -> None:
         raise SystemExit("no result rows to combine")
 
     combined_raw["model_family"] = combined_raw.apply(_classify_family, axis=1)
+
+    # Preprocessing alignment guard: both arms must use "unified" for the
+    # combined publication table to be valid. Always warn; --require-matching-
+    # preprocessing makes it fatal.
+    classical_preps = (
+        set(classical_raw["preprocessing"].dropna().unique())
+        if "preprocessing" in classical_raw.columns and not classical_raw.empty
+        else set()
+    )
+    pinn_preps = (
+        set(pinn_raw["preprocessing"].dropna().unique())
+        if "preprocessing" in pinn_raw.columns and not pinn_raw.empty
+        else set()
+    )
+    if classical_preps and classical_preps != {"unified"}:
+        msg = f"classical results use non-unified preprocessing: {sorted(classical_preps)}"
+        logger.warning(msg)
+        if args.require_matching_preprocessing:
+            raise SystemExit(f"[combine] {msg}")
+    if pinn_preps and pinn_preps - {"unified"}:
+        msg = (f"PINN results use non-unified preprocessing: "
+               f"{sorted(pinn_preps - {'unified'})}")
+        logger.warning(msg)
+        if args.require_matching_preprocessing:
+            raise SystemExit(f"[combine] {msg}")
+    log_event(logger, logging.INFO, "combination_summary",
+              n_classical_rows=int(len(classical_raw)),
+              n_pinn_rows=int(len(pinn_raw)),
+              classical_preprocessing=sorted(classical_preps),
+              pinn_preprocessing=sorted(pinn_preps),
+              require_matching_preprocessing=args.require_matching_preprocessing)
 
     atomic_write_csv(combined_raw, combined_dir / "raw_results_combined.csv")
 
