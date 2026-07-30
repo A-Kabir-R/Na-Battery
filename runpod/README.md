@@ -63,6 +63,68 @@ still starts with `build`, `run.sh` automatically runs `canonical` first when
 its required tables are missing.
 Quick smoke run on the pod: `RUN_STAGES=smoke bash runpod/run.sh`.
 
+## Unified-preprocessing revision stages
+
+The revision replaces the P1/P2/P3 ladder with a single `unified` feature table
+shared by Previous-RPT, Ridge, ExtraTrees and NaPINN-Q. See
+`docs/UNIFIED_PREPROCESSING.md` for the feature registry and the physics changes.
+
+| stage | script | approx runtime |
+| --- | --- | --- |
+| `tests` | `pytest tests/ -q -x` | ~1–2 min |
+| `build_unified` | `01_build_features.py --unified-only` | ~10–20 min (2 cycles per CYC file, not every cycle) |
+| `pinn_smoke` | `06_run_pinn_experiments.py --smoke-test --fold 0` | <5 min |
+| `pinn` | `06_run_pinn_experiments.py --seed 42` | primary seed, 5 folds |
+| `pinn_seeds` | same, for `$SIB_SPREAD_SEEDS` | ~4× `pinn` |
+
+Aliases:
+
+| alias | expands to |
+| --- | --- |
+| `revision_smoke` | `tests,build_unified,pinn_smoke` |
+| `revision_dev` | `tests,build_unified,experiments,aggregate,pinn,pinn_aggregate,combined_report` |
+| `revision` | `revision_dev` plus `degradation,plot,pinn_seeds,pinn_ablation,pinn_plot` |
+
+`tests` runs first and **gates** everything after it: a wiring-test failure stops
+the run before GPU time is spent. `pinn_seeds` failures are logged but do **not**
+invalidate the primary-seed result.
+
+### Preflight assertions
+
+Before any stage, `run.sh` fails fast if the deployment or config would produce
+an unfair or misreported comparison: registry over the 64-feature cap, stress
+coordinate or initial state duplicated into the PINN auxiliary tensor,
+`preprocessing_levels` not `["unified"]`, `rate_uses_u_hat` not false,
+`predict_delta_u` not true, `checkpoint_after_physics_active` not true, or
+SVR-RBF still enabled.
+
+It also logs whether the locked holdout is gated off.
+`experiment.evaluate_holdout` ships as `false`; set it true exactly once, after
+preprocessing, architecture and losses are frozen.
+
+### Recommended sequence
+
+```bash
+# --- laptop ---
+./runpod/push.sh --with-env
+
+# --- pod ---
+tmux new -s sib
+cd /workspace/sib/code
+bash runpod/setup.sh
+
+# 1. wiring check first — cheap, and catches a stale deployment
+RUN_STAGES=revision_smoke STOP_MODE=none bash runpod/run.sh 2>&1 | tee smoke.log
+
+# 2. development run once the smoke test is clean
+RUN_STAGES=revision_dev STOP_MODE=none bash runpod/run.sh 2>&1 | tee dev.log
+
+# 3. full revision incl. seed spread, ablations and figures
+RUN_STAGES=revision bash runpod/run.sh 2>&1 | tee run.log
+```
+
+Keep `STOP_MODE=none` for steps 1–2 so the pod stays up for inspection.
+
 ## Path resolution
 
 `config.yaml` uses `${env:VAR:-default}`. On the pod, `run.sh` exports:

@@ -5,10 +5,28 @@
   ``H = du/ds + r`` can then no longer be trivially satisfied by learning
   ``r ≈ -∂u/∂s``.
 * Networks support ``dropout`` between hidden layers.
-* :class:`NaPINNQ` supports ``predict_delta_u``. When set, the SolutionNet
-  output is interpreted as ``Δu`` and the caller reconstructs
-  ``u_next = u_current + Δu`` — enforcing the initial condition by
-  construction and keeping typical outputs near 0.
+* :class:`SolutionNet` supports ``predict_delta_u``, which selects the **hard
+  initial-condition residual parameterisation**::
+
+      local_stress = s - s_current
+      u_hat(s)     = u_current + local_stress * f_theta(s, x)
+
+  so ``u_hat(s_current) == u_current`` *exactly*, for any parameters, and
+
+      u_hat(s_next) = u_current + stress_delta * f_theta(s_next, x).
+
+  The earlier implementation used ``u_hat(s) = u_current + f_theta(s, x)``, which
+  reproduces the initial condition only if ``f_theta(s_current, x)`` happens to
+  vanish — it does not, so the IC was penalised rather than enforced. Because the
+  ``local_stress`` factor vanishes at the anchor, the initial-condition loss is
+  now redundant by construction and its residual is identically zero.
+
+  The derivative the PDE needs stays well defined::
+
+      d u_hat / ds = f_theta(s, x) + local_stress * d f_theta / ds
+
+  Zero-initialising the final layer of ``f_theta`` makes an untrained model
+  predict persistence (``u_hat == u_current``) everywhere.
 """
 from __future__ import annotations
 
@@ -47,18 +65,26 @@ def _stack_mlp(in_dim: int, hidden_dims: Iterable[int], activation: str,
 class SolutionNet(nn.Module):
     """Continuous capacity solution head.
 
-    When ``predict_delta_u`` is ``False`` (legacy) the output is ``u_hat``
-    directly. When ``True``, the output is ``Δu`` (residual) and the caller
-    is responsible for adding ``u_current`` to obtain ``u_next``.
+    When ``predict_delta_u`` is ``False`` (legacy) the network output is ``u_hat``
+    directly. When ``True`` the network output is the *rate-like* field
+    ``f_theta(s, x)`` and ``u_hat`` is reconstructed as
+
+        u_hat(s) = u_current + (s - s_current) * f_theta(s, x)
+
+    which enforces ``u_hat(s_current) = u_current`` identically.
 
     Inputs
     ------
-    stress : (N, 1) tensor
+    stress : (N,) or (N, 1) tensor
         Scalar (normalized) stress coordinate. Must carry ``requires_grad=True``
-        for the PINN forward path so ``du/ds`` participates in autograd.
+        on the PINN forward path so ``du/ds`` participates in autograd.
     features : (N, F) tensor
-        Concatenation of horizon, u_current, physical-state block and the
-        preprocessing-specific auxiliary features.
+        Auxiliary feature block (horizon, physical state, registry features).
+    u_current : (N,) tensor
+        Capacity at the anchor. Required in residual mode.
+    stress_current : (N,) tensor
+        Anchor stress coordinate. Required in residual mode — this is what makes
+        the initial condition hard rather than penalised.
     """
 
     def __init__(self, feature_dim: int, hidden_dims: Iterable[int] = (16, 16),
@@ -68,34 +94,41 @@ class SolutionNet(nn.Module):
         self.predict_delta_u = bool(predict_delta_u)
         self.body = _stack_mlp(feature_dim + 1, hidden_dims, activation,
                                 dropout=dropout, output_dim=1)
-        # Zero-init the final residual layer so initial Δu predictions are ~0.
+        # Zero-init the final layer so an untrained residual model predicts
+        # persistence (f_theta == 0 => u_hat == u_current).
         if self.predict_delta_u:
             final_linear = self.body[-1]
             nn.init.zeros_(final_linear.weight)
             nn.init.zeros_(final_linear.bias)
 
     def raw(self, stress: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
-        """Return the raw MLP output (Δu when predict_delta_u, else u_hat)."""
+        """Raw MLP output: ``f_theta(s, x)`` in residual mode, else ``u_hat``."""
         if stress.dim() == 1:
             stress = stress.unsqueeze(-1)
         return self.body(torch.cat([stress, features], dim=-1)).squeeze(-1)
 
     def forward(self, stress: torch.Tensor, features: torch.Tensor,
-                 u_current: torch.Tensor | None = None) -> torch.Tensor:
-        """Return u_hat. If predicting Δu, u_current must be provided.
+                 u_current: torch.Tensor | None = None,
+                 stress_current: torch.Tensor | None = None) -> torch.Tensor:
+        """Return ``u_hat``.
 
-        When predict_delta_u=False the u_current argument is ignored so the
-        signature stays backward compatible with older call sites that only
-        pass (stress, features).
+        In residual mode both ``u_current`` and ``stress_current`` are mandatory;
+        omitting either raises rather than silently degrading to the soft-IC
+        behaviour that this revision removed.
         """
         raw = self.raw(stress, features)
         if not self.predict_delta_u:
             return raw
-        if u_current is None:
+        if u_current is None or stress_current is None:
             raise ValueError(
-                "predict_delta_u=True requires u_current in SolutionNet.forward"
+                "predict_delta_u=True requires both u_current and stress_current "
+                "in SolutionNet.forward; the hard initial condition cannot be "
+                "formed without the anchor stress coordinate"
             )
-        return u_current + raw
+        if stress.dim() == 2 and stress.shape[-1] == 1:
+            stress = stress.squeeze(-1)
+        local_stress = stress - stress_current
+        return u_current + local_stress * raw
 
 
 class RateNet(nn.Module):
@@ -147,9 +180,10 @@ class NaPINNQ(nn.Module):
         self.predict_delta_u = bool(predict_delta_u)
 
     def forward(self, stress: torch.Tensor, features: torch.Tensor,
-                 u_current: torch.Tensor | None = None
+                 u_current: torch.Tensor | None = None,
+                 stress_current: torch.Tensor | None = None
                  ) -> tuple[torch.Tensor, torch.Tensor]:
-        u_hat = self.solution(stress, features, u_current)
+        u_hat = self.solution(stress, features, u_current, stress_current)
         r_hat = self.rate(stress, features, u_hat)
         return u_hat, r_hat
 

@@ -67,6 +67,25 @@ if [[ "$RUN_STAGES" == "all" ]]; then
   RUN_STAGES="canonical,build,degradation,experiments,aggregate,plot,pinn,pinn_aggregate,pinn_ablation,pinn_plot,combined_report"
 fi
 
+# Alias for the unified-preprocessing revision. 'tests' runs first and gates
+# everything else: the whole point of the revision is that the wiring is
+# verified, so a failing test must stop the run before hours of GPU time.
+# 'pinn' trains the primary seed only; 'pinn_seeds' adds the robustness spread.
+if [[ "$RUN_STAGES" == "revision" ]]; then
+  RUN_STAGES="tests,build_unified,degradation,experiments,aggregate,plot,pinn,pinn_seeds,pinn_aggregate,pinn_ablation,pinn_plot,combined_report"
+fi
+
+# Development-only variant: everything except the holdout. This is what to run
+# until every setting is frozen (config experiment.evaluate_holdout stays false).
+if [[ "$RUN_STAGES" == "revision_dev" ]]; then
+  RUN_STAGES="tests,build_unified,experiments,aggregate,pinn,pinn_aggregate,combined_report"
+fi
+
+# Fast wiring check: tests + feature build + one short fold per model.
+if [[ "$RUN_STAGES" == "revision_smoke" ]]; then
+  RUN_STAGES="tests,build_unified,pinn_smoke"
+fi
+
 log(){ printf '\n[run %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
 # --- venv --------------------------------------------------------------------
@@ -128,6 +147,16 @@ REQUIRED_SOURCE=(
   src/pinn/models.py
   src/pinn/physics.py
   src/pinn/trainer.py
+  src/pinn/batching.py
+  src/preprocessing/unified.py
+  src/preprocessing/unified_feature_registry.py
+  src/preprocessing/curve_features.py
+  src/preprocessing/dcir.py
+  src/preprocessing/fold_transform.py
+  tests/test_unified_registry.py
+  tests/test_unified_parity.py
+  tests/test_pinn_config_wiring.py
+  tests/test_pinn_hard_initial_condition.py
 )
 for required in "${REQUIRED_SOURCE[@]}"; do
   if [[ ! -f "$required" ]]; then
@@ -144,20 +173,98 @@ if ! python -c 'from src.pinn.models import NaPINNQ; from src.pinn.physics impor
   exit 1
 fi
 
+# Unified-preprocessing preflight. Also asserts the invariants that make the
+# comparison fair, so a stale deployment cannot quietly run the old wiring.
+if ! python - <<'PY'
+import sys
+from src.pinn.batching import CellBalancedSampler
+from src.preprocessing.fold_transform import UnifiedFoldPreprocessor
+from src.preprocessing.unified import build_unified
+from src.preprocessing.unified_feature_registry import (
+    MAX_MODEL_FEATURES, N_MODEL_FEATURES, model_feature_columns,
+    registry_hash, initial_state_column, stress_coordinate_column,
+)
+from src.pinn.losses import GradientBalancer, LossWeights
+from src.io.loaders import load_config
+
+problems = []
+if N_MODEL_FEATURES > MAX_MODEL_FEATURES:
+    problems.append(f"registry declares {N_MODEL_FEATURES} > {MAX_MODEL_FEATURES}")
+
+aux = model_feature_columns(exclude_roles=("stress_coordinate", "initial_state"))
+if stress_coordinate_column() in aux or initial_state_column() in aux:
+    problems.append("stress coordinate / initial state duplicated in PINN features")
+
+cfg = load_config()
+if (cfg.get("experiment") or {}).get("preprocessing_levels") != ["unified"]:
+    problems.append("experiment.preprocessing_levels is not ['unified']")
+if cfg["pinn"]["preprocessing"] != ["unified"]:
+    problems.append("pinn.preprocessing is not ['unified']")
+if cfg["pinn"]["model"]["rate_uses_u_hat"] is not False:
+    problems.append("pinn.model.rate_uses_u_hat must be false")
+if cfg["pinn"]["model"]["predict_delta_u"] is not True:
+    problems.append("pinn.model.predict_delta_u must be true")
+if cfg["pinn"]["training"]["checkpoint_after_physics_active"] is not True:
+    problems.append("checkpoint_after_physics_active must be true")
+if "SVR-RBF" in cfg["models"]["enabled_regressors"]:
+    problems.append("SVR-RBF is still enabled")
+
+if problems:
+    for problem in problems:
+        print(f"PREFLIGHT: {problem}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"[preflight] unified registry ok: {N_MODEL_FEATURES} features "
+      f"({len(aux)} PINN auxiliary), hash={registry_hash()[:12]}")
+PY
+then
+  echo "ERROR: unified-preprocessing preflight failed" >&2
+  exit 1
+fi
+
+# The locked holdout must stay untouched until every setting is frozen.
+if python -c 'import sys; from src.io.loaders import load_config; sys.exit(0 if (load_config().get("experiment") or {}).get("evaluate_holdout") else 1)'; then
+  log "WARNING: experiment.evaluate_holdout=TRUE — this run WILL read the locked holdout."
+  log "WARNING: only do this once, after preprocessing/architecture/losses are frozen."
+else
+  log "locked holdout: gated off (development-only run)"
+fi
+
 # --- run pipeline ------------------------------------------------------------
 PIPELINE_RC=0
 IFS=',' read -r -a STAGES <<< "$RUN_STAGES"
 
+# run_stage <name> <script> [extra args...]
+# Extra args are forwarded to the script, so stages can pass flags such as
+# --unified-only or --seed without needing a bespoke case branch.
 run_stage(){
-  local name="$1" script="$2"
+  local name="$1" script="$2"; shift 2
   if [[ $PIPELINE_RC -ne 0 ]]; then
     log "skipping stage '$name' — earlier stage failed"
     return 0
   fi
-  log "===== stage: $name -> python $script ====="
+  log "===== stage: $name -> python $script $* ====="
   local t0 rc
   t0=$SECONDS
-  python "$script"
+  python "$script" "$@"
+  rc=$?
+  log "stage '$name' finished rc=$rc in $((SECONDS - t0))s"
+  if [[ $rc -ne 0 ]]; then
+    PIPELINE_RC=$rc
+  fi
+}
+
+# run_cmd <name> <command...> — same accounting for non-`python script` stages.
+run_cmd(){
+  local name="$1"; shift
+  if [[ $PIPELINE_RC -ne 0 ]]; then
+    log "skipping stage '$name' — earlier stage failed"
+    return 0
+  fi
+  log "===== stage: $name -> $* ====="
+  local t0 rc
+  t0=$SECONDS
+  "$@"
   rc=$?
   log "stage '$name' finished rc=$rc in $((SECONDS - t0))s"
   if [[ $rc -ne 0 ]]; then
@@ -178,14 +285,67 @@ for stage in "${STAGES[@]}"; do
       fi
       run_stage build scripts/01_build_features.py
       ;;
+    build_unified)
+      if [[ ! -f "${SIB_CANONICAL}/file_manifest.parquet" || \
+            ! -f "${SIB_CANONICAL}/cycles.parquet" || \
+            ! -f "${SIB_CANONICAL}/steps.parquet" || \
+            ! -f "${SIB_CANONICAL}/rpt_measurements.parquet" ]]; then
+        log "canonical prerequisites missing; running canonical stage before build_unified"
+        run_stage canonical scripts/00_build_canonical.py
+      fi
+      # Only cu_capacity + unified.parquet. Much cheaper than the full build:
+      # two cycles per CYC file instead of every cycle.
+      run_stage build_unified scripts/01_build_features.py --unified-only
+      ;;
+    tests)
+      # Gate the run on the wiring tests. -x so the first failure stops the
+      # suite instead of burning time on a broken deployment.
+      run_cmd tests python -m pytest tests/ -q -x
+      ;;
     experiments) run_stage experiments scripts/02_run_all_experiments.py ;;
     degradation) run_stage degradation scripts/05_analyze_degradation.py ;;
     aggregate)   run_stage aggregate   scripts/03_aggregate_results.py ;;
     plot)        run_stage plot        scripts/04_plot_results.py ;;
-    pinn)             run_stage pinn             scripts/06_run_pinn_experiments.py ;;
+    pinn)
+      # Primary result: seed 42 only. This is the seed every tuning decision
+      # was made on, and the only one that may appear as a headline number.
+      run_stage pinn scripts/06_run_pinn_experiments.py \
+        --seed "${SIB_PRIMARY_SEED:-42}"
+      ;;
+    pinn_seeds)
+      # Robustness spread ONLY. Reported as "spread across random
+      # initializations", never seed-averaged into the headline metric and never
+      # used to select anything. A failure here must not invalidate the primary
+      # seed, so the loop records but does not propagate a non-zero rc.
+      if [[ $PIPELINE_RC -ne 0 ]]; then
+        log "skipping stage 'pinn_seeds' — earlier stage failed"
+      else
+        for extra_seed in ${SIB_SPREAD_SEEDS:-43 44 45 46}; do
+          log "===== stage: pinn_seeds (seed=$extra_seed) ====="
+          t0=$SECONDS
+          python scripts/06_run_pinn_experiments.py --seed "$extra_seed"
+          rc=$?
+          log "pinn_seeds seed=$extra_seed finished rc=$rc in $((SECONDS - t0))s"
+          if [[ $rc -ne 0 ]]; then
+            log "WARNING: spread seed $extra_seed failed; primary seed result is unaffected"
+          fi
+        done
+      fi
+      ;;
+    pinn_smoke)
+      # Short single-fold wiring check: dropout active, hard IC enforced,
+      # PDE gradients non-zero, checkpoint eligibility and refit curriculum sane.
+      run_stage pinn_smoke scripts/06_run_pinn_experiments.py \
+        --smoke-test --fold 0 --seed "${SIB_PRIMARY_SEED:-42}"
+      ;;
     pinn_aggregate)   run_stage pinn_aggregate   scripts/07_aggregate_pinn_results.py ;;
     pinn_plot)        run_stage pinn_plot        scripts/08_plot_pinn_results.py ;;
-    pinn_ablation)    run_stage pinn_ablation    scripts/10_run_pinn_ablations.py ;;
+    pinn_ablation)
+      # Primary seed and the single active preprocessing level, explicitly.
+      # Left to its defaults the script would fan out over every seed.
+      run_stage pinn_ablation scripts/10_run_pinn_ablations.py \
+        --seed "${SIB_PRIMARY_SEED:-42}" --preprocessing unified
+      ;;
     combined_report)
       if [[ $PIPELINE_RC -ne 0 ]]; then
         log "skipping combined_report — earlier stage failed"

@@ -127,6 +127,18 @@ def load_rpt_measurements() -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+def load_steps_table() -> pd.DataFrame:
+    """Canonical per-step table. Used by the unified DCIR extractor."""
+    cfg = load_config()
+    path = Path(cfg["paths"]["canonical"]) / "steps.parquet"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"canonical steps are missing at {path}; run "
+            "`python3 scripts/00_build_canonical.py` first"
+        )
+    return pd.read_parquet(path)
+
+
 def load_degradation_rates() -> pd.DataFrame:
     cfg = load_config()
     return pd.read_csv(cfg["paths"]["tables"]["degradation_rates"])

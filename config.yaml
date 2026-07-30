@@ -58,6 +58,18 @@ preprocessing:
   vq_resample_points: 100
   minimum_p3_file_coverage: 0.95
   minimum_p3_cycle_coverage: 0.98
+  # ---- unified preprocessing: the only level used for final training ----
+  # Voltage-grid resolution for true Delta-Q(V). The grid spans only the shared
+  # voltage interval of the two curves being differenced; no extrapolation.
+  dqv_grid_points: 100
+  # Trailing complete cycles for the Group C temporal summaries.
+  unified_temporal_window: 10
+  # Minimum valid observations inside that window before a temporal feature is
+  # emitted; below this the features are NaN and temporal_window_available = 0.
+  unified_minimum_temporal_observations: 5
+  # Minimum fraction of anchors that must receive waveform features before the
+  # unified build is accepted.
+  unified_minimum_waveform_coverage: 0.95
 
 targets:
   next_rpt:
@@ -98,22 +110,40 @@ experiment:
   # Isolate this run's aggregated tables/plots from historical outputs written
   # under artifacts/results/. Set to "" or null to write directly to the base
   # artifacts/results/ directory. The subdir is created lazily.
-  results_subdir: "extratrees_preprocessing_selection"
+  results_subdir: "unified_final_comparison"
   # Prevent nested parallelism: when parallel_workers > 1, models that expose
   # n_jobs (ExtraTrees, RandomForest, XGBoost, ...) are forced to this value
   # so that thread counts do not multiply across the outer joblib pool.
   model_n_jobs: 1
+  # The single preprocessing level used by every retained model. P1/P2/P3 remain
+  # in the codebase for traceability but are not run in the final experiment.
+  preprocessing_levels:
+    - unified
+  # Locked-holdout gate. Keep FALSE for all development work: with it false the
+  # classical runner evaluates cross-validation folds only and never touches the
+  # holdout partition. Set true exactly once, after preprocessing, architecture,
+  # losses and every other setting are frozen (execution-order step 22).
+  #
+  # NOTE ON PROVENANCE: holdout metrics for P1/P2/P3 were already computed during
+  # the earlier "extratrees_preprocessing_selection" run, so the holdout is not
+  # pristine for the classical arm. The final report must state that the
+  # classical holdout is a second look, and a first look only for the unified /
+  # NaPINN-Q arm. See docs/UNIFIED_PREPROCESSING.md.
+  evaluate_holdout: false
 
 # Central regressor allowlist. Only names listed here are executed by
 # scripts/02_run_all_experiments.py; every other regressor implementation
 # remains in src/models/regressors.py for later experiments. The order is
 # preserved for reproducibility of the startup banner and the raw results.
+# Retained models for the final comparison. SVR-RBF was removed: on the locked
+# holdout it scored MAE 0.0429 Ah / cell-macro R2 -119, i.e. far worse than the
+# DummyMean baseline, so it carried no information. DummyMean is retained only
+# as the variance reference.
 models:
   enabled_regressors:
     - DummyMean
     - PreviousRPT
     - Ridge
-    - SVR-RBF
     - ExtraTrees
 
 # ---------------------------------------------------------------------------
@@ -124,18 +154,29 @@ models:
 pinn:
   enabled: true
   model_name: "NaPINN-Q"
-  results_subdir: "pinn_preprocessing_study"
+  results_subdir: "pinn_unified_study"
 
+  # One unified preprocessing for every retained model. P1/P2/P3 are no longer
+  # run as experimental alternatives.
   preprocessing:
-    - p1
-    - p2
-    - p3
+    - unified
 
   architectures:
     - NaPINN-Q
 
+  # Seed 42 is the pre-registered primary result and the only one used for any
+  # tuning decision. The remaining seeds are reported ONLY as a robustness note
+  # ("spread across random initializations"), never as a seed-averaged headline
+  # metric and never as a selection criterion. With ~140 training rows the
+  # initialization spread can be comparable to the Ridge-vs-PINN gap, so hiding
+  # it would overstate the result.
+  primary_seed: 42
   seeds:
     - 42
+    - 43
+    - 44
+    - 45
+    - 46
 
   derive_all_targets_from_capacity: true
   reuse_existing_folds: true
@@ -163,25 +204,28 @@ pinn:
     inner_split_seed: 20240117
 
   model:
-    # Stage-3 diagnosis fixes for the ~175-sample development set: shrink both
-    # heads by an order of magnitude so trainable params fall from ~11-13k to
-    # ~500, and predict Δu (u_next − u_current) instead of u_next directly so
-    # the initial condition is enforced by construction.
+    # Compact heads for the ~175-anchor development set (~140 training rows per
+    # outer fold). With the 38-column unified auxiliary tensor the solution head
+    # is ~1.0k parameters; going wider is not supportable at this sample size.
     solution_hidden_dims: [16, 16]
     rate_hidden_dims: [8, 8]
     solution_activation: "tanh"
     rate_activation: "tanh"
     rate_output_activation: "softplus"
-    solution_dropout: 0.2
-    rate_dropout: 0.2
+    # Dropout is wired through TrainerConfig -> NaPINNQ and is active at runtime.
+    solution_dropout: 0.15
+    rate_dropout: 0.05
     # When true, the rate network receives u_hat as an input. Setting false
     # produces the constrained-rate variant used in ablation A6, which
     # prevents H = du/ds + r ≈ 0 from being satisfied tautologically
     # (Stage 2 diagnosis fix #14).
     rate_uses_u_hat: false
-    # Predict Δu = u_next − u_current instead of absolute u_next. The model's
-    # output is added to u_current at inference, so IC error is zero by
-    # construction and typical outputs live near 0 (~0.001–0.02).
+    # Hard initial-condition residual parameterisation:
+    #     u_hat(s) = u_current + (s - s_current) * f_theta(s, x)
+    # so u_hat(s_current) == u_current exactly, for any parameters. The final
+    # layer of f_theta is zero-initialised, so an untrained model predicts
+    # persistence. (Previously this flag produced u_current + f_theta(s, x),
+    # which does NOT satisfy the initial condition; it was merely penalised.)
     predict_delta_u: true
     maximum_parameters: 50000
 
@@ -201,17 +245,19 @@ pinn:
     # Stage-3 fix #2: 100× stronger L2 regularization to counter the
     # ~120-sample overfitting regime.
     weight_decay: 0.001
-    # Stage-3 fix #3: shorter training budget & tighter patience so the
-    # physics curriculum can plausibly activate before early stopping fires.
-    maximum_epochs: 800
-    minimum_epochs: 80
+    # Budget sized so the curriculum reaches full physics (epoch 100 with
+    # ramp_end_fraction=0.20) well before minimum_epochs, and so early stopping
+    # can only fire after many fully-physics-active epochs.
+    maximum_epochs: 500
+    minimum_epochs: 180
     early_stopping_patience: 80
     scheduler: "reduce_on_plateau"
     scheduler_factor: 0.5
     scheduler_patience: 30
     minimum_learning_rate: 1.0e-6
     gradient_clip_norm: 1.0
-    # Stage-3 fix #4: cell-balanced mini-batching (see trainer.py).
+    # Cell-balanced mini-batching (see src/pinn/batching.py). batch_mode is
+    # honoured at runtime; the forward pass is restricted to the sampled rows.
     batch_size: 32
     # AMP is not implemented — mixed precision breaks the fp32 autograd path
     # used for du/ds and the PDE residual. Keep this false until an
@@ -219,8 +265,20 @@ pinn:
     use_amp: false
     physics_float32: true
     batch_mode: "cell_balanced"
-    # Balance data and physics losses via EMA of their gradient magnitudes.
+    # Balance every active loss component against the DATA gradient via an EMA
+    # of component gradient norms. Multipliers are clipped to the interval below
+    # and logged per epoch alongside the nominal and curriculum-scaled weights,
+    # so the effective weight is reproducible from the epoch log.
     use_gradient_balance: true
+    gradient_balance_ema: 0.95
+    gradient_balance_min_multiplier: 0.1
+    gradient_balance_max_multiplier: 10.0
+    # Checkpoint eligibility: refuse to select a best checkpoint before the
+    # curriculum factor reaches 1.0. Guards against reporting a partially
+    # physics-active model as the full PINN.
+    checkpoint_after_physics_active: true
+    # Candidate cross-cell pairs drawn per batch for the pairwise loss.
+    pairwise_max_pairs: 256
     # Two-phase outer-training refit: after inner train/val chooses best_epoch,
     # discard the temporary model and retrain a fresh one on ALL outer-training
     # cells for exactly best_epoch+1 epochs. Matches how the classical model
@@ -231,16 +289,28 @@ pinn:
     pde_gradient_zero_patience: 5
 
   losses:
-    # Stage-3 fix #7: physics as a soft prior. On ~120 samples the PDE/integral
-    # losses fight the data fit and hurt generalization; monotonicity+bounds
-    # are cheap sanity constraints and get promoted instead.
+    # Conservative nominal weights. Gradient-norm balancing (above) removes the
+    # raw scale mismatch between components, so these express intent rather than
+    # magnitude. Any retuning must use INNER-validation only.
     data: 1.0
     pde: 0.01
+    # With the hard initial condition the IC residual is identically zero, so
+    # this weight is inert by construction. It is kept at a small non-zero value
+    # only so the logged residual keeps acting as a runtime assertion that the
+    # residual parameterisation is in force.
     initial_condition: 0.1
     integral: 0.005
     monotonicity: 0.5
     bounds: 0.5
     rate_regularization: 1.0e-4
+    # Direct Huber supervision of the rate head on the observed degradation
+    # rate. Conservative starting weight; tune on inner validation only.
+    rate_data: 0.05
+    # Cross-cell relative-degradation regulariser. DISABLED by default: its
+    # weight would have to be tuned on inner-validation folds of ~28 rows / 4-5
+    # cells, which is too noisy to trust as a headline setting. Enable it only
+    # as a reported ablation.
+    pairwise: 0.0
     huber_delta: 1.0
 
   bounds:
@@ -255,11 +325,16 @@ pinn:
     tolerance_quantile: 0.95
 
   curriculum:
-    # Stage-3 fix #3: physics ramps in inside the actual training horizon.
-    # With maximum_epochs=800 this activates by epoch 16 and fully saturates
-    # by epoch 80 — well before typical early-stopping triggers.
-    warmup_fraction: 0.02
-    ramp_end_fraction: 0.10
+    # With maximum_epochs=500: physics starts ramping at epoch 25 and is fully
+    # active from epoch 100. Checkpoint eligibility and early-stopping patience
+    # both begin at epoch 100, and minimum_epochs=180 guarantees at least 80
+    # fully-physics-active epochs before a fold may stop.
+    #
+    # The two-phase refit derives its OWN schedule from the actual refit length
+    # (best_epoch + 1) rather than reusing maximum_epochs, so a short refit still
+    # reaches curriculum factor 1.0.
+    warmup_fraction: 0.05
+    ramp_end_fraction: 0.20
 
   evaluation:
     bootstrap_replicates_development: 100
@@ -304,4 +379,18 @@ pinn:
       - name: "A5_Full_NaPINN_Q"
         architecture: "NaPINN-Q"
         weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.005,
-                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4}
+                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4,
+                  rate_data: 0.05, pairwise: 0.0}
+      # Isolates the new direct rate supervision.
+      - name: "A6_No_Rate_Supervision"
+        architecture: "NaPINN-Q"
+        weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.005,
+                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4,
+                  rate_data: 0.0, pairwise: 0.0}
+      # Reports the cross-cell pairwise loss as an ablation rather than baking
+      # an inner-validation-tuned weight into the headline model.
+      - name: "A7_With_Pairwise"
+        architecture: "NaPINN-Q"
+        weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.005,
+                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4,
+                  rate_data: 0.05, pairwise: 0.02}

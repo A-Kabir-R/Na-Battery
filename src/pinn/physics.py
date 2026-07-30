@@ -81,10 +81,11 @@ def integral_transition(solution_forward: Callable[..., torch.Tensor],
     """Approximate ``u(s_{k+1}) = u_k - int r(s, x, u) ds`` by quadrature.
 
     ``solution_forward`` may be a plain ``(stress, features) -> u_hat`` callable
-    (legacy path) or a Δu-aware ``(stress, features, u_current) -> u_hat`` one.
-    We detect the latter by inspecting whether the module exposes a
-    ``predict_delta_u`` attribute — for such modules we broadcast ``u_current``
-    to match the collocation grid and forward it in.
+    (legacy path) or a residual-mode
+    ``(stress, features, u_current, stress_current) -> u_hat`` one. We detect the
+    latter via the ``predict_delta_u`` attribute; for such modules both
+    ``u_current`` **and** ``stress_current`` are broadcast to the quadrature grid,
+    so the hard initial condition holds at every node.
     """
     device = stress_current.device
     dtype = stress_current.dtype
@@ -100,7 +101,12 @@ def integral_transition(solution_forward: Callable[..., torch.Tensor],
     predicts_delta = bool(getattr(solution_forward, "predict_delta_u", False))
     if predicts_delta:
         u_current_bc = u_current.unsqueeze(-1).expand(-1, xi.size(0))  # (N, J)
-        u_flat = solution_forward(s_flat, x_flat, u_current_bc.reshape(-1))
+        stress_current_grid = stress_current_bc.expand(-1, xi.size(0))  # (N, J)
+        u_flat = solution_forward(
+            s_flat, x_flat,
+            u_current_bc.reshape(-1),
+            stress_current_grid.reshape(-1),
+        )
     else:
         u_flat = solution_forward(s_flat, x_flat)
     r_flat = rate_forward(s_flat, x_flat, u_flat)

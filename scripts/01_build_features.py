@@ -1,6 +1,17 @@
-"""Build feature parquets for P1, P2, P3 and cache them under artifacts/features/."""
+"""Build feature parquets and cache them under artifacts/features/.
+
+``unified.parquet`` is the table every retained model trains on. P1/P2/P3 are
+still built for traceability and for the reported feature-family ablation, but
+they are not used for final training.
+
+Usage
+-----
+    python3 scripts/01_build_features.py              # everything
+    python3 scripts/01_build_features.py --unified-only
+"""
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -20,6 +31,7 @@ from src.io.loaders import (
 from src.preprocessing.p1_aggregate import build_p1
 from src.preprocessing.p2_rolling_delta import build_p2
 from src.preprocessing.p3_waveform import build_p3
+from src.preprocessing.unified import build_unified, write_unified
 from src.targets.failure_label import add_target as add_failure
 from src.targets.next_rpt import add_target as add_next_rpt
 from src.targets.rul import add_target as add_rul
@@ -190,12 +202,45 @@ def _cycling_file_eligibility(inventory: pd.DataFrame, p2: pd.DataFrame) -> pd.D
     return result.sort_values(["condition", "cell", "visit"]).reset_index(drop=True)
 
 
+def _build_unified_stage(out: Path, cycle_metrics: pd.DataFrame,
+                         cu_cache: pd.DataFrame) -> None:
+    t0 = time.time()
+    result = build_unified(cycle_metrics, cu_cache)
+    write_unified(result, out)
+    manifest = result["manifest"]
+    tqdm.write(
+        f"[build] unified: {result['unified'].shape} "
+        f"({manifest['n_model_features']} model features, "
+        f"{manifest['n_anchors']} anchors, {manifest['n_cells']} cells) "
+        f"({time.time()-t0:.1f}s)"
+    )
+    coverage = result["coverage"]
+    weak = coverage[
+        coverage["scope"].eq("all") & coverage["coverage"].lt(0.95)
+    ].sort_values("coverage")
+    if not weak.empty:
+        tqdm.write("[build] unified features with <95% coverage:")
+        for row in weak.itertuples(index=False):
+            tqdm.write(f"[build]     {row.feature:<42} {row.coverage:6.1%}")
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--unified-only", action="store_true",
+        help="Build only cu_cache and unified.parquet (skip P1/P2/P3).",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = _parse_args()
     cfg = load_config()
     out = Path(cfg["paths"]["artifacts"]) / "features"
     out.mkdir(parents=True, exist_ok=True)
 
-    stages = ["cu_cache", "P1", "P2", "P3"]
+    stages = (["cu_cache", "unified"] if args.unified_only
+              else ["cu_cache", "P1", "P2", "P3", "unified"])
     pbar = tqdm(stages, desc="[build] stages", unit="stage")
 
     # -------- CU cache
@@ -208,6 +253,14 @@ def main() -> None:
     cu_cache.to_parquet(out / "cu_capacity.parquet")
     tqdm.write(f"[build] cu_cache: {cu_cache.shape} ({time.time()-t0:.1f}s)")
     pbar.update(1)
+
+    if args.unified_only:
+        pbar.set_postfix_str("unified")
+        _build_unified_stage(out, load_cycle_metrics(), cu_cache)
+        pbar.update(1)
+        pbar.close()
+        print("[build] done (unified only).")
+        return
 
     # -------- P1
     pbar.set_postfix_str("P1")
@@ -270,6 +323,11 @@ def main() -> None:
     p3.to_parquet(out / "p3.parquet")
     _write_provenance(p3, out / "p3.provenance.csv", "P3")
     tqdm.write(f"[build] P3 final: {p3.shape}")
+    pbar.update(1)
+
+    # -------- unified: the single table used for final training
+    pbar.set_postfix_str("unified")
+    _build_unified_stage(out, cm, cu_cache)
     pbar.update(1)
     pbar.close()
 

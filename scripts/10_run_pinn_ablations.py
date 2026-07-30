@@ -103,8 +103,16 @@ def main() -> None:
               git_commit=git_commit(HERE.parent), args=vars(args))
     log_config_snapshot(logger, cfg)
 
+    # Default to the single active preprocessing level rather than the legacy
+    # "p2": after a --unified-only feature build, p2.parquet does not exist.
+    default_preprocessing = (
+        (cfg.get("experiment") or {}).get("preprocessing_levels")
+        or pinn_cfg.get("preprocessing")
+        or ["unified"]
+    )[0]
     preprocessing = args.preprocessing or _select_preprocessing(
-        results / "development_cv_model_ranking.csv", default="p2",
+        results / "development_cv_model_ranking.csv",
+        default=str(default_preprocessing),
     )
     features_path = Path(cfg["paths"]["artifacts"]) / "features" / f"{preprocessing}.parquet"
     if not features_path.exists():
@@ -121,7 +129,15 @@ def main() -> None:
         random_state=int(cfg["split"]["random_state"]),
     )
 
-    seeds = pinn_cfg["seeds"] if args.seed is None else [int(args.seed)]
+    # Ablations answer "does this loss term help?", which is a question about the
+    # PRIMARY seed only. Running them across the full seed list would multiply
+    # the fit count by len(seeds) (8 configs x 5 seeds x 5 folds = 200 fits) for
+    # no additional scientific content, since the seed spread is reported
+    # separately from the headline model.
+    if args.seed is not None:
+        seeds = [int(args.seed)]
+    else:
+        seeds = [int(pinn_cfg.get("primary_seed", pinn_cfg["seeds"][0]))]
     folds = list(range(int(cfg["split"]["n_splits"]))) if args.fold is None else [int(args.fold)]
     max_epochs = int(args.max_epochs) if args.max_epochs is not None else int(pinn_cfg["training"]["maximum_epochs"])
 

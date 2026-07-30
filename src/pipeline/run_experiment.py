@@ -16,6 +16,10 @@ from ..evaluation.metrics import classification_metrics, regression_metrics
 from ..features.selection import FoldPreprocessor
 from ..io.loaders import load_config
 from ..models.registry import needs_scaling
+from ..preprocessing.fold_transform import UnifiedFoldPreprocessor
+from ..preprocessing.unified_feature_registry import (
+    REGISTRY_VERSION, registry_hash,
+)
 from ..splits.group_kfold import (
     assert_no_cell_overlap,
     build_locked_split_manifest,
@@ -31,7 +35,12 @@ REGRESSION_TARGETS = (
     "delta_next_rpt_SOH_pct",
 )
 CLASSIFICATION_TARGETS: tuple[str, ...] = ()
-PIPELINE_VERSION = "locked-holdout-v3"
+PIPELINE_VERSION = "unified-registry-v4"
+
+#: The one preprocessing level whose feature matrix comes from the fixed
+#: registry. For this level Ridge and ExtraTrees use exactly the columns and
+#: exactly the fold-local transform that NaPINN-Q uses.
+UNIFIED_PREPROCESSING = "unified"
 
 
 def _predict_score(est, features: np.ndarray, kind: str):
@@ -190,14 +199,33 @@ def _persistence_predictions(train: pd.DataFrame, test: pd.DataFrame,
     )
 
 
+def _build_preprocessor(preprocessing: str, model_name: str, kind: str):
+    """Return the fold-local transformer for this run.
+
+    For the ``unified`` level every model shares one
+    :class:`UnifiedFoldPreprocessor` with ``scale=True``, so Ridge and
+    ExtraTrees receive a byte-identical matrix to NaPINN-Q's auxiliary tensor
+    (plus the stress coordinate and initial state, which the PINN consumes
+    structurally instead). ExtraTrees is scale invariant, so forcing the same
+    scaling costs nothing and removes a source of unfair difference.
+    """
+    if preprocessing == UNIFIED_PREPROCESSING:
+        return UnifiedFoldPreprocessor(scale=True)
+    return FoldPreprocessor(scale=needs_scaling(model_name, kind))
+
+
 def _fit_partition(train: pd.DataFrame, test: pd.DataFrame, *, target: str,
-                   model_name: str, model, kind: str):
+                   model_name: str, model, kind: str,
+                   preprocessing: str = ""):
     y_train = train[target].to_numpy()
     if model_name == "PreviousRPT":
         train_prediction, test_prediction, features = _persistence_predictions(train, test, target)
         return None, {"baseline": "PreviousRPT", "features": features}, features, train_prediction, test_prediction, None, None
-    preprocessor = FoldPreprocessor(scale=needs_scaling(model_name, kind))
-    x_train = preprocessor.fit_transform(train, target=target)
+    preprocessor = _build_preprocessor(preprocessing, model_name, kind)
+    if isinstance(preprocessor, UnifiedFoldPreprocessor):
+        x_train = preprocessor.fit_transform(train)
+    else:
+        x_train = preprocessor.fit_transform(train, target=target)
     x_test = preprocessor.transform(test)
     estimator = clone(model)
     estimator.fit(x_train, y_train)
@@ -240,7 +268,8 @@ def _model_importance(estimator: Any, features: list[str]) -> pd.DataFrame:
 
 def _diagnostic_curve(data: pd.DataFrame, train_indices: np.ndarray, target: str,
                       model_name: str, model, kind: str,
-                      random_state: int) -> pd.DataFrame | None:
+                      random_state: int,
+                      preprocessing: str = "") -> pd.DataFrame | None:
     """Fit a disposable inner-fold model for loss curves only."""
     if model_name not in CURVE_MODELS:
         return None
@@ -255,8 +284,13 @@ def _diagnostic_curve(data: pd.DataFrame, train_indices: np.ndarray, target: str
         random_state=random_state,
     )))
     assert_no_cell_overlap(inner_train, inner_val, outer_train["cell"])
-    preprocessor = FoldPreprocessor(scale=needs_scaling(model_name, kind))
-    x_inner_train = preprocessor.fit_transform(outer_train.iloc[inner_train], target=target)
+    preprocessor = _build_preprocessor(preprocessing, model_name, kind)
+    if isinstance(preprocessor, UnifiedFoldPreprocessor):
+        x_inner_train = preprocessor.fit_transform(outer_train.iloc[inner_train])
+    else:
+        x_inner_train = preprocessor.fit_transform(
+            outer_train.iloc[inner_train], target=target,
+        )
     x_inner_val = preprocessor.transform(outer_train.iloc[inner_val])
     y = outer_train[target].to_numpy()
     _, curve = fit_with_curves(
@@ -301,6 +335,68 @@ def _metric_rows(*, preprocessing: str, target: str, model_name: str, fold: int,
     } for metric, value in metrics.items()]
 
 
+def _git_commit() -> str:
+    import subprocess
+
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=str(Path(__file__).resolve().parent),
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def _write_provenance_artifacts(directory: Path, preprocessor: Any,
+                                features: list[str], *, preprocessing: str,
+                                target: str, model_name: str, fold: int,
+                                n_splits: int, random_state: int) -> None:
+    """Write the per-fold provenance files the revision requires.
+
+    Emits ``feature_columns.json``, ``feature_hash.json``,
+    ``preprocessor_state.json`` and ``config_snapshot.json`` so a classical fold
+    can be compared column-for-column against the corresponding PINN fold.
+    """
+    _atomic_json({
+        "feature_columns": list(features),
+        "n_features": len(features),
+        "registry_version": REGISTRY_VERSION,
+    }, directory / "feature_columns.json")
+
+    feature_hash = (
+        preprocessor.feature_hash()
+        if hasattr(preprocessor, "feature_hash") else None
+    )
+    _atomic_json({
+        "feature_hash": feature_hash,
+        "registry_hash": registry_hash(),
+        "preprocessor_state_hash": (
+            preprocessor.state_hash()
+            if hasattr(preprocessor, "state_hash") else None
+        ),
+    }, directory / "feature_hash.json")
+
+    if hasattr(preprocessor, "state_dict"):
+        _atomic_json(preprocessor.state_dict(), directory / "preprocessor_state.json")
+
+    cfg = load_config()
+    _atomic_json({
+        "pipeline_version": PIPELINE_VERSION,
+        "preprocessing": preprocessing,
+        "target": target,
+        "model": model_name,
+        "fold": fold,
+        "n_splits": n_splits,
+        "random_state": random_state,
+        "git_commit": _git_commit(),
+        "config": {
+            key: cfg.get(key)
+            for key in ("cleaning", "protocol", "preprocessing", "targets",
+                        "split", "evaluation", "experiment", "models")
+        },
+    }, directory / "config_snapshot.json")
+
+
 def _completed_rows(directory: Path, fingerprint: str) -> list[dict[str, Any]] | None:
     metrics_path = directory / "fold_metrics.parquet"
     status_path = directory / "fold_status.json"
@@ -332,7 +428,15 @@ def _invalidate_partition(directory: Path) -> None:
 
 def run_one(df: pd.DataFrame, preprocessing: str, target: str, model_name: str,
             model, kind: str, n_splits: int = 5, random_state: int = 42,
-            split_manifest: pd.DataFrame | None = None) -> List[Dict[str, Any]]:
+            split_manifest: pd.DataFrame | None = None,
+            evaluate_holdout: bool | None = None) -> List[Dict[str, Any]]:
+    """Run cross-validation and, only when explicitly enabled, the holdout.
+
+    ``evaluate_holdout`` defaults to ``experiment.evaluate_holdout`` in the
+    config, which ships as ``false``. With it false the locked holdout partition
+    is never read, so development work cannot leak information from it. Set it
+    true exactly once, after every setting is frozen.
+    """
     if target not in df.columns:
         return []
     data = df.dropna(subset=[target]).reset_index(drop=True)
@@ -400,7 +504,8 @@ def run_one(df: pd.DataFrame, preprocessing: str, target: str, model_name: str,
             train = data.iloc[train_indices]
             validation = data.iloc[validation_indices]
             curve = _diagnostic_curve(
-                data, train_indices, target, model_name, model, kind, random_state + fold
+                data, train_indices, target, model_name, model, kind,
+                random_state + fold, preprocessing=preprocessing,
             )
             if curve is not None and not curve.empty:
                 curve_output = curve.assign(
@@ -412,7 +517,8 @@ def run_one(df: pd.DataFrame, preprocessing: str, target: str, model_name: str,
 
             (preprocessor, estimator, features, train_prediction, validation_prediction,
              train_score, validation_score) = _fit_partition(
-                train, validation, target=target, model_name=model_name, model=model, kind=kind
+                train, validation, target=target, model_name=model_name,
+                model=model, kind=kind, preprocessing=preprocessing,
             )
             train_valid, train_flags = _prediction_plausibility(train_prediction, target)
             validation_valid, validation_flags = _prediction_plausibility(
@@ -466,6 +572,11 @@ def run_one(df: pd.DataFrame, preprocessing: str, target: str, model_name: str,
                 "features": features, "target": target,
                 "validation_cells": validation_cells, "fingerprint": fold_fingerprint,
             }, fold_dir / "selected_features.json")
+            _write_provenance_artifacts(
+                fold_dir, preprocessor, features, preprocessing=preprocessing,
+                target=target, model_name=model_name, fold=fold,
+                n_splits=n_splits, random_state=random_state,
+            )
         except Exception as exc:
             error_message = f"{type(exc).__name__}: {exc}"
             fold_rows.append({
@@ -487,6 +598,14 @@ def run_one(df: pd.DataFrame, preprocessing: str, target: str, model_name: str,
             "fingerprint": fold_fingerprint,
         }, status_path)
         rows.extend(fold_rows)
+
+    if evaluate_holdout is None:
+        evaluate_holdout = bool(
+            load_config().get("experiment", {}).get("evaluate_holdout", False)
+        )
+    if not evaluate_holdout:
+        # Development-only mode: the holdout partition is not read at all.
+        return rows
 
     development_indices = np.flatnonzero(development_mask.to_numpy())
     holdout_indices = np.flatnonzero(holdout_mask.to_numpy())
@@ -515,7 +634,8 @@ def run_one(df: pd.DataFrame, preprocessing: str, target: str, model_name: str,
         holdout = data.iloc[holdout_indices]
         (preprocessor, estimator, features, development_prediction, holdout_prediction,
          development_score, holdout_score) = _fit_partition(
-            development, holdout, target=target, model_name=model_name, model=model, kind=kind
+            development, holdout, target=target, model_name=model_name,
+            model=model, kind=kind, preprocessing=preprocessing,
         )
         development_valid, development_flags = _prediction_plausibility(
             development_prediction, target
@@ -570,6 +690,11 @@ def run_one(df: pd.DataFrame, preprocessing: str, target: str, model_name: str,
             "holdout_cells": sorted(holdout["cell"].unique()),
             "fingerprint": holdout_fingerprint,
         }, final_dir / "selected_features.json")
+        _write_provenance_artifacts(
+            final_dir, preprocessor, features, preprocessing=preprocessing,
+            target=target, model_name=model_name, fold=-1,
+            n_splits=n_splits, random_state=random_state,
+        )
     except Exception as exc:
         error_message = f"{type(exc).__name__}: {exc}"
         final_rows.append({

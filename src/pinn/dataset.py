@@ -43,6 +43,11 @@ import pandas as pd
 # Column definitions
 # ---------------------------------------------------------------------------
 
+#: Name of the single preprocessing used for all final training. When the
+#: dataset is built for this level, features come from the fixed registry
+#: instead of dtype-based column discovery.
+UNIFIED_PREPROCESSING = "unified"
+
 TARGETS = (
     "next_rpt_Q_Ah",
     "next_rpt_SOH_pct",
@@ -505,35 +510,83 @@ def build_anchor_dataset(preprocessing_frame: pd.DataFrame, *,
         require_known_forecast_horizon=require_known,
     )
 
-    # Candidate feature columns.
-    numeric = anchors.select_dtypes(include=[np.number]).columns.tolist()
-    identifiers = set(IDENTIFIER_COLUMNS) | {
-        "initial_rpt_Q_Ah", "previous_rpt_Q_Ah", "previous_rpt_SOH_pct",
-        "q_current_Ah", "u_current", "u_true_next",
-        "stress_current", "stress_delta", "stress_next",
-        # Exclude the raw stress column so it does not appear both as the
-        # model's stress input AND inside the feature matrix.
-        raw_stress_column,
-    }
-    candidate_columns = [
-        c for c in numeric if c not in identifiers and c not in TARGETS
-    ]
-
-    allow_unaudited = bool((audit_cfg or {}).get("allow_unaudited", False))
-    if provenance_manifest is None and features_dir is not None:
-        provenance_manifest = load_provenance_manifest(
-            preprocessing, features_dir=features_dir,
+    # ---- Feature columns.
+    #
+    # For the ``unified`` preprocessing the feature set comes from the fixed
+    # registry, not from column discovery. That is what makes the NaPINN-Q
+    # feature matrix identical to the one Ridge and ExtraTrees receive: previously
+    # the PINN inferred its own candidate list by dtype and then filtered it
+    # through a causal allow-list, while the classical pipeline applied its own
+    # fold-local variance/correlation pruning, so the two models never saw the
+    # same columns.
+    #
+    # ``stress_coordinate`` and ``initial_state`` are excluded because they enter
+    # the model as the differentiable coordinate and the initial condition
+    # respectively; duplicating them in the auxiliary tensor is what the revision
+    # forbids.
+    if preprocessing == UNIFIED_PREPROCESSING:
+        from ..preprocessing.unified import build_temporal_audit
+        from ..preprocessing.unified_feature_registry import (
+            model_feature_columns, stress_coordinate_column,
         )
-    audit = build_temporal_feature_audit(
-        candidate_columns, preprocessing=preprocessing,
-        allow_unaudited=allow_unaudited,
-        provenance=provenance_manifest,
-    )
+
+        expected_stress = stress_coordinate_column()
+        if raw_stress_column != expected_stress:
+            raise StressCoordinateError(
+                f"unified registry declares {expected_stress!r} as the stress "
+                f"coordinate but the dataset selected {raw_stress_column!r}; "
+                f"align config.pinn.stress.preferred_coordinate with the registry"
+            )
+        allowed = model_feature_columns(
+            exclude_roles=("stress_coordinate", "initial_state"),
+        )
+        missing = [c for c in allowed if c not in anchors.columns]
+        if missing:
+            raise ValueError(
+                f"unified.parquet is missing registered feature columns: {missing}"
+            )
+        audit = build_temporal_audit(anchors)
+        # Reshape to the columns downstream audit consumers expect.
+        audit = audit.assign(
+            preprocessing=preprocessing,
+            status="allowed",
+            allowed_as_input=audit["feature"].isin(allowed),
+            known_at_anchor=True,
+            planned_at_inference=True,
+            future_derived=False,
+            rejection_reason="",
+            provenance_source="unified_feature_registry",
+        )
+    else:
+        numeric = anchors.select_dtypes(include=[np.number]).columns.tolist()
+        identifiers = set(IDENTIFIER_COLUMNS) | {
+            "initial_rpt_Q_Ah", "previous_rpt_Q_Ah", "previous_rpt_SOH_pct",
+            "q_current_Ah", "u_current", "u_true_next",
+            "stress_current", "stress_delta", "stress_next",
+            # Exclude the raw stress column so it does not appear both as the
+            # model's stress input AND inside the feature matrix.
+            raw_stress_column,
+        }
+        candidate_columns = [
+            c for c in numeric if c not in identifiers and c not in TARGETS
+        ]
+
+        allow_unaudited = bool((audit_cfg or {}).get("allow_unaudited", False))
+        if provenance_manifest is None and features_dir is not None:
+            provenance_manifest = load_provenance_manifest(
+                preprocessing, features_dir=features_dir,
+            )
+        audit = build_temporal_feature_audit(
+            candidate_columns, preprocessing=preprocessing,
+            allow_unaudited=allow_unaudited,
+            provenance=provenance_manifest,
+        )
+        allowed = audit[audit["allowed_as_input"]]["feature"].tolist()
+
     if audit_path is not None:
         audit_path.parent.mkdir(parents=True, exist_ok=True)
         audit.to_csv(audit_path, index=False)
 
-    allowed = audit[audit["allowed_as_input"]]["feature"].tolist()
     if not allowed:
         raise TemporalLeakageError(
             "no leakage-safe feature columns remain after temporal audit; "
@@ -643,29 +696,59 @@ class FoldScaler:
     stress_std: float = 1.0
     u_max: float = 1.0
     epsilon_rec: float = 0.02
+    #: When set, the feature block is delegated to the shared
+    #: UnifiedFoldPreprocessor so NaPINN-Q and the classical models apply
+    #: byte-identical imputation and scaling to identical columns.
+    unified: Any | None = None
 
     def fit(self, frame: pd.DataFrame, feature_columns: list[str], *,
             u_max_source: str, u_max_constant: float, u_max_margin: float,
             tolerance_source: str, tolerance_constant: float,
-            tolerance_quantile: float) -> "FoldScaler":
-        # Drop all-NaN columns fold-locally (Stage 3 fix #15).
-        features_raw = frame[feature_columns].to_numpy(dtype=float)
-        all_nan = np.isnan(features_raw).all(axis=0)
-        used_columns = [c for c, drop in zip(feature_columns, all_nan) if not drop]
-        dropped = [c for c, drop in zip(feature_columns, all_nan) if drop]
-        self.feature_columns_used = list(used_columns)
-        self.dropped_all_nan_columns = list(dropped)
-        if not used_columns:
-            raise ValueError(
-                "all candidate feature columns are entirely NaN on this fold"
+            tolerance_quantile: float,
+            use_unified: bool = False) -> "FoldScaler":
+        if use_unified:
+            # Registry-driven path. No fold-local column dropping: a feature
+            # that happens to be entirely missing on one fold keeps its slot
+            # (imputed to the fold median, or 0.0 when undefined) so the matrix
+            # width and column order are fold-invariant and identical to the
+            # classical pipeline's. Dropping columns per fold, as the legacy
+            # path does, silently changes feature_dim between folds.
+            from ..preprocessing.fold_transform import UnifiedFoldPreprocessor
+
+            preprocessor = UnifiedFoldPreprocessor(
+                exclude_roles=("stress_coordinate", "initial_state"),
+                scale=True,
             )
-        features = frame[used_columns].to_numpy(dtype=float)
-        self.feature_medians = np.nanmedian(features, axis=0)
-        # No column can still be all-NaN here because we dropped those above,
-        # so feature_medians has no NaN entries.
-        replaced = np.where(np.isnan(features), self.feature_medians, features)
-        self.feature_mean = replaced.mean(axis=0)
-        self.feature_std = replaced.std(axis=0) + 1e-8
+            # Restrict to the requested columns while preserving registry order.
+            expected = preprocessor.expected_columns()
+            if list(feature_columns) != expected:
+                raise ValueError(
+                    "unified feature columns disagree with the registry order; "
+                    f"got {len(feature_columns)} columns, expected {len(expected)}"
+                )
+            preprocessor.fit(frame)
+            self.unified = preprocessor
+            self.feature_columns_used = list(expected)
+            self.dropped_all_nan_columns = []
+        else:
+            # Drop all-NaN columns fold-locally (legacy P1/P2/P3 path).
+            features_raw = frame[feature_columns].to_numpy(dtype=float)
+            all_nan = np.isnan(features_raw).all(axis=0)
+            used_columns = [c for c, drop in zip(feature_columns, all_nan) if not drop]
+            dropped = [c for c, drop in zip(feature_columns, all_nan) if drop]
+            self.feature_columns_used = list(used_columns)
+            self.dropped_all_nan_columns = list(dropped)
+            if not used_columns:
+                raise ValueError(
+                    "all candidate feature columns are entirely NaN on this fold"
+                )
+            features = frame[used_columns].to_numpy(dtype=float)
+            self.feature_medians = np.nanmedian(features, axis=0)
+            # No column can still be all-NaN here because we dropped those
+            # above, so feature_medians has no NaN entries.
+            replaced = np.where(np.isnan(features), self.feature_medians, features)
+            self.feature_mean = replaced.mean(axis=0)
+            self.feature_std = replaced.std(axis=0) + 1e-8
 
         stress = frame["stress_current"].to_numpy(dtype=float)
         stress_next = frame["stress_next"].to_numpy(dtype=float)
@@ -699,9 +782,24 @@ class FoldScaler:
         del feature_columns  # ignored — we always use fit-time selection
         if self.feature_columns_used is None:
             raise RuntimeError("FoldScaler.transform_features called before fit")
+        if self.unified is not None:
+            return self.unified.transform(frame)
         features = frame[self.feature_columns_used].to_numpy(dtype=float)
         replaced = np.where(np.isnan(features), self.feature_medians, features)
         return (replaced - self.feature_mean) / self.feature_std
+
+    def feature_hash(self) -> str:
+        """Hash of the exact feature contract, recorded per fold."""
+        import hashlib
+        import json
+
+        if self.unified is not None:
+            return self.unified.feature_hash()
+        payload = json.dumps(
+            {"feature_columns": list(self.feature_columns_used or [])},
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
     def transform_stress(self, values: np.ndarray) -> np.ndarray:
         return (np.asarray(values, dtype=float) - self.stress_mean) / self.stress_std
@@ -721,11 +819,18 @@ class FoldScaler:
             "stress_std": self.stress_std,
             "u_max": self.u_max,
             "epsilon_rec": self.epsilon_rec,
+            "unified": None if self.unified is None else self.unified.state_dict(),
+            "feature_hash": self.feature_hash() if self.feature_columns_used else None,
         }
 
     @classmethod
     def from_state_dict(cls, state: dict[str, Any]) -> "FoldScaler":
         obj = cls()
+        unified_state = state.get("unified")
+        if unified_state:
+            from ..preprocessing.fold_transform import UnifiedFoldPreprocessor
+
+            obj.unified = UnifiedFoldPreprocessor.from_state_dict(unified_state)
         obj.feature_columns_used = list(state.get("feature_columns_used") or [])
         obj.dropped_all_nan_columns = list(state.get("dropped_all_nan_columns") or [])
         obj.feature_medians = None if state["feature_medians"] is None else np.asarray(state["feature_medians"])

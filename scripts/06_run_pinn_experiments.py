@@ -79,6 +79,59 @@ def _load_split(cfg: dict, reference_frame: pd.DataFrame) -> pd.DataFrame:
     return split_manifest
 
 
+def _write_experiment_manifest(results_dir: Path, cfg: dict, pinn_cfg: dict, *,
+                               plan: list, device: str, max_epochs: int,
+                               git_commit_hash: str) -> None:
+    """Persist every effective setting for this run.
+
+    Section 14 of the revision requires that no configuration value is inert.
+    This manifest is the audit trail: it records the resolved model, training,
+    loss, curriculum and batching settings actually handed to TrainerConfig,
+    plus the feature-registry hash, so a reviewer can verify that what the
+    config declares is what ran.
+    """
+    from src.preprocessing.unified_feature_registry import (
+        N_MODEL_FEATURES, REGISTRY_VERSION, model_feature_columns, registry_hash,
+    )
+
+    payload = {
+        "git_commit": git_commit_hash,
+        "device": device,
+        "max_epochs": max_epochs,
+        "planned_runs": [
+            {"architecture": a, "preprocessing": p, "fold": f, "seed": s}
+            for a, p, f, s in plan
+        ],
+        "n_planned_runs": len(plan),
+        "seeds": list(pinn_cfg["seeds"]),
+        "preprocessing": list(pinn_cfg["preprocessing"]),
+        "feature_registry": {
+            "version": REGISTRY_VERSION,
+            "hash": registry_hash(),
+            "n_model_features": N_MODEL_FEATURES,
+            "classical_feature_columns": model_feature_columns(),
+            "pinn_auxiliary_feature_columns": model_feature_columns(
+                exclude_roles=("stress_coordinate", "initial_state"),
+            ),
+        },
+        "effective_settings": {
+            "model": dict(pinn_cfg["model"]),
+            "training": dict(pinn_cfg["training"]),
+            "losses": dict(pinn_cfg["losses"]),
+            "curriculum": dict(pinn_cfg["curriculum"]),
+            "collocation": dict(pinn_cfg["collocation"]),
+            "quadrature": dict(pinn_cfg["quadrature"]),
+            "bounds": dict(pinn_cfg["bounds"]),
+            "monotonicity": dict(pinn_cfg["monotonicity"]),
+            "stress": dict(pinn_cfg["stress"]),
+        },
+        "split": dict(cfg["split"]),
+    }
+    path = results_dir / "experiment_manifest.json"
+    path.write_text(json.dumps(payload, indent=2, default=str) + "\n",
+                    encoding="utf-8")
+
+
 def main() -> None:
     args = _parse_args()
     cfg = load_config()
@@ -148,9 +201,19 @@ def main() -> None:
         return
 
     features_dir = Path(cfg["paths"]["artifacts"]) / "features"
-    p2 = pd.read_parquet(features_dir / "p2.parquet")
-    reference = p2.dropna(subset=["next_rpt_Q_Ah"]).reset_index(drop=True)
+    # The split manifest is validated against the same anchor table the models
+    # train on, so classical and PINN folds are provably identical rows.
+    reference_level = preprocessing_choices[0]
+    reference_frame = pd.read_parquet(features_dir / f"{reference_level}.parquet")
+    reference = reference_frame.dropna(subset=["next_rpt_Q_Ah"]).reset_index(drop=True)
     split_manifest = _load_split(cfg, reference)
+
+    # Record every effective setting once per run, so "declared in config" and
+    # "active at runtime" can be checked against each other after the fact.
+    _write_experiment_manifest(
+        results_dir, cfg, pinn_cfg, plan=plan, device=device,
+        max_epochs=max_epochs, git_commit_hash=str(git_commit(HERE.parent)),
+    )
 
     manifest_rows: list[dict[str, object]] = []
     failed_rows: list[dict[str, object]] = []
@@ -200,6 +263,7 @@ def main() -> None:
                 rate_uses_u_hat=bool(pinn_cfg["model"].get("rate_uses_u_hat", True)),
                 predict_delta_u=bool(pinn_cfg["model"].get("predict_delta_u", False)),
                 batch_size=int(pinn_cfg["training"].get("batch_size", 0)),
+                batch_mode=str(pinn_cfg["training"].get("batch_mode", "cell_balanced")),
                 maximum_parameters=int(pinn_cfg["model"]["maximum_parameters"]),
                 inner_split_seed=int(pinn_cfg.get("audit", {}).get(
                     "inner_split_seed", 20240117)),
@@ -210,6 +274,18 @@ def main() -> None:
                     "pde_gradient_zero_patience", 5)),
                 use_gradient_balance=bool(pinn_cfg["training"].get(
                     "use_gradient_balance", True)),
+                gradient_balance_ema=float(pinn_cfg["training"].get(
+                    "gradient_balance_ema", 0.95)),
+                gradient_balance_min_multiplier=float(pinn_cfg["training"].get(
+                    "gradient_balance_min_multiplier", 0.1)),
+                gradient_balance_max_multiplier=float(pinn_cfg["training"].get(
+                    "gradient_balance_max_multiplier", 10.0)),
+                checkpoint_after_physics_active=bool(pinn_cfg["training"].get(
+                    "checkpoint_after_physics_active", True)),
+                rate_data_weight=float(pinn_cfg["losses"].get("rate_data", 0.0)),
+                pairwise_weight=float(pinn_cfg["losses"].get("pairwise", 0.0)),
+                pairwise_max_pairs=int(pinn_cfg["training"].get(
+                    "pairwise_max_pairs", 256)),
                 log_every_epochs=int(pinn_cfg["logging"]["log_every_epochs"]),
                 save_checkpoint_every_epochs=int(pinn_cfg["logging"]["save_checkpoint_every_epochs"]),
                 log_gpu_memory=bool(pinn_cfg["logging"]["log_gpu_memory"]),

@@ -28,7 +28,11 @@ from src.splits.group_kfold import (
 )
 from src.utils.progress import tqdm_joblib
 
-PIPELINES = ["p1", "p2", "p3"]
+#: Fallback only. The active list comes from
+#: ``experiment.preprocessing_levels`` in config.yaml, which is ["unified"].
+#: P1/P2/P3 remain loadable for traceability but are not part of the final
+#: experiment.
+DEFAULT_PIPELINES = ["unified"]
 REG_TARGETS = list(REGRESSION_TARGETS)
 CLF_TARGETS = list(CLASSIFICATION_TARGETS)
 
@@ -67,33 +71,47 @@ def main() -> None:
     if model_n_jobs is not None:
         model_n_jobs = int(model_n_jobs)
 
+    # Active preprocessing levels come from config; the final experiment uses
+    # only "unified" so every retained model reads one identical feature table.
+    pipelines = [
+        str(level) for level in
+        ((cfg.get("experiment") or {}).get("preprocessing_levels")
+         or DEFAULT_PIPELINES)
+    ]
+    evaluate_holdout = bool(
+        (cfg.get("experiment") or {}).get("evaluate_holdout", False)
+    )
+
     reg_models = enabled_regressors(cfg, model_n_jobs=model_n_jobs)
     clf_models = enabled_classifiers(cfg, model_n_jobs=model_n_jobs) if CLF_TARGETS else {}
 
     reg_names = list(reg_models.keys())
     clf_names = list(clf_models.keys())
-    expected_reg_combos = len(PIPELINES) * len(REG_TARGETS) * len(reg_names)
-    expected_clf_combos = len(PIPELINES) * len(CLF_TARGETS) * len(clf_names)
+    expected_reg_combos = len(pipelines) * len(REG_TARGETS) * len(reg_names)
+    expected_clf_combos = len(pipelines) * len(CLF_TARGETS) * len(clf_names)
 
     print(f"[run] enabled regressors: {', '.join(reg_names)}", flush=True)
     if clf_names:
         print(f"[run] enabled classifiers: {', '.join(clf_names)}", flush=True)
-    print(f"[run] preprocessing pipelines: {', '.join(PIPELINES)}", flush=True)
+    print(f"[run] preprocessing pipelines: {', '.join(pipelines)}", flush=True)
     print(f"[run] regression targets: {len(REG_TARGETS)}", flush=True)
     print(f"[run] expected experiment combinations: {expected_reg_combos + expected_clf_combos}",
           flush=True)
     print(f"[run] results directory: {results_dir}", flush=True)
+    print(f"[run] locked-holdout evaluation: "
+          f"{'ENABLED' if evaluate_holdout else 'disabled (development only)'}",
+          flush=True)
     print(f"[run] outer workers: {workers}  |  model n_jobs: {model_n_jobs}", flush=True)
 
     if args.dry_run:
         print("[run] --dry-run: listing planned combinations only", flush=True)
-        for pipe, target, name in product(PIPELINES, REG_TARGETS, reg_names):
+        for pipe, target, name in product(pipelines, REG_TARGETS, reg_names):
             print(f"[run]   {pipe:>3} | {target:>25} | {name}", flush=True)
-        for pipe, target, name in product(PIPELINES, CLF_TARGETS, clf_names):
+        for pipe, target, name in product(pipelines, CLF_TARGETS, clf_names):
             print(f"[run]   {pipe:>3} | {target:>25} | {name}", flush=True)
         return
 
-    reference = _load_pipeline("p2", features_dir)
+    reference = _load_pipeline(pipelines[0], features_dir)
     primary_target = REG_TARGETS[0]
     reference = reference.dropna(subset=[primary_target]).reset_index(drop=True)
     split_dir = Path(cfg["paths"]["artifacts"]) / "splits"
@@ -134,7 +152,7 @@ def main() -> None:
     all_rows = []
     total_t = time.time()
 
-    outer = tqdm(PIPELINES, desc="[run] pipelines", unit="pipe")
+    outer = tqdm(pipelines, desc="[run] pipelines", unit="pipe")
     for pipe in outer:
         outer.set_postfix_str(pipe)
         try:
@@ -151,7 +169,8 @@ def main() -> None:
             t0 = time.time()
             rows = run_one(df, pipe, target, name, model, kind=kind,
                             n_splits=n_splits, random_state=rs,
-                            split_manifest=split_manifest)
+                            split_manifest=split_manifest,
+                            evaluate_holdout=evaluate_holdout)
             tqdm.write(f"[run] {pipe:>3} | {target:>15} | {name:<20} | "
                        f"{len(rows):3d} rows | {time.time()-t0:5.1f}s")
             return rows

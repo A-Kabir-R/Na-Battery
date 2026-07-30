@@ -108,15 +108,7 @@ for required in \
   scripts/01_build_features.py \
   src/io/canonical.py \
   src/preprocessing/protocol_segmentation.py \
-  src/preprocessing/p3_waveform.py \
-  src/preprocessing/unified.py \
-  src/preprocessing/unified_feature_registry.py \
-  src/preprocessing/curve_features.py \
-  src/preprocessing/dcir.py \
-  src/preprocessing/fold_transform.py \
-  src/pinn/batching.py \
-  tests/test_unified_parity.py \
-  tests/test_pinn_config_wiring.py; do
+  src/preprocessing/p3_waveform.py; do
   test -f '${POD_CODE_DIR}/'"\$required" || {
     echo "[push:remote] ERROR: incomplete deployment; missing ${POD_CODE_DIR}/\$required" >&2
     exit 1
