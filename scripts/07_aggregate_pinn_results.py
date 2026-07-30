@@ -115,6 +115,29 @@ def main() -> None:
     log_event(logger, logging.INFO, "prediction_paths_discovered",
               n=len(prediction_paths), expected_completed=expected_completed,
               planned=planned)
+
+    # Physics-gate check: if checkpoint_after_physics_active was disabled in the
+    # run that produced these results, the best checkpoint may have been selected
+    # before the curriculum reached full physics. Refuse to publish such results.
+    experiment_manifest_json = results / "experiment_manifest.json"
+    if experiment_manifest_json.exists():
+        try:
+            exp_manifest = json.loads(experiment_manifest_json.read_text())
+            training_cfg = (exp_manifest.get("effective_settings") or {}).get("training", {})
+            checkpoint_gate = training_cfg.get("checkpoint_after_physics_active", True)
+            if not checkpoint_gate:
+                log_event(logger, logging.WARNING, "physics_gate_disabled",
+                          message="checkpoint_after_physics_active was False in this run; "
+                                  "reported model may have been checkpointed before full "
+                                  "physics activation — do not use these results as the "
+                                  "headline PINN result.",
+                          checkpoint_after_physics_active=checkpoint_gate)
+                print("[pinn.aggregate] WARNING: checkpoint_after_physics_active was False "
+                      "in this run. The best checkpoint may precede full physics activation. "
+                      "Do not publish these as headline results.")
+        except Exception as exc:
+            log_event(logger, logging.WARNING, "experiment_manifest_json_unreadable",
+                      path=str(experiment_manifest_json), error=str(exc))
     if expected_completed and len(prediction_paths) < expected_completed:
         msg = (f"[pinn.aggregate] found {len(prediction_paths)} completed "
                f"prediction files but the manifest expected {expected_completed}")
@@ -177,14 +200,36 @@ def main() -> None:
         if status_path.exists():
             try:
                 status = json.loads(status_path.read_text())
+                best_epoch = status.get("best_epoch", np.nan)
+                physics_full_epoch = status.get("physics_full_epoch", np.nan)
                 complexity_rows.append({
                     "architecture": arch, "preprocessing": prep, "fold": fold,
                     "seed": seed,
                     "trainable_parameters": status.get("trainable_parameters", np.nan),
-                    "best_epoch": status.get("best_epoch", np.nan),
+                    "best_epoch": best_epoch,
+                    "physics_full_epoch": physics_full_epoch,
                     "best_validation_mae": status.get("best_validation_mae", np.nan),
                     "status": status.get("status", "unknown"),
                 })
+                # Per-run physics-gate: the selected checkpoint must not predate
+                # full physics activation.
+                if (
+                    isinstance(best_epoch, (int, float))
+                    and isinstance(physics_full_epoch, (int, float))
+                    and np.isfinite(best_epoch)
+                    and np.isfinite(physics_full_epoch)
+                    and int(best_epoch) < int(physics_full_epoch)
+                ):
+                    log_event(logger, logging.WARNING, "physics_gate_violation",
+                              architecture=arch, preprocessing=prep,
+                              fold=fold, seed=seed,
+                              best_epoch=int(best_epoch),
+                              physics_full_epoch=int(physics_full_epoch),
+                              message=(f"fold={fold} seed={seed}: best_epoch={best_epoch} "
+                                       f"< physics_full_epoch={physics_full_epoch}; "
+                                       f"checkpoint was selected before full physics "
+                                       f"activation. Do not publish this fold as the "
+                                       f"headline PINN result."))
             except Exception:
                 pass
 
