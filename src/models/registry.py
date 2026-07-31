@@ -63,6 +63,9 @@ def _apply_n_jobs(estimators: Dict[str, Any], model_n_jobs: int | None) -> None:
                 continue
 
 
+_OPTIONAL_REGRESSORS = {"XGBoost", "LightGBM", "CatBoost"}
+
+
 def enabled_regressors(cfg: Mapping[str, Any] | None = None,
                        model_n_jobs: int | None = None) -> Dict[str, Any]:
     """Return the ordered dict of regressors permitted by ``models.enabled_regressors``.
@@ -70,16 +73,28 @@ def enabled_regressors(cfg: Mapping[str, Any] | None = None,
     - ``cfg`` defaults to ``load_config()``; pass an override for tests.
     - ``model_n_jobs`` forces ``n_jobs`` on every estimator that exposes it, to
       prevent nested parallelism when the outer experiment loop is parallel.
+    - Optional regressors (XGBoost, LightGBM, CatBoost) are skipped with a
+      warning when the backing package is not installed, rather than aborting.
     """
     if cfg is None:
         cfg = load_config()
     model_cfg = (cfg.get("models") or {}) if isinstance(cfg, Mapping) else {}
     names = model_cfg.get("enabled_regressors")
     available = build_regressors()
+    # Optional packages may be absent from the registry when not installed.
+    # Warn and skip rather than aborting the pipeline.
+    filtered_names: List[str] = []
+    if names is not None and not isinstance(names, (str, bytes)):
+        for name in names:
+            if name in _OPTIONAL_REGRESSORS and name not in available:
+                print(f"[registry] WARNING: {name} requested but package not installed; skipping.")
+            else:
+                filtered_names.append(name)
+        names = filtered_names
     resolved = _validate_allowlist(names, available, "models.enabled_regressors")
-    filtered: Dict[str, Any] = {name: available[name] for name in resolved}
-    _apply_n_jobs(filtered, model_n_jobs)
-    return filtered
+    result: Dict[str, Any] = {name: available[name] for name in resolved}
+    _apply_n_jobs(result, model_n_jobs)
+    return result
 
 
 def enabled_classifiers(cfg: Mapping[str, Any] | None = None,

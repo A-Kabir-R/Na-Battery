@@ -1,0 +1,49 @@
+{
+  "dataset_root": "/workspace/dataset",
+  "scope": "Standard cycling only",
+  "file_count": 548,
+  "parse_valid_count": 546,
+  "complete_cycle_count": 56353,
+  "valid_rpt_count": 284,
+  "config_protocol": {
+    "nominal_capacity_Ah": 1.2,
+    "current_deadband_A": 0.02,
+    "cycling_current_relative_tolerance": 0.35,
+    "minimum_phase_capacity_Ah": 0.001,
+    "capacity_ratio_bounds": [
+      0.25,
+      4.0
+    ],
+    "minimum_cycle_voltage_span_V": 0.3,
+    "minimum_phase_voltage_span_V": 0.25,
+    "max_invalid_fraction": 0.0,
+    "max_sampling_gap_s": 300.0,
+    "physical_bounds": {
+      "Voltage": [
+        0.0,
+        5.0
+      ],
+      "Current": [
+        -5.0,
+        5.0
+      ],
+      "Temperature": [
+        -30.0,
+        70.0
+      ]
+    },
+    "rpt_reference_current_A": 0.6,
+    "rpt_current_relative_tolerance": 0.2,
+    "rpt_charged_voltage_min_V": 3.6,
+    "rpt_discharged_voltage_max_V": 1.8,
+    "rpt_capacity_bounds_Ah": [
+      0.2,
+      2.0
+    ]
+  },
+  "scientific_blockers": [
+    "Confirm the inferred 0.5C reference-discharge protocol rule against dataset documentation.",
+    "Provide authoritative CID/gassing outcomes and censoring evidence before classification.",
+    "Approve a sustained capacity-EOL definition before survival target construction."
+  ]
+}

@@ -59,20 +59,19 @@ echo "[run] r2.env loaded  R2_BUCKET=${R2_BUCKET:-<unset>}  STOP_MODE=${STOP_MOD
 : "${R2_PREFIX:=sodium_ion_battery}"
 : "${RUN_STAGES:=all}"
 
-# Expand the alias 'all' to the full classical + PINN pipeline. pinn_ablation
-# must precede pinn_plot: the plotting script reads ablation_metrics.csv, and
-# without the earlier ordering the ablation bar was silently absent from the
-# published figure set.
+# Expand the alias 'all' to the full classical + PINN pipeline.
+# NOTE: pinn_ablation is excluded — ablation suite is deferred (re-enable A0–A7 in future).
 if [[ "$RUN_STAGES" == "all" ]]; then
-  RUN_STAGES="canonical,build,degradation,experiments,aggregate,plot,pinn,pinn_aggregate,pinn_ablation,pinn_plot,combined_report"
+  RUN_STAGES="canonical,build,degradation,experiments,aggregate,plot,pinn,pinn_aggregate,pinn_plot,combined_report"
 fi
 
 # Alias for the unified-preprocessing revision. 'tests' runs first and gates
 # everything else: the whole point of the revision is that the wiring is
 # verified, so a failing test must stop the run before hours of GPU time.
 # 'pinn' trains the primary seed only; 'pinn_seeds' adds the robustness spread.
+# NOTE: pinn_ablation excluded — deferred for future work.
 if [[ "$RUN_STAGES" == "revision" ]]; then
-  RUN_STAGES="tests,build_unified,degradation,experiments,aggregate,plot,pinn,pinn_seeds,pinn_aggregate,pinn_ablation,pinn_plot,combined_report"
+  RUN_STAGES="tests,build_unified,degradation,experiments,aggregate,plot,pinn,pinn_seeds,pinn_aggregate,pinn_plot,combined_report"
 fi
 
 # Development-only variant: everything except the holdout. This is what to run
@@ -136,7 +135,7 @@ REQUIRED_SOURCE=(
   scripts/07_aggregate_pinn_results.py
   scripts/08_plot_pinn_results.py
   scripts/09_combine_classical_pinn_results.py
-  scripts/10_run_pinn_ablations.py
+  # scripts/10_run_pinn_ablations.py  # DEFERRED
   src/io/canonical.py
   src/preprocessing/protocol_segmentation.py
   src/preprocessing/p3_waveform.py
@@ -206,9 +205,6 @@ if cfg["pinn"]["model"]["predict_delta_u"] is not True:
     problems.append("pinn.model.predict_delta_u must be true")
 if cfg["pinn"]["training"]["checkpoint_after_physics_active"] is not True:
     problems.append("checkpoint_after_physics_active must be true")
-if "SVR-RBF" in cfg["models"]["enabled_regressors"]:
-    problems.append("SVR-RBF is still enabled")
-
 if problems:
     for problem in problems:
         print(f"PREFLIGHT: {problem}", file=sys.stderr)
@@ -275,7 +271,15 @@ run_cmd(){
 log "===== pipeline start (stages: $RUN_STAGES) ====="
 for stage in "${STAGES[@]}"; do
   case "$stage" in
-    canonical)   run_stage canonical   scripts/00_build_canonical.py ;;
+    canonical)
+      if [[ -f "${SIB_CANONICAL}/file_manifest.parquet" && \
+            -f "${SIB_CANONICAL}/cycles.parquet" && \
+            -f "${SIB_CANONICAL}/rpt_measurements.parquet" ]]; then
+        log "canonical tables already present at ${SIB_CANONICAL}; skipping canonical stage"
+      else
+        run_stage canonical scripts/00_build_canonical.py
+      fi
+      ;;
     build)
       if [[ ! -f "${SIB_CANONICAL}/file_manifest.parquet" || \
             ! -f "${SIB_CANONICAL}/cycles.parquet" || \
@@ -283,7 +287,12 @@ for stage in "${STAGES[@]}"; do
         log "canonical prerequisites missing; running canonical stage before build"
         run_stage canonical scripts/00_build_canonical.py
       fi
-      run_stage build scripts/01_build_features.py
+      if [[ -f "${SIB_ARTIFACTS}/features/unified.parquet" && \
+            -f "${SIB_ARTIFACTS}/features/cu_capacity.parquet" ]]; then
+        log "feature tables already present at ${SIB_ARTIFACTS}/features; skipping build stage"
+      else
+        run_stage build scripts/01_build_features.py
+      fi
       ;;
     build_unified)
       if [[ ! -f "${SIB_CANONICAL}/file_manifest.parquet" || \
@@ -293,9 +302,14 @@ for stage in "${STAGES[@]}"; do
         log "canonical prerequisites missing; running canonical stage before build_unified"
         run_stage canonical scripts/00_build_canonical.py
       fi
-      # Only cu_capacity + unified.parquet. Much cheaper than the full build:
-      # two cycles per CYC file instead of every cycle.
-      run_stage build_unified scripts/01_build_features.py --unified-only
+      if [[ -f "${SIB_ARTIFACTS}/features/unified.parquet" && \
+            -f "${SIB_ARTIFACTS}/features/cu_capacity.parquet" ]]; then
+        log "unified features already present at ${SIB_ARTIFACTS}/features; skipping build_unified stage"
+      else
+        # Only cu_capacity + unified.parquet. Much cheaper than the full build:
+        # two cycles per CYC file instead of every cycle.
+        run_stage build_unified scripts/01_build_features.py --unified-only
+      fi
       ;;
     tests)
       # Gate the run on the wiring tests. -x so the first failure stops the
@@ -340,12 +354,12 @@ for stage in "${STAGES[@]}"; do
       ;;
     pinn_aggregate)   run_stage pinn_aggregate   scripts/07_aggregate_pinn_results.py ;;
     pinn_plot)        run_stage pinn_plot        scripts/08_plot_pinn_results.py ;;
-    pinn_ablation)
-      # Primary seed and the single active preprocessing level, explicitly.
-      # Left to its defaults the script would fan out over every seed.
-      run_stage pinn_ablation scripts/10_run_pinn_ablations.py \
-        --seed "${SIB_PRIMARY_SEED:-42}" --preprocessing unified
-      ;;
+    # pinn_ablation)  # DEFERRED: re-enable when ablation suite (A0–A7) is ready
+    #   # Primary seed and the single active preprocessing level, explicitly.
+    #   # Left to its defaults the script would fan out over every seed.
+    #   run_stage pinn_ablation scripts/10_run_pinn_ablations.py \
+    #     --seed "${SIB_PRIMARY_SEED:-42}" --preprocessing unified
+    # ;;
     combined_report)
       if [[ $PIPELINE_RC -ne 0 ]]; then
         log "skipping combined_report — earlier stage failed"

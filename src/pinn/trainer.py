@@ -212,6 +212,8 @@ class FoldPaths:
 
 def _tensor(values, device: str, dtype=torch.float32,
             requires_grad: bool = False) -> torch.Tensor:
+    if isinstance(values, np.ndarray) and not values.flags.writeable:
+        values = values.copy()
     tensor = torch.as_tensor(values, dtype=dtype, device=device)
     if requires_grad:
         tensor.requires_grad_(True)
@@ -596,6 +598,13 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
     fold_paths.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     fold_paths.logs_dir.mkdir(parents=True, exist_ok=True)
     device = resolve_device(config.device)
+    if config.device == "cuda" and device != "cuda":
+        msg = ("[trainer] WARNING: cuda requested but torch.cuda.is_available() is False; "
+               "training will run on CPU. Check your PyTorch installation and CUDA drivers.")
+        print(msg)
+        if logger is not None:
+            log_event(logger, logging.WARNING, "cuda_unavailable_cpu_fallback",
+                      requested=config.device, actual=device)
 
     # AMP is configured but not implemented — training runs in fp32. Warn
     # loudly if the caller still asks for AMP so downstream metrics aren't
@@ -748,7 +757,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
         val_ss_tot_cached = 0.0
 
     epoch_rows: list[dict[str, Any]] = []
-    generator = torch.Generator(device=device if device == "cpu" else "cpu")
+    generator = torch.Generator(device=device)
     generator.manual_seed(config.seed)
 
     manifest = {
@@ -910,7 +919,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                     features=batch_features,
                     cell_index=batch_cells,
                     points_per_transition=config.collocation_points,
-                    generator=generator if device == "cpu" else None,
+                    generator=generator,
                 )
                 collo_stress = collocation.stress.clone().detach().requires_grad_(True)
                 collo_u_current = batch_u_current[collocation.row_index]
@@ -1359,8 +1368,14 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
         atomic_write_csv(epoch_log, fold_paths.epoch_log_csv)
         try:
             atomic_write_parquet(epoch_log, fold_paths.epoch_log_parquet)
-        except Exception:
-            pass
+        except Exception as _parquet_exc:
+            if logger is not None:
+                log_event(logger, logging.WARNING, "epoch_log_parquet_write_failed",
+                          path=str(fold_paths.epoch_log_parquet),
+                          error=str(_parquet_exc))
+            print(f"[trainer] WARNING: epoch_log.parquet write failed "
+                  f"({type(_parquet_exc).__name__}: {_parquet_exc}); "
+                  f"CSV fallback written to {fold_paths.epoch_log_csv}")
 
     # Selection provenance: fail loudly rather than reporting a checkpoint that
     # was chosen while the physics curriculum was still ramping.
@@ -1654,7 +1669,7 @@ def _refit_full_outer_train(
         ramp_end_fraction=config.curriculum_ramp_end_fraction,
     )
     refit_physics_full_epoch = curriculum.physics_full_epoch
-    generator = torch.Generator(device="cpu")
+    generator = torch.Generator(device=device)
     generator.manual_seed(config.seed)
 
     # Mirror the inner-training batching exactly, including cell balancing.
@@ -1724,7 +1739,7 @@ def _refit_full_outer_train(
                 features=batch_features,
                 cell_index=batch_cells,
                 points_per_transition=config.collocation_points,
-                generator=generator if device == "cpu" else None,
+                generator=generator,
             )
             collo_stress = collocation.stress.clone().detach().requires_grad_(True)
             collo_u_current = batch_u_current[collocation.row_index]

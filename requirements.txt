@@ -11,8 +11,6 @@ pyarrow>=13.0
 pytest>=8.0
 torch>=2.2
 
-# Optional: boosted-tree libraries retained for historical comparison only.
-# Not installed by default; the final experiment uses Ridge and ExtraTrees.
-# xgboost>=2.0
-# lightgbm>=4.0
-# catboost>=1.2
+xgboost>=2.0
+lightgbm>=4.0
+catboost>=1.2

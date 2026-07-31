@@ -50,13 +50,32 @@ class CellBalancedSampler:
             raise ValueError(f"unknown batch_mode: {self.mode}")
         self.row_positions = self.row_positions.view(-1)
         self.n_rows = int(self.row_positions.numel())
+        device = self.row_positions.device
         cells = self.cell_index[self.row_positions]
         self.unique_cells = torch.unique(cells)
-        # Row positions grouped by cell, so within-cell draws are a single
-        # index op rather than a mask over the whole frame.
         self._by_cell = [
             self.row_positions[cells == cell] for cell in self.unique_cells
         ]
+        # Precompute padded pool tensor for vectorized GPU batch drawing.
+        # Avoids the Python for-loop + .tolist() sync that previously ran
+        # batch_size iterations per batch on the GPU → CPU → GPU round-trip.
+        n_c = len(self._by_cell)
+        if n_c > 0:
+            max_pool = max(p.numel() for p in self._by_cell)
+            self._padded_pool = torch.zeros(
+                n_c, max_pool, dtype=self.row_positions.dtype, device=device,
+            )
+            self._pool_sizes = torch.zeros(n_c, dtype=torch.long, device=device)
+            for i, pool in enumerate(self._by_cell):
+                sz = pool.numel()
+                if sz:
+                    self._padded_pool[i, :sz] = pool
+                self._pool_sizes[i] = sz
+        else:
+            self._padded_pool = torch.empty(
+                0, 0, dtype=self.row_positions.dtype, device=device,
+            )
+            self._pool_sizes = torch.empty(0, dtype=torch.long, device=device)
 
     @property
     def n_cells(self) -> int:
@@ -87,22 +106,20 @@ class CellBalancedSampler:
             shuffled = self.row_positions[perm]
             return [shuffled[i * size:(i + 1) * size] for i in range(count)]
 
-        batches: list[torch.Tensor] = []
-        for _ in range(count):
-            # Uniform over cells, with replacement, then one row per slot from
-            # the chosen cell. Cells with many anchors can no longer dominate.
-            cell_slots = self._randint(self.n_cells, size, generator)
-            picks: list[torch.Tensor] = []
-            for slot in cell_slots.tolist():
-                pool = self._by_cell[slot]
-                if pool.numel() == 0:
-                    continue
-                offset = self._randint(int(pool.numel()), 1, generator)
-                picks.append(pool[offset])
-            batches.append(
-                torch.cat(picks) if picks else self.row_positions[:0]
-            )
-        return batches
+        device = self.row_positions.device
+        total = count * size
+        # Draw all cell indices at once (no Python loop, no GPU→CPU sync).
+        cell_slots = self._randint(self.n_cells, total, generator)
+        selected_sizes = self._pool_sizes[cell_slots]
+        # Sample a within-cell offset via rand × pool_size → floor.
+        # Uniform for pool sizes up to ~8 M rows (well beyond any real dataset).
+        gen = (generator if generator is not None
+               and generator.device.type == device.type else None)
+        rand_offsets = torch.rand(total, device=device, generator=gen)
+        offsets = (rand_offsets * selected_sizes.float()).long()
+        offsets = offsets.clamp(max=(selected_sizes - 1).clamp(min=0))
+        rows = self._padded_pool[cell_slots, offsets]
+        return [rows[i * size:(i + 1) * size] for i in range(count)]
 
     # -- deterministic helpers -------------------------------------------
     def _randperm(self, n: int, generator: torch.Generator | None) -> torch.Tensor:

@@ -501,6 +501,62 @@ def plot_combined_family_bar(combined_metrics: pd.DataFrame, output_dir: Path,
     _save(fig, output_dir / f"combined_family_{metric.lower()}")
 
 
+def plot_training_curves(epoch_log: pd.DataFrame, output_dir: Path) -> None:
+    """Combined training-loss + validation-MAE figure, one panel per fold/seed.
+
+    Left axis: total training loss (log scale).
+    Right axis: inner-validation MAE (linear scale).
+    Placed in the main plots directory so it is immediately visible.
+    """
+    output_dir = Path(output_dir)
+    if epoch_log.empty:
+        _skip("training_curves", "epoch log is empty"); return
+    required = {"epoch", "train_total_loss", "validation_MAE",
+                "architecture", "preprocessing", "fold", "seed"}
+    if not required.issubset(epoch_log.columns):
+        missing = required - set(epoch_log.columns)
+        _skip("training_curves", f"missing columns: {missing}"); return
+
+    groups = list(epoch_log.groupby(
+        ["architecture", "preprocessing", "fold", "seed"], dropna=False))
+    n = len(groups)
+    if n == 0:
+        _skip("training_curves", "no groups"); return
+
+    cols = min(n, 3)
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 3.5 * rows), squeeze=False)
+    flat_axes = [ax for row in axes for ax in row]
+
+    for idx, ((arch, prep, fold, seed), grp) in enumerate(groups):
+        ax = flat_axes[idx]
+        grp = grp.sort_values("epoch")
+        color_train = "tab:blue"
+        color_val = "tab:orange"
+
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("train total loss", color=color_train)
+        ax.tick_params(axis="y", labelcolor=color_train)
+        ax.set_yscale("log")
+        ax.plot(grp["epoch"], grp["train_total_loss"],
+                color=color_train, linewidth=1.0, label="train loss")
+
+        ax2 = ax.twinx()
+        ax2.set_ylabel("val MAE", color=color_val)
+        ax2.tick_params(axis="y", labelcolor=color_val)
+        ax2.plot(grp["epoch"], grp["validation_MAE"],
+                 color=color_val, linewidth=1.0, linestyle="--", label="val MAE")
+
+        ax.set_title(f"{arch}|{prep}|f{fold}|s{seed}", fontsize=8)
+
+    for idx in range(n, len(flat_axes)):
+        flat_axes[idx].set_visible(False)
+
+    fig.suptitle("Training loss (blue, log) vs inner-validation MAE (orange, linear)", fontsize=9)
+    fig.tight_layout()
+    _save(fig, output_dir / "training_curves")
+
+
 def render_all_pinn_plots(*, epoch_log: pd.DataFrame,
                           predictions: pd.DataFrame,
                           target_metrics: pd.DataFrame,
@@ -519,7 +575,9 @@ def render_all_pinn_plots(*, epoch_log: pd.DataFrame,
     output_dir.mkdir(parents=True, exist_ok=True)
     supp_dir = output_dir / "supplementary"
     supp_dir.mkdir(parents=True, exist_ok=True)
-    # Training / validation / LR history → supplementary material only.
+    # Combined training-loss + validation-MAE curve in the main directory.
+    plot_training_curves(epoch_log, output_dir)
+    # Per-component training / validation / LR history → supplementary material.
     plot_epoch_curves(epoch_log, supp_dir)
     # Predicted vs actual capacity + SOH (same routine plots both when the
     # aggregator supplies the SOH columns).

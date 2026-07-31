@@ -21,7 +21,7 @@ POD_ENV_FILE="$HERE/pod.env"
 : "${POD_CODE_DIR:=${CODE_DIR}}"
 : "${POD_DATA_STATICS_DIR:=${POD_ROOT}/data statics}"
 : "${POD_DATASET_DIR:=${POD_ROOT}/dataset}"
-: "${POD_RESULTS_DIR:=${POD_CODE_DIR}/artifacts}"
+POD_RESULTS_DIR="${POD_CODE_DIR}/artifacts"
 
 DATASET_URL="${DATASET_URL:-https://publications.rwth-aachen.de/record/987579/files/Data_Failure_Mode_and_Degradation_Analysis_of_a_Commercial_Sodium-Ion_Battery_With_Severe_Gassing_Issue.zip}"
 DATASET_ZIP="${POD_WORKSPACE}/dataset.zip"
@@ -116,6 +116,46 @@ else
     python -m pip install -r "${POD_CODE_DIR}/requirements.txt"
   fi
   printf '%s\n' "$REQ_HASH" > "$REQ_MARKER"
+fi
+
+# --- 3b. CUDA-aware PyTorch override -----------------------------------------
+# requirements.txt installs the CPU-only default torch wheel. This section
+# replaces it with the CUDA build when a GPU is detected. Idempotent: skipped
+# when torch already reports cuda.is_available() == True.
+TORCH_HAS_CUDA=0
+python - <<'PY' >/dev/null 2>&1 && TORCH_HAS_CUDA=1 || true
+import torch; assert torch.cuda.is_available()
+PY
+
+if [[ "$TORCH_HAS_CUDA" -eq 1 ]]; then
+  log "PyTorch already has CUDA support; skipping torch reinstall"
+elif command -v nvidia-smi >/dev/null 2>&1; then
+  CUDA_VER="$(nvidia-smi 2>/dev/null | grep -oP 'CUDA Version: \K[0-9]+\.[0-9]+' | head -1)"
+  CUDA_MAJOR="$(echo "$CUDA_VER" | cut -d. -f1)"
+  CUDA_MINOR="$(echo "$CUDA_VER" | cut -d. -f2)"
+  log "detected CUDA ${CUDA_VER} via nvidia-smi; selecting CUDA PyTorch wheel"
+  case "$CUDA_MAJOR" in
+    11) TORCH_INDEX="https://download.pytorch.org/whl/cu118" ;;
+    12)
+      if [[ "${CUDA_MINOR:-99}" -le 1 ]]; then
+        TORCH_INDEX="https://download.pytorch.org/whl/cu121"
+      else
+        TORCH_INDEX="https://download.pytorch.org/whl/cu124"
+      fi
+      ;;
+    *)
+      log "WARNING: unrecognised CUDA major version ${CUDA_MAJOR}; defaulting to cu124"
+      TORCH_INDEX="https://download.pytorch.org/whl/cu124"
+      ;;
+  esac
+  log "installing GPU torch from ${TORCH_INDEX}"
+  if [[ $USE_UV -eq 1 ]]; then
+    uv pip install torch --index-url "$TORCH_INDEX"
+  else
+    python -m pip install torch --index-url "$TORCH_INDEX"
+  fi
+else
+  log "nvidia-smi not found; keeping CPU-only PyTorch (no GPU detected)"
 fi
 
 # awscli lives outside requirements.txt (heavy, only needed by run.sh).

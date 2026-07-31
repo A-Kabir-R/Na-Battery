@@ -141,10 +141,36 @@ experiment:
 # as the variance reference.
 models:
   enabled_regressors:
+    # Baselines
     - DummyMean
+    - DummyMedian
     - PreviousRPT
+
+    # Linear models
     - Ridge
+    - Lasso
+    - ElasticNet
+
+    # Support-vector models
+    - SVR-linear
+    - SVR-RBF
+
+    # Distance-based model
+    - KNN
+
+    # Tree-based models
+    - DecisionTree
+    - RandomForest
     - ExtraTrees
+    - GradientBoosting
+
+    # Neural-network baseline
+    - MLP
+
+    # Gradient-boosting libraries
+    - XGBoost
+    - LightGBM
+    - CatBoost
 
 # ---------------------------------------------------------------------------
 # NaPINN-Q autograd-based physics-informed neural network configuration.
@@ -354,7 +380,7 @@ pinn:
     log_physics_metrics: true
 
   ablation:
-    enabled: true
+    enabled: false  # DISABLED: ablation suite deferred; re-enable when ready to run A0–A7
     configurations:
       - name: "A0_Data_Only"
         architecture: "NaPINN-Q"

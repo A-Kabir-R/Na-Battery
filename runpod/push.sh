@@ -72,6 +72,7 @@ CODE_EXCLUDES=(
   --exclude="artifacts/"
   --exclude="logs/"
   --exclude="runpod/downloads/"
+  --exclude="/preprocessing/"
   --exclude="results_*.tar.zst"
   --exclude="results_*.tar.gz"
   --exclude="results_*.meta.json"
@@ -98,6 +99,37 @@ rsync -avz --delete "${DRY_RUN[@]}" \
   "${CODE_EXCLUDES[@]}" \
   "${CODE_ROOT}/" \
   "${RUNPOD_SSH_USER}@${RUNPOD_SSH_HOST}:${POD_CODE_DIR}/"
+
+# Push pre-built canonical + feature tables so the pod can skip parsing.
+# preprocessing/ maps directly onto the pod's artifacts/ directory layout.
+if [[ -d "${CODE_ROOT}/preprocessing" ]]; then
+  echo "[push] rsyncing preprocessing -> ${POD_CODE_DIR}/artifacts/"
+  ssh "${SSH_OPTS[@]}" "${RUNPOD_SSH_USER}@${RUNPOD_SSH_HOST}" \
+    mkdir -p "${POD_CODE_DIR}/artifacts/canonical" \
+             "${POD_CODE_DIR}/artifacts/features" \
+             "${POD_CODE_DIR}/artifacts/splits"
+  rsync -avz "${DRY_RUN[@]}" \
+    -e "ssh ${SSH_OPTS[*]}" \
+    "${CODE_ROOT}/preprocessing/" \
+    "${RUNPOD_SSH_USER}@${RUNPOD_SSH_HOST}:${POD_CODE_DIR}/artifacts/"
+else
+  echo "[push] preprocessing/ not found locally; skipping pre-built tables push"
+fi
+
+# Fix pod.env so SIB_ARTIFACTS and SIB_CANONICAL always point to the correct
+# artifacts dir regardless of what setup.sh derived from r2.env.
+POD_ENV_REMOTE="${POD_CODE_DIR}/runpod/pod.env"
+echo "[push] patching pod.env SIB_ARTIFACTS and SIB_CANONICAL paths"
+ssh "${SSH_OPTS[@]}" "${RUNPOD_SSH_USER}@${RUNPOD_SSH_HOST}" bash -s <<REMOTE
+if [[ -f '${POD_ENV_REMOTE}' ]]; then
+  sed -i "s|SIB_ARTIFACTS='[^']*'|SIB_ARTIFACTS='${POD_CODE_DIR}/artifacts'|" '${POD_ENV_REMOTE}'
+  sed -i "s|SIB_CANONICAL='[^']*'|SIB_CANONICAL='${POD_CODE_DIR}/artifacts/canonical'|" '${POD_ENV_REMOTE}'
+  echo "[push:remote] pod.env patched:"
+  grep -E "SIB_ARTIFACTS|SIB_CANONICAL" '${POD_ENV_REMOTE}'
+else
+  echo "[push:remote] pod.env not found yet (run setup.sh first)"
+fi
+REMOTE
 
 if [[ ${#DRY_RUN[@]} -eq 0 ]]; then
   echo "[push] validating required pipeline files on pod"

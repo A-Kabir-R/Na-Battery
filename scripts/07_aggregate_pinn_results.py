@@ -63,7 +63,15 @@ def _iter_prediction_paths(run_root: Path):
 
 
 def _iter_epoch_logs(run_root: Path, *, include_failed: bool = False):
+    """Yield epoch-log paths (parquet preferred, CSV fallback) from completed runs.
+
+    When epoch_log.parquet is missing but epoch_log.csv exists in the same
+    directory (e.g., because the parquet write failed silently), the CSV path
+    is yielded instead so the training curves are not silently dropped.
+    """
+    seen_dirs: set[Path] = set()
     for epoch_log in sorted(run_root.rglob("epoch_log.parquet")):
+        seen_dirs.add(epoch_log.parent)
         status_path = epoch_log.parent.parent / "status.json"
         if not status_path.exists():
             if include_failed:
@@ -80,6 +88,26 @@ def _iter_epoch_logs(run_root: Path, *, include_failed: bool = False):
                 yield epoch_log
             continue
         yield epoch_log
+    # CSV fallback: pick up any logs_dir that has a CSV but no parquet.
+    for csv_log in sorted(run_root.rglob("epoch_log.csv")):
+        if csv_log.parent in seen_dirs:
+            continue  # parquet already handled this dir
+        status_path = csv_log.parent.parent / "status.json"
+        if not status_path.exists():
+            if include_failed:
+                yield csv_log
+            continue
+        try:
+            status = json.loads(status_path.read_text())
+        except Exception:
+            if include_failed:
+                yield csv_log
+            continue
+        if status.get("status") != "completed":
+            if include_failed:
+                yield csv_log
+            continue
+        yield csv_log
 
 
 def main() -> None:
@@ -284,7 +312,10 @@ def main() -> None:
         epoch_frames = []
         for path in tqdm(epoch_paths, desc="[pinn.aggregate] epoch logs", unit="run"):
             try:
-                epoch_frames.append(pd.read_parquet(path))
+                if path.suffix == ".csv":
+                    epoch_frames.append(pd.read_csv(path))
+                else:
+                    epoch_frames.append(pd.read_parquet(path))
             except Exception as exc:
                 logger.exception("failed_to_read_epoch_log",
                                  extra={"structured": {"path": str(path),

@@ -1,0 +1,41 @@
+feature,group,kind,role,unit,reference,source_columns,description,registry_version
+previous_rpt_Q_Ah,state,continuous,initial_state,Ah,previous_rpt,previous_rpt_Q_Ah,Capacity measured at the previous (already completed) RPT visit. NaPINN-Q initial state u_current.,unified-v1
+previous_rpt_SOH_pct,state,continuous,feature,%,previous_rpt,previous_rpt_SOH_pct,"Previous-RPT capacity relative to the cell's first valid RPT. Encodes initial_rpt_Q_Ah given previous_rpt_Q_Ah, so the baseline capacity is not registered separately.",unified-v1
+EFC_cum,state,continuous,stress_coordinate,equivalent_full_cycles,anchor_cycle,Q_discharge_Ah,Cumulative equivalent full cycles at the anchor. Canonical stress coordinate; cumulative_Ah_throughput is a scalar multiple and is deliberately not registered.,unified-v1
+DOD_pct,condition,continuous,feature,%,protocol_constant,DOD_pct,Nominal depth of discharge of the block.,unified-v1
+C_ch,condition,continuous,feature,1/h,protocol_constant,C_ch,Nominal charge C-rate of the block.,unified-v1
+C_dis,condition,continuous,feature,1/h,protocol_constant,C_dis,Nominal discharge C-rate of the block.,unified-v1
+T_degC,condition,continuous,feature,degC,protocol_constant,T_degC,Nominal chamber temperature of the block.,unified-v1
+visit_index,state,continuous,feature,count,protocol_constant,visit,"Zero-based index of the current cycling block for this cell. Copy of the ``visit`` identity column, registered under a distinct name so identity and feature namespaces never collide.",unified-v1
+Q_discharge_Ah,cycle_aggregate,continuous,feature,Ah,anchor_cycle,Q_discharge_Ah,Discharge capacity of the anchor cycle.,unified-v1
+coulombic_efficiency,cycle_aggregate,continuous,feature,ratio,anchor_cycle,Q_charge_Ah;Q_discharge_Ah,Q_discharge / Q_charge of the anchor cycle. Makes Q_charge_Ah and capacity_throughput_ratio redundant.,unified-v1
+energy_loss_Wh,cycle_aggregate,continuous,feature,Wh,anchor_cycle,E_charge_Wh;E_discharge_Wh,E_charge_Wh - E_discharge_Wh at the anchor cycle.,unified-v1
+voltage_hysteresis_V,cycle_aggregate,continuous,feature,V,anchor_cycle,E_charge_Wh;Q_charge_Ah;E_discharge_Wh;Q_discharge_Ah,"mean_charge_voltage - mean_discharge_voltage, each computed as E/Q with safe division.",unified-v1
+T_max,cycle_aggregate,continuous,feature,degC,anchor_cycle,T_max,Maximum measured cell temperature during the anchor cycle.,unified-v1
+temperature_span_C,cycle_aggregate,continuous,feature,degC,anchor_cycle,T_max;T_min,T_max - T_min at the anchor cycle.,unified-v1
+Q_discharge_Ah_r10_slope,temporal,continuous,feature,Ah/cycle,anchor_cycle_minus_9..anchor_cycle,Q_discharge_Ah,Robust backward slope of discharge capacity over the trailing 10 cycles.,unified-v1
+Q_discharge_Ah_r10_std,temporal,continuous,feature,Ah,anchor_cycle_minus_9..anchor_cycle,Q_discharge_Ah,"Backward rolling standard deviation of discharge capacity, 10 cycles.",unified-v1
+Q_discharge_Ah_dev_r10,temporal,continuous,feature,Ah,anchor_cycle_minus_9..anchor_cycle,Q_discharge_Ah,Anchor-cycle discharge capacity minus its trailing 10-cycle mean.,unified-v1
+coulombic_efficiency_r10_mean,temporal,continuous,feature,ratio,anchor_cycle_minus_9..anchor_cycle,coulombic_efficiency,"Backward rolling mean coulombic efficiency, 10 cycles.",unified-v1
+coulombic_efficiency_r10_slope,temporal,continuous,feature,1/cycle,anchor_cycle_minus_9..anchor_cycle,coulombic_efficiency,Robust backward slope of coulombic efficiency over 10 cycles. Gassing-sensitive.,unified-v1
+dqv_logvar,dqv,continuous,feature,log(Ah^2),block_first..block_last,Voltage;Ah_counter,log variance of Delta-Q(V) over the shared voltage grid (Severson).,unified-v1
+dqv_min,dqv,continuous,feature,Ah,block_first..block_last,Voltage;Ah_counter,Minimum of Delta-Q(V) over the shared voltage grid.,unified-v1
+dqv_l2,dqv,continuous,feature,Ah,block_first..block_last,Voltage;Ah_counter,L2 norm of Delta-Q(V) over the shared voltage grid.,unified-v1
+dqv_skew,dqv,continuous,feature,dimensionless,block_first..block_last,Voltage;Ah_counter,Skewness of the Delta-Q(V) distribution.,unified-v1
+dqv_v_at_max_abs_dev,dqv,continuous,feature,V,block_first..block_last,Voltage;Ah_counter,Voltage at which |Delta-Q(V)| is largest.,unified-v1
+dqv_overlap_span_V,dqv,continuous,feature,V,block_first..block_last,Voltage,Width of the shared voltage interval used for Delta-Q(V).,unified-v1
+icdv_dis_peak1_V_shift,icdv,continuous,feature,V,block_first..block_last,Voltage;Ah_counter,Voltage shift of the first discharge dQ/dV peak relative to the first complete cycle of the same block.,unified-v1
+icdv_dis_peak1_height_change,icdv,continuous,feature,Ah/V,block_first..block_last,Voltage;Ah_counter,Signed change in the first discharge dQ/dV peak height relative to the first complete cycle of the same block.,unified-v1
+thermal_discharge_rise_degC,thermal,continuous,feature,degC,anchor_cycle,Temperature,Temperature rise across the anchor cycle's discharge phase.,unified-v1
+thermal_max_dTdt_degC_s,thermal,continuous,feature,degC/s,anchor_cycle,Temperature;Time,Maximum |dT/dt| during the anchor cycle.,unified-v1
+thermal_rise_per_Ah,thermal,continuous,feature,degC/Ah,anchor_cycle,Temperature;Ah_counter,Discharge temperature rise divided by discharged capacity.,unified-v1
+dcir_prev_rpt_discharge_ohm,resistance,continuous,feature,ohm,previous_rpt,Voltage;Current,Discharge-side DC internal resistance dV/dI at the previous RPT.,unified-v1
+dcir_prev_rpt_delta_from_baseline_ohm,resistance,continuous,feature,ohm,initial_rpt..previous_rpt,Voltage;Current,Previous-RPT DCIR minus the cell's first valid RPT DCIR.,unified-v1
+inverse_temperature_1_K,interaction,continuous,feature,1/K,protocol_constant,T_degC,1 / (T_degC + 273.15). No activation energy is assumed.,unified-v1
+stress_x_DOD_fraction,interaction,continuous,feature,equivalent_full_cycles,anchor_cycle,Q_discharge_Ah;DOD_pct,EFC_cum * (DOD_pct / 100).,unified-v1
+stress_x_inverse_temperature,interaction,continuous,feature,EFC/K,anchor_cycle,Q_discharge_Ah;T_degC,EFC_cum * inverse_temperature_1_K.,unified-v1
+stress_x_C_dis,interaction,continuous,feature,EFC/h,anchor_cycle,Q_discharge_Ah;C_dis,EFC_cum * C_dis.,unified-v1
+dqv_available,flag,flag,feature,bool,block_first..block_last,Voltage;Ah_counter,1 when Delta-Q(V) had a usable shared voltage interval.,unified-v1
+icdv_available,flag,flag,feature,bool,block_first..block_last,Voltage;Ah_counter,1 when a reproducible first discharge dQ/dV peak was found in both the anchor and the block-reference cycle.,unified-v1
+dcir_available,flag,flag,feature,bool,previous_rpt,Voltage;Current,1 when the previous RPT contained a valid current step.,unified-v1
+temporal_window_available,flag,flag,feature,bool,anchor_cycle_minus_9..anchor_cycle,Q_discharge_Ah,1 when at least MIN_TEMPORAL_OBSERVATIONS complete cycles precede the anchor within the block.,unified-v1
