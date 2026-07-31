@@ -245,11 +245,13 @@ def _fit_partition(train: pd.DataFrame, test: pd.DataFrame, *, target: str,
 def _model_importance(estimator: Any, features: list[str]) -> pd.DataFrame:
     if not features or estimator is None or isinstance(estimator, dict):
         return pd.DataFrame()
-    if hasattr(estimator, "feature_importances_"):
-        values = np.asarray(estimator.feature_importances_, dtype=float)
+    # Unwrap GridSearchCV to access the best fitted estimator
+    inner = getattr(estimator, "best_estimator_", estimator)
+    if hasattr(inner, "feature_importances_"):
+        values = np.asarray(inner.feature_importances_, dtype=float)
         importance_type = "feature_importance"
-    elif hasattr(estimator, "coef_"):
-        coefficients = np.asarray(estimator.coef_, dtype=float)
+    elif hasattr(inner, "coef_"):
+        coefficients = np.asarray(inner.coef_, dtype=float)
         values = np.abs(coefficients) if coefficients.ndim == 1 else np.mean(np.abs(coefficients), axis=0)
         importance_type = "absolute_coefficient"
     else:
@@ -281,6 +283,7 @@ def _diagnostic_curve(data: pd.DataFrame, train_indices: np.ndarray, target: str
     inner_train, inner_val = next(iter(make_folds(
         outer_train,
         n_splits=inner_splits,
+        stratify_col=None,
         random_state=random_state,
     )))
     assert_no_cell_overlap(inner_train, inner_val, outer_train["cell"])

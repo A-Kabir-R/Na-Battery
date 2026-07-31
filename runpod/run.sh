@@ -268,6 +268,23 @@ run_cmd(){
   fi
 }
 
+# require_cuda — fail-fast check before any PINN stage.
+# Prints diagnostics and returns non-zero when CUDA is unavailable.
+require_cuda(){
+  python - <<'PY'
+import sys, torch
+print(f"[CUDA CHECK] torch={torch.__version__}  build={torch.version.cuda}  available={torch.cuda.is_available()}")
+if not torch.cuda.is_available():
+    print(
+        "[FATAL] CUDA is unavailable in the active Python environment. "
+        "PINN training must not fall back to CPU.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+print(f"[CUDA CHECK] device={torch.cuda.get_device_name(0)}")
+PY
+}
+
 log "===== pipeline start (stages: $RUN_STAGES) ====="
 for stage in "${STAGES[@]}"; do
   case "$stage" in
@@ -316,13 +333,15 @@ for stage in "${STAGES[@]}"; do
       # suite instead of burning time on a broken deployment.
       run_cmd tests python -m pytest tests/ -q -x
       ;;
-    experiments) run_stage experiments scripts/02_run_all_experiments.py ;;
+    experiments) run_stage experiments scripts/02_run_all_experiments.py --tuned ;;
     degradation) run_stage degradation scripts/05_analyze_degradation.py ;;
     aggregate)   run_stage aggregate   scripts/03_aggregate_results.py ;;
     plot)        run_stage plot        scripts/04_plot_results.py ;;
     pinn)
       # Primary result: seed 42 only. This is the seed every tuning decision
       # was made on, and the only one that may appear as a headline number.
+      export SIB_DEVICE=cuda
+      require_cuda || { PIPELINE_RC=1; continue; }
       run_stage pinn scripts/06_run_pinn_experiments.py \
         --seed "${SIB_PRIMARY_SEED:-42}"
       ;;
@@ -334,21 +353,28 @@ for stage in "${STAGES[@]}"; do
       if [[ $PIPELINE_RC -ne 0 ]]; then
         log "skipping stage 'pinn_seeds' — earlier stage failed"
       else
-        for extra_seed in ${SIB_SPREAD_SEEDS:-43 44 45 46}; do
-          log "===== stage: pinn_seeds (seed=$extra_seed) ====="
-          t0=$SECONDS
-          python scripts/06_run_pinn_experiments.py --seed "$extra_seed"
-          rc=$?
-          log "pinn_seeds seed=$extra_seed finished rc=$rc in $((SECONDS - t0))s"
-          if [[ $rc -ne 0 ]]; then
-            log "WARNING: spread seed $extra_seed failed; primary seed result is unaffected"
-          fi
-        done
+        export SIB_DEVICE=cuda
+        if ! require_cuda; then
+          log "WARNING: pinn_seeds skipped — CUDA unavailable"
+        else
+          for extra_seed in ${SIB_SPREAD_SEEDS:-43 44 45 46}; do
+            log "===== stage: pinn_seeds (seed=$extra_seed) ====="
+            t0=$SECONDS
+            python scripts/06_run_pinn_experiments.py --seed "$extra_seed"
+            rc=$?
+            log "pinn_seeds seed=$extra_seed finished rc=$rc in $((SECONDS - t0))s"
+            if [[ $rc -ne 0 ]]; then
+              log "WARNING: spread seed $extra_seed failed; primary seed result is unaffected"
+            fi
+          done
+        fi
       fi
       ;;
     pinn_smoke)
       # Short single-fold wiring check: dropout active, hard IC enforced,
       # PDE gradients non-zero, checkpoint eligibility and refit curriculum sane.
+      export SIB_DEVICE=cuda
+      require_cuda || { PIPELINE_RC=1; continue; }
       run_stage pinn_smoke scripts/06_run_pinn_experiments.py \
         --smoke-test --fold 0 --seed "${SIB_PRIMARY_SEED:-42}"
       ;;

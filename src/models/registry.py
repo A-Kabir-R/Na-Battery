@@ -7,11 +7,15 @@ from ..io.loaders import load_config
 from .classifiers import NEEDS_SCALING as CLF_NEEDS_SCALING
 from .classifiers import build_classifiers
 from .regressors import NEEDS_SCALING as REG_NEEDS_SCALING
-from .regressors import build_regressors
+from .regressors import build_regressors, build_tuned_regressors
 
 
 def regressors() -> Dict[str, Any]:
     return build_regressors()
+
+
+def tuned_regressors() -> Dict[str, Any]:
+    return build_tuned_regressors()
 
 
 def classifiers() -> Dict[str, Any]:
@@ -83,6 +87,32 @@ def enabled_regressors(cfg: Mapping[str, Any] | None = None,
     available = build_regressors()
     # Optional packages may be absent from the registry when not installed.
     # Warn and skip rather than aborting the pipeline.
+    filtered_names: List[str] = []
+    if names is not None and not isinstance(names, (str, bytes)):
+        for name in names:
+            if name in _OPTIONAL_REGRESSORS and name not in available:
+                print(f"[registry] WARNING: {name} requested but package not installed; skipping.")
+            else:
+                filtered_names.append(name)
+        names = filtered_names
+    resolved = _validate_allowlist(names, available, "models.enabled_regressors")
+    result: Dict[str, Any] = {name: available[name] for name in resolved}
+    _apply_n_jobs(result, model_n_jobs)
+    return result
+
+
+def enabled_tuned_regressors(cfg: Mapping[str, Any] | None = None,
+                             model_n_jobs: int | None = None) -> Dict[str, Any]:
+    """Same as enabled_regressors() but every model is wrapped in GridSearchCV.
+
+    Uses the same allowlist from ``models.enabled_regressors`` in config so
+    you can run tuned and untuned experiments on the same model set.
+    """
+    if cfg is None:
+        cfg = load_config()
+    model_cfg = (cfg.get("models") or {}) if isinstance(cfg, Mapping) else {}
+    names = model_cfg.get("enabled_regressors")
+    available = build_tuned_regressors()
     filtered_names: List[str] = []
     if names is not None and not isinstance(names, (str, bytes)):
         for name in names:

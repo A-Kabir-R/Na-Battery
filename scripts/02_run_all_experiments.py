@@ -2,12 +2,20 @@
 
 Writes long-format results to the configured results directory
 (``artifacts/results/[experiment.results_subdir/]raw_results.csv``).
+
+All console output, Python warnings, and per-model training messages are
+mirrored to a timestamped log file under ``paths.logs`` (configured in
+config.yaml, default: code/logs/).  The exact log path is printed at startup.
 """
 from __future__ import annotations
 
 import argparse
+import io
+import logging
 import sys
 import time
+import warnings
+from datetime import datetime
 from itertools import product
 from pathlib import Path
 
@@ -19,7 +27,8 @@ from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 
 from src.io.loaders import load_config
-from src.models.registry import enabled_classifiers, enabled_regressors
+from src.models.registry import (enabled_classifiers, enabled_regressors,
+                                  enabled_tuned_regressors)
 from src.pipeline.run_experiment import (CLASSIFICATION_TARGETS,
                                           REGRESSION_TARGETS, run_one)
 from src.splits.group_kfold import (
@@ -27,6 +36,76 @@ from src.splits.group_kfold import (
     validate_locked_split_manifest,
 )
 from src.utils.progress import tqdm_joblib
+
+
+class _Tee(io.TextIOBase):
+    """Forwards every write to both the original stream and a log file."""
+
+    def __init__(self, original: io.TextIOBase, log_file: io.TextIOBase) -> None:
+        self._orig = original
+        self._log = log_file
+
+    def write(self, text: str) -> int:
+        self._orig.write(text)
+        self._orig.flush()
+        self._log.write(text)
+        self._log.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        self._orig.flush()
+        self._log.flush()
+
+    def fileno(self):
+        return self._orig.fileno()
+
+    @property
+    def encoding(self):
+        return getattr(self._orig, "encoding", "utf-8")
+
+
+def _setup_logging(log_dir: Path, tuned: bool) -> Path:
+    """Route all stdout, stderr, Python logging, and warnings to a log file.
+
+    Returns the path to the log file so it can be printed before redirection.
+    """
+    log_dir.mkdir(parents=True, exist_ok=True)
+    suffix = "_tuned" if tuned else ""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"classical_training{suffix}_{stamp}.log"
+
+    log_file = open(log_path, "w", encoding="utf-8", buffering=1)
+
+    # Write a header so the file is self-identifying
+    log_file.write(
+        f"# classical training log\n"
+        f"# started : {datetime.now().isoformat(timespec='seconds')}\n"
+        f"# mode    : {'tuned (GridSearchCV)' if tuned else 'default hyperparameters'}\n"
+        f"# python  : {sys.version}\n"
+        f"# argv    : {' '.join(sys.argv)}\n"
+        f"# {'=' * 70}\n\n"
+    )
+
+    # Tee stdout and stderr so terminal output continues AND goes to the file
+    sys.stdout = _Tee(sys.__stdout__, log_file)
+    sys.stderr = _Tee(sys.__stderr__, log_file)
+
+    # Route Python's logging module to the same file
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    root_logger.addHandler(fh)
+
+    # Route all Python warnings (sklearn, joblib, numpy, …) to logging
+    logging.captureWarnings(True)
+    warnings.simplefilter("always")
+
+    return log_path
 
 #: Fallback only. The active list comes from
 #: ``experiment.preprocessing_levels`` in config.yaml, which is ["unified"].
@@ -60,12 +139,25 @@ def _parse_args() -> argparse.Namespace:
         "--dry-run", action="store_true",
         help="List the planned (preprocessing, target, model) combinations without fitting.",
     )
+    parser.add_argument(
+        "--tuned", action="store_true",
+        help=(
+            "Wrap every classical model in GridSearchCV (3-fold inner CV, scored on R²) "
+            "to eliminate negative R² from untuned defaults. Substantially slower."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
     cfg = load_config()
+
+    # Set up logging BEFORE any other output so nothing is missed
+    log_dir = Path(cfg["paths"]["logs"])
+    log_path = _setup_logging(log_dir, tuned=args.tuned)
+    print(f"[run] logging all output to: {log_path}", flush=True)
+
     features_dir = Path(cfg["paths"]["artifacts"]) / "features"
     results_dir = _results_dir(cfg)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -87,7 +179,11 @@ def main() -> None:
         (cfg.get("experiment") or {}).get("evaluate_holdout", False)
     )
 
-    reg_models = enabled_regressors(cfg, model_n_jobs=model_n_jobs)
+    if args.tuned:
+        reg_models = enabled_tuned_regressors(cfg, model_n_jobs=model_n_jobs)
+        print("[run] mode: TUNED (GridSearchCV inner 3-fold, scoring=r2)", flush=True)
+    else:
+        reg_models = enabled_regressors(cfg, model_n_jobs=model_n_jobs)
     clf_models = enabled_classifiers(cfg, model_n_jobs=model_n_jobs) if CLF_TARGETS else {}
 
     reg_names = list(reg_models.keys())
@@ -224,7 +320,16 @@ def main() -> None:
             print(failed[[
                 "preprocessing", "target", "model", "fold", "error_message",
             ]].drop_duplicates().to_string(index=False))
+        print(f"[run] FINISHED WITH ERRORS at {datetime.now().isoformat(timespec='seconds')}",
+              flush=True)
         raise SystemExit("experiment stage incomplete; refusing aggregation and publication plots")
+
+    print(
+        f"[run] ALL EXPERIMENTS COMPLETE — "
+        f"finished at {datetime.now().isoformat(timespec='seconds')} | "
+        f"log saved to: {log_path}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

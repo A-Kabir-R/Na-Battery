@@ -150,10 +150,19 @@ elif command -v nvidia-smi >/dev/null 2>&1; then
   esac
   log "installing GPU torch from ${TORCH_INDEX}"
   if [[ $USE_UV -eq 1 ]]; then
-    uv pip install torch --index-url "$TORCH_INDEX"
+    uv pip install --reinstall torch --index-url "$TORCH_INDEX"
   else
-    python -m pip install torch --index-url "$TORCH_INDEX"
+    python -m pip install --force-reinstall torch --index-url "$TORCH_INDEX"
   fi
+  # Hard assertion: abort if CUDA still unavailable after the reinstall.
+  python - <<'PY'
+import sys, torch
+print(f"[setup] PyTorch {torch.__version__}  CUDA build={torch.version.cuda}  cuda_available={torch.cuda.is_available()}")
+if not torch.cuda.is_available():
+    print("[setup] FATAL: CUDA-enabled torch install failed — GPU would not be used for PINN training.", file=sys.stderr)
+    sys.exit(1)
+print(f"[setup] GPU: {torch.cuda.get_device_name(0)}")
+PY
 else
   log "nvidia-smi not found; keeping CPU-only PyTorch (no GPU detected)"
 fi
