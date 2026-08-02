@@ -26,7 +26,7 @@ set -a; source "$ENV_FILE"; set +a
 : "${RUNPOD_SSH_KEY:=$HOME/.ssh/id_ed25519}"
 : "${POD_ROOT:=/workspace/sib}"
 : "${POD_CODE_DIR:=${POD_ROOT}/code}"
-: "${POD_DATA_STATICS_DIR:=${POD_ROOT}/data statics}"
+: "${POD_DATA_STATICS_DIR:=${POD_CODE_DIR}/data_statics}"
 
 RUNPOD_SSH_KEY="${RUNPOD_SSH_KEY/#\~/$HOME}"
 SSH_OPTS=(-i "$RUNPOD_SSH_KEY" -p "$RUNPOD_SSH_PORT" -o StrictHostKeyChecking=accept-new)
@@ -160,7 +160,7 @@ fi
 if [[ $CODE_ONLY -eq 0 ]]; then
   # Only push what the ML pipeline actually reads: tables + parse_errors log.
   # Skip the ~hundreds-of-MB plots/ tree.
-  DS_LOCAL="${PROJECT_ROOT}/data statics"
+  DS_LOCAL="${CODE_ROOT}/data_statics"
   if [[ ! -d "${DS_LOCAL}/tables" ]]; then
     echo "[push] WARNING: ${DS_LOCAL}/tables not found — the pod won't have the CSVs the pipeline needs."
   else

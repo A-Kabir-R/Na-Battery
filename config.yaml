@@ -3,7 +3,7 @@ paths:
   #   ${env:VAR:-default}  ->  os.environ["VAR"] if set, else "default"
   # This lets the same config work on the laptop and on RunPod.
   root:         "${env:SIB_ROOT:-/media/kabir/Research/Project/sodium battery /Data_Failure_Mode_and_Degradation_Analysis_of_a_Commercial_Sodium-Ion_Battery_With_Severe_Gassing_Issue/Standard cycling}"
-  data_statics: "${env:SIB_DATA_STATICS:-${paths.root}/data statics}"
+  data_statics: "${env:SIB_DATA_STATICS:-${paths.root}/code/data_statics}"
   # DOD*/CU_at_25degC/*.ird and DOD*/Cycling_Periods/*.ird live under this root.
   # On laptop it's the same as `paths.root`; on the pod it points at the extracted dataset dir.
   dataset_root: "${env:SIB_DATASET_ROOT:-${paths.root}}"

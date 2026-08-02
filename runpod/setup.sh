@@ -19,7 +19,7 @@ POD_ENV_FILE="$HERE/pod.env"
 : "${POD_WORKSPACE:=/workspace}"
 : "${POD_ROOT:=/workspace/sib}"
 : "${POD_CODE_DIR:=${CODE_DIR}}"
-: "${POD_DATA_STATICS_DIR:=${POD_ROOT}/data statics}"
+: "${POD_DATA_STATICS_DIR:=${POD_CODE_DIR}/data_statics}"
 : "${POD_DATASET_DIR:=${POD_ROOT}/dataset}"
 POD_RESULTS_DIR="${POD_CODE_DIR}/artifacts"
 
