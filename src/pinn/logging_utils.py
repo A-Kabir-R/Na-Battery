@@ -19,6 +19,7 @@ import json
 import logging
 import sys
 import time
+from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -46,18 +47,28 @@ class JsonLineFormatter(logging.Formatter):
 
 
 def get_logger(script_name: str, log_dir: Path | str | None = None,
-               level: int = logging.INFO) -> logging.Logger:
+               level: int = logging.INFO,
+               file_level: int = logging.DEBUG) -> logging.Logger:
     """Return a logger writing to console + ``<log_dir>/<script_name>_<ts>.log``.
 
     Repeated calls with the same ``script_name`` reuse the same logger without
     duplicating handlers.
+
+    ``level`` controls the console; ``file_level`` controls both file handlers
+    and defaults to DEBUG so that everything the run emits lands on disk. That
+    split matters: ``log_epoch_summary`` and ``log_fold_curriculum_state`` emit
+    at DEBUG, so with a single INFO threshold every per-epoch and per-curriculum
+    record was discarded before reaching a handler -- the training history was
+    unavailable for debugging even though the code was writing it.
     """
     key = f"{LOGGER_NAMESPACE}.{script_name}"
     if key in _INITIALIZED:
         return _INITIALIZED[key]
 
     logger = logging.getLogger(key)
-    logger.setLevel(level)
+    # The logger itself must sit at the most permissive level of any handler,
+    # otherwise it filters records out before the handlers ever see them.
+    logger.setLevel(min(level, file_level))
     logger.propagate = False
 
     console = logging.StreamHandler(stream=sys.stdout)
@@ -80,14 +91,14 @@ def get_logger(script_name: str, log_dir: Path | str | None = None,
         text_handler.setFormatter(logging.Formatter(
             "%(asctime)sZ [%(levelname)s] %(name)s :: %(message)s",
         ))
-        text_handler.setLevel(level)
+        text_handler.setLevel(file_level)
         logger.addHandler(text_handler)
 
         jsonl_handler = RotatingFileHandler(
             jsonl_path, maxBytes=25 * 1024 * 1024, backupCount=5, encoding="utf-8",
         )
         jsonl_handler.setFormatter(JsonLineFormatter())
-        jsonl_handler.setLevel(level)
+        jsonl_handler.setLevel(file_level)
         logger.addHandler(jsonl_handler)
 
         logger.info("logging_initialized",
@@ -212,3 +223,78 @@ def log_failure(logger: logging.Logger, message: str, exc: BaseException,
     logger.exception(message, extra={"structured": {**fields,
                                                      "error_type": type(exc).__name__,
                                                      "error_message": str(exc)}})
+
+
+class _Tee:
+    """Duplicate a stream to a file. Used to capture stdout into the run log."""
+
+    def __init__(self, stream, handle) -> None:
+        self._stream = stream
+        self._handle = handle
+
+    def write(self, data: str) -> int:
+        self._stream.write(data)
+        self._handle.write(data)
+        self._handle.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        self._stream.flush()
+        self._handle.flush()
+
+    def isatty(self) -> bool:
+        return getattr(self._stream, "isatty", lambda: False)()
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+
+@contextmanager
+def run_log(script_name: str, log_dir: Path | str, **context: Any):
+    """Logger + captured stdout + a persisted traceback, for one script run.
+
+    Every study script printed its results to stdout and nowhere else, so a run
+    that finished hours ago left nothing to debug from. This wraps a script body
+    so that the console output, the structured events and any crash all land in
+    ``<log_dir>/<script_name>_<timestamp>.{log,jsonl,stdout.log}``.
+
+    Usage::
+
+        with run_log("11_run_generalization_study", log_dir) as logger:
+            ...
+
+    The traceback is written before the exception is re-raised, so a crash is
+    still a crash -- it is simply also on disk.
+    """
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    stdout_path = log_dir / f"{script_name}_{timestamp}.stdout.log"
+
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    handle = stdout_path.open("w", encoding="utf-8")
+    # Swap *before* get_logger: its console handler binds whatever sys.stdout is
+    # at construction time, so building the logger first left every logger line
+    # out of the captured file.
+    sys.stdout = _Tee(original_stdout, handle)
+    # stderr too. Skipped figures and every other warnings.warn go here, and a
+    # run that quietly rendered half its figure set is exactly what this log is
+    # supposed to explain afterwards.
+    sys.stderr = _Tee(original_stderr, handle)
+
+    logger = get_logger(script_name, log_dir)
+    log_event(logger, logging.INFO, "script_start", script=script_name, **context)
+
+    started = time.time()
+    try:
+        yield logger
+    except BaseException as exc:
+        log_failure(logger, "script_failed", exc, script=script_name)
+        raise
+    else:
+        log_event(logger, logging.INFO, "script_complete", script=script_name,
+                  elapsed_s=round(time.time() - started, 2),
+                  stdout_log=str(stdout_path))
+    finally:
+        sys.stdout, sys.stderr = original_stdout, original_stderr
+        handle.close()

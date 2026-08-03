@@ -1,0 +1,64 @@
+name: CI
+
+# CPU-only. The GPU path is exercised manually via scripts/06 --smoke-test;
+# nothing here needs CUDA, and pinning the suite to CPU keeps it reproducible
+# across runners.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          # CPU wheel only: the CUDA build is ~2 GB and buys nothing here.
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt
+          python -m pip install -e ".[test]"
+
+      - name: Test
+        run: python -m pytest tests/ -q --durations=10
+
+      - name: Leakage guards
+        # These encode the correctness properties that are expensive to notice
+        # by eye and cheap to assert: no cell on both sides of any split, and no
+        # metric column carrying a value that contradicts its label.
+        run: |
+          python -m pytest tests/ -q \
+            tests/test_grouped_inner_cv.py \
+            tests/test_condition_holdout.py \
+            tests/test_inner_fold_partition.py \
+            tests/test_pinn_splits.py \
+            tests/test_locked_group_split.py
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install ruff
+      - run: python -m ruff check src scripts tests

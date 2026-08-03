@@ -344,4 +344,38 @@ def add_target(df: pd.DataFrame, cu_cache: pd.DataFrame | None = None) -> pd.Dat
             out.at[anchor_index, "next_rpt_horizon_days"] = (
                 next_rpt["cu_start_time"] - anchor_time
             ).total_seconds() / 86400.0
+    return _drop_non_adjacent_blocks(out)
+
+
+def _drop_non_adjacent_blocks(out: pd.DataFrame) -> pd.DataFrame:
+    """Retain one anchor per (cell, next RPT): the block adjacent to the target.
+
+    A cell may run several CYC blocks with no RPT between them (observed for
+    ``S2000FM42G``: CYC V03, V04, V05 all sit between CU V02 and CU V06). Every
+    such block is an anchor pointing at the same next RPT, which gives duplicate
+    targets on non-independent rows, and for the earlier blocks the features
+    cover only part of the previous-RPT-to-next-RPT interval while the stress
+    delta spans all of it. Only the last block before the target satisfies the
+    contract, so the earlier ones are demoted to unavailable rather than
+    silently regressed on.
+    """
+    targeted = out["next_rpt_path"].notna()
+    if not targeted.any():
+        return out
+    # Closest to the target in time wins; visit order breaks ties when the
+    # horizon is unavailable (visit-fallback matches carry no horizon).
+    order = out.loc[targeted].sort_values(
+        ["next_rpt_horizon_days", "visit"],
+        ascending=[True, False],
+        na_position="last",
+        kind="mergesort",
+    )
+    keep = order.groupby(["condition", "cell", "next_rpt_path"], sort=False).head(1).index
+    superseded = out.index[targeted].difference(keep)
+    if len(superseded) == 0:
+        return out
+    for column in (TARGET, SOH_TARGET, DELTA_Q_TARGET, DELTA_SOH_TARGET):
+        out.loc[superseded, column] = np.nan
+    out.loc[superseded, "next_rpt_target_status"] = "unavailable"
+    out.loc[superseded, "target_unavailable_reason"] = "superseded_by_adjacent_block"
     return out

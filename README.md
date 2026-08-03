@@ -84,7 +84,7 @@ are resumed only when every required artifact exists and its fingerprint matches
 `artifacts/results/` includes prediction-level pooled and macro metrics, grouped
 bootstrap intervals, per-cell/per-condition tables, horizon results, prediction
 plausibility, feature stability/importance, RPT degradation summaries, and both
-300-dpi PNG and vector PDF figures.
+vector PDF plus 300-dpi PNG figures (config: `plotting.formats`).
 
 ## Scientific Blockers
 

@@ -6,17 +6,22 @@
 #   bash runpod/run.sh 2>&1 | tee run.log
 #
 # Runs, in order (override with RUN_STAGES in r2.env):
-#   1. scripts/00_build_canonical.py               — raw IRD -> canonical tables + QC
-#   2. scripts/01_build_features.py                — parquets for P1/P2/P3
-#   3. scripts/05_analyze_degradation.py           — RPT-SOH and projected threshold tables
-#   4. scripts/02_run_all_experiments.py           — locked 75/25 + five-fold CV (classical)
-#   5. scripts/03_aggregate_results.py             — pooled/macro/bootstrap classical tables
-#   6. scripts/04_plot_results.py                  — classical publication figure suite
-#   7. scripts/06_run_pinn_experiments.py          — DNN-Q + NaPINN-Q fold training
-#   8. scripts/07_aggregate_pinn_results.py        — PINN metric aggregation
-#   9. scripts/08_plot_pinn_results.py             — PINN publication plots
-#  10. scripts/10_run_pinn_ablations.py            — physics ablation A0..A5
-#  11. scripts/09_combine_classical_pinn_results.py — combined report
+#   scripts/00_build_canonical.py                 — raw IRD -> canonical tables + QC
+#   scripts/01_build_features.py                  — unified anchor table
+#   scripts/05_analyze_degradation.py             — RPT-SOH and projected thresholds
+#   scripts/02_run_all_experiments.py             — locked 75/25 + five-fold CV (classical)
+#   scripts/03_aggregate_results.py               — pooled/macro/bootstrap classical tables
+#   scripts/04_plot_results.py                    — classical figure suite
+#   scripts/06_run_pinn_experiments.py            — NaPINN-Q fold training
+#   scripts/07_aggregate_pinn_results.py          — PINN metric aggregation
+#   scripts/08_plot_pinn_results.py               — PINN plots
+#   scripts/10_run_pinn_ablations.py              — physics ablations
+#   scripts/11_run_generalization_study.py        — LOCO + factor-level holdouts
+#   scripts/12_run_low_data_study.py              — learning curves in training cells
+#   scripts/13_run_uncertainty_study.py           — grouped conformal + coverage
+#   scripts/14_run_robustness_study.py            — input perturbations
+#   scripts/15_run_nested_pinn_selection.py       — nested epoch selection (GPU)
+#   scripts/09_combine_classical_pinn_results.py  — combined report
 #
 # Exit codes: 0 = pipeline + upload + shutdown attempted. Non-zero = pipeline
 # stage failed; we STILL try to upload whatever exists but leave the pod up.
@@ -59,8 +64,9 @@ echo "[run] r2.env loaded  R2_BUCKET=${R2_BUCKET:-<unset>}  STOP_MODE=${STOP_MOD
 : "${R2_PREFIX:=sodium_ion_battery}"
 : "${RUN_STAGES:=all}"
 
-# Expand the alias 'all' to the full classical + PINN pipeline.
-# NOTE: pinn_ablation is excluded — ablation suite is deferred (re-enable A0–A7 in future).
+# Expand the alias 'all' to the legacy classical + PINN pipeline.
+# For a manuscript run use the 'paper' alias below, which adds the ablations and
+# the four study scripts.
 if [[ "$RUN_STAGES" == "all" ]]; then
   RUN_STAGES="canonical,build,degradation,experiments,aggregate,plot,pinn,pinn_aggregate,pinn_plot,combined_report"
 fi
@@ -69,7 +75,6 @@ fi
 # everything else: the whole point of the revision is that the wiring is
 # verified, so a failing test must stop the run before hours of GPU time.
 # 'pinn' trains the primary seed only; 'pinn_seeds' adds the robustness spread.
-# NOTE: pinn_ablation excluded — deferred for future work.
 if [[ "$RUN_STAGES" == "revision" ]]; then
   RUN_STAGES="tests,build_unified,degradation,experiments,aggregate,plot,pinn,pinn_seeds,pinn_aggregate,pinn_plot,combined_report"
 fi
@@ -83,6 +88,23 @@ fi
 # Fast wiring check: tests + feature build + one short fold per model.
 if [[ "$RUN_STAGES" == "revision_smoke" ]]; then
   RUN_STAGES="tests,build_unified,pinn_smoke"
+fi
+
+# The four paper studies only. CPU-viable: none of them touch CUDA, so this can
+# run on a cheap pod while a GPU pod trains.
+if [[ "$RUN_STAGES" == "studies" ]]; then
+  RUN_STAGES="generalization,low_data,uncertainty,robustness,paper_figures"
+fi
+
+# Everything the manuscript needs: the revision pipeline plus nested epoch
+# selection, the ablation suite and the four studies.
+#
+# 'pinn_nested' is not optional here. The refit epoch count is a hyperparameter,
+# and selecting it on the outer validation fold is the leak nested CV exists to
+# close; a manuscript run that skips it cannot claim a nested protocol.
+# It runs before 'pinn' so the primary fit uses the selected epoch count.
+if [[ "$RUN_STAGES" == "paper" ]]; then
+  RUN_STAGES="tests,build_unified,degradation,experiments,aggregate,plot,pinn_nested,pinn,pinn_seeds,pinn_aggregate,pinn_ablation,pinn_plot,generalization,low_data,uncertainty,robustness,paper_figures,combined_report"
 fi
 
 log(){ printf '\n[run %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -135,12 +157,28 @@ REQUIRED_SOURCE=(
   scripts/07_aggregate_pinn_results.py
   scripts/08_plot_pinn_results.py
   scripts/09_combine_classical_pinn_results.py
-  # scripts/10_run_pinn_ablations.py  # DEFERRED
+  scripts/10_run_pinn_ablations.py
+  scripts/11_run_generalization_study.py
+  scripts/12_run_low_data_study.py
+  scripts/13_run_uncertainty_study.py
+  scripts/14_run_robustness_study.py
+  scripts/15_run_nested_pinn_selection.py
+  scripts/16_make_paper_figures.py
   src/io/canonical.py
   src/preprocessing/protocol_segmentation.py
-  src/preprocessing/p3_waveform.py
+  # src/preprocessing/p3_waveform.py was retired with the P1/P2/P3 pipeline.
+  # Requiring it here aborted every alias before the first stage ran.
   src/splits/group_kfold.py
+  src/splits/condition_holdout.py
+  src/models/degradation_baselines.py
+  src/evaluation/conformal.py
+  src/evaluation/low_data.py
+  src/evaluation/robustness.py
   src/evaluation/report.py
+  src/evaluation/paper_figures.py
+  src/pinn/config_builder.py
+  src/pinn/degradation_laws.py
+  src/pinn/nested_selection.py
   src/pinn/__init__.py
   src/pinn/dataset.py
   src/pinn/models.py
@@ -285,6 +323,15 @@ print(f"[CUDA CHECK] device={torch.cuda.get_device_name(0)}")
 PY
 }
 
+# use_gpu — every stage that trains a PINN must call this first. Pins the device
+# and refuses to continue without CUDA. A PINN stage that quietly falls back to
+# CPU does not fail, it just produces a result days late and off-protocol, which
+# is the failure mode worth spending a hard check on.
+use_gpu(){
+  export SIB_DEVICE=cuda
+  require_cuda
+}
+
 log "===== pipeline start (stages: $RUN_STAGES) ====="
 for stage in "${STAGES[@]}"; do
   case "$stage" in
@@ -325,7 +372,7 @@ for stage in "${STAGES[@]}"; do
       else
         # Only cu_capacity + unified.parquet. Much cheaper than the full build:
         # two cycles per CYC file instead of every cycle.
-        run_stage build_unified scripts/01_build_features.py --unified-only
+        run_stage build_unified scripts/01_build_features.py
       fi
       ;;
     tests)
@@ -340,8 +387,7 @@ for stage in "${STAGES[@]}"; do
     pinn)
       # Primary result: seed 42 only. This is the seed every tuning decision
       # was made on, and the only one that may appear as a headline number.
-      export SIB_DEVICE=cuda
-      require_cuda || { PIPELINE_RC=1; continue; }
+      use_gpu || { PIPELINE_RC=1; continue; }
       run_stage pinn scripts/06_run_pinn_experiments.py \
         --seed "${SIB_PRIMARY_SEED:-42}"
       ;;
@@ -353,8 +399,7 @@ for stage in "${STAGES[@]}"; do
       if [[ $PIPELINE_RC -ne 0 ]]; then
         log "skipping stage 'pinn_seeds' — earlier stage failed"
       else
-        export SIB_DEVICE=cuda
-        if ! require_cuda; then
+        if ! use_gpu; then
           log "WARNING: pinn_seeds skipped — CUDA unavailable"
         else
           for extra_seed in ${SIB_SPREAD_SEEDS:-43 44 45 46}; do
@@ -373,19 +418,12 @@ for stage in "${STAGES[@]}"; do
     pinn_smoke)
       # Short single-fold wiring check: dropout active, hard IC enforced,
       # PDE gradients non-zero, checkpoint eligibility and refit curriculum sane.
-      export SIB_DEVICE=cuda
-      require_cuda || { PIPELINE_RC=1; continue; }
+      use_gpu || { PIPELINE_RC=1; continue; }
       run_stage pinn_smoke scripts/06_run_pinn_experiments.py \
         --smoke-test --fold 0 --seed "${SIB_PRIMARY_SEED:-42}"
       ;;
     pinn_aggregate)   run_stage pinn_aggregate   scripts/07_aggregate_pinn_results.py ;;
     pinn_plot)        run_stage pinn_plot        scripts/08_plot_pinn_results.py ;;
-    # pinn_ablation)  # DEFERRED: re-enable when ablation suite (A0–A7) is ready
-    #   # Primary seed and the single active preprocessing level, explicitly.
-    #   # Left to its defaults the script would fan out over every seed.
-    #   run_stage pinn_ablation scripts/10_run_pinn_ablations.py \
-    #     --seed "${SIB_PRIMARY_SEED:-42}" --preprocessing unified
-    # ;;
     combined_report)
       if [[ $PIPELINE_RC -ne 0 ]]; then
         log "skipping combined_report — earlier stage failed"
@@ -421,6 +459,26 @@ PY
         PIPELINE_RC=$rc
       fi
       ;;
+    pinn_ablation)
+      # Primary seed and the single active preprocessing level, explicitly.
+      # Left to its defaults the script would fan out over every seed.
+      # This trains PINNs like every other pinn_* stage and must not run on CPU.
+      use_gpu || { PIPELINE_RC=1; continue; }
+      run_stage pinn_ablation scripts/10_run_pinn_ablations.py \
+        --seed "${SIB_PRIMARY_SEED:-42}" --preprocessing unified
+    ;;
+    pinn_nested)
+      # Nested selection of the refit epoch count. Trains k inner folds per
+      # outer fold, so it costs roughly k times a 'pinn' stage.
+      use_gpu || { PIPELINE_RC=1; continue; }
+      run_stage pinn_nested scripts/15_run_nested_pinn_selection.py \
+        --seed "${SIB_PRIMARY_SEED:-42}"
+    ;;
+    generalization)  run_stage generalization scripts/11_run_generalization_study.py ;;
+    low_data)        run_stage low_data       scripts/12_run_low_data_study.py ;;
+    uncertainty)     run_stage uncertainty    scripts/13_run_uncertainty_study.py ;;
+    robustness)      run_stage robustness     scripts/14_run_robustness_study.py ;;
+    paper_figures)   run_stage paper_figures  scripts/16_make_paper_figures.py ;;
     smoke)       run_stage smoke       scripts/00_smoke_test.py ;;
     "" )         ;;
     *) log "unknown stage '$stage' in RUN_STAGES"; PIPELINE_RC=2 ;;

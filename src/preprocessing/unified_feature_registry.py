@@ -34,6 +34,21 @@ REGISTRY_VERSION = "unified-v1"
 #: Hard ceiling from the revision plan. Exceeding it is a build-time failure.
 MAX_MODEL_FEATURES = 64
 
+#: Reference windows that have been reviewed and are known to be strictly
+#: backward-looking from the anchor. ``build_temporal_audit`` derives every
+#: causality flag from membership here, so a feature declaring any other window
+#: is treated as unproven and fails ``assert_causal``. Adding a window to this
+#: set is an explicit scientific decision: it asserts the window closes at or
+#: before the anchor cycle and never reads the target RPT.
+CAUSAL_REFERENCE_WINDOWS: frozenset[str] = frozenset({
+    "protocol_constant",              # static condition metadata
+    "previous_rpt",                   # the already-completed anchor RPT
+    "initial_rpt..previous_rpt",      # birth to the anchor RPT
+    "anchor_cycle",                   # the last complete cycle of the block
+    "anchor_cycle_minus_9..anchor_cycle",  # trailing 10-cycle window
+    "block_first..block_last",        # within the completed cycling block
+})
+
 FeatureKind = Literal["continuous", "flag"]
 FeatureRole = Literal["feature", "stress_coordinate", "initial_state"]
 

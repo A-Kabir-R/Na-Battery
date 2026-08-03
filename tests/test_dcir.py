@@ -81,10 +81,22 @@ def test_selection_is_independent_of_pulse_ordinal():
 
 
 def test_short_rest_disqualifies_the_pulse():
-    """An unrelaxed cell gives a meaningless resistance, so reject the pulse."""
+    """An unrelaxed cell gives a meaningless resistance, so reject that pulse.
+
+    Only the pulse whose *own* preceding rest is too short may be dropped.
+    ``_pulse_train`` contains two pulses: a discharge at step 1 (preceded by the
+    step-0 rest shortened here) and a charge at step 3 (preceded by the untouched
+    1800 s step-2 rest). The charge pulse stays qualified, so asserting that the
+    whole frame is empty overstates the requirement.
+    """
     steps = _pulse_train()
     steps.loc[0, "duration_s"] = 30.0          # far below the 600 s requirement
-    assert identify_pulses(steps, nominal_capacity_Ah=NOMINAL).empty
+    pulses = identify_pulses(steps, nominal_capacity_Ah=NOMINAL)
+    assert (pulses["phase"] != "discharge").all(), (
+        "the discharge pulse follows a 30 s rest and must be disqualified"
+    )
+    # The charge pulse keeps its long rest and is therefore still valid.
+    assert set(pulses["step_index"]) == {3}
 
 
 def test_pulse_that_is_too_long_is_not_a_pulse():
@@ -119,14 +131,14 @@ def test_protocol_without_pulses_returns_empty_not_an_error():
     assert out.empty
 
 
-def test_previous_rpt_dcir_joins_by_visit_and_computes_drift():
+def test_previous_rpt_dcir_keys_by_file_and_computes_drift():
     steps = pd.concat([
         _pulse_train(file_id="v0", resistance=0.050),
         _pulse_train(file_id="v1", resistance=0.062),
     ], ignore_index=True)
     rpt = pd.DataFrame([
-        {"condition": "c", "cell": "A", "visit": 0, "file_id": "v0"},
-        {"condition": "c", "cell": "A", "visit": 1, "file_id": "v1"},
+        {"condition": "c", "cell": "A", "visit": 0, "file_id": "v0", "path": "/r/v0.ird"},
+        {"condition": "c", "cell": "A", "visit": 1, "file_id": "v1", "path": "/r/v1.ird"},
     ])
     out = previous_rpt_dcir(steps, rpt, nominal_capacity_Ah=NOMINAL)
     visit1 = out[out["visit"] == 1].iloc[0]
@@ -136,11 +148,33 @@ def test_previous_rpt_dcir_joins_by_visit_and_computes_drift():
     assert np.isclose(visit0["dcir_delta_from_baseline_ohm"], 0.0, atol=1e-12)
 
 
+def test_duplicate_visit_labels_stay_distinct_rows():
+    """Two RPT files sharing a visit label must not collapse into one row.
+
+    Observed in five cells, which carry two CU files both labelled V16. Keying
+    on (condition, cell, visit) bound anchors to whichever file sorted first.
+    """
+    steps = pd.concat([
+        _pulse_train(file_id="early", resistance=0.050),
+        _pulse_train(file_id="late", resistance=0.071),
+    ], ignore_index=True)
+    rpt = pd.DataFrame([
+        {"condition": "c", "cell": "A", "visit": 16, "file_id": "early", "path": "/r/e.ird"},
+        {"condition": "c", "cell": "A", "visit": 16, "file_id": "late", "path": "/r/l.ird"},
+    ])
+    out = previous_rpt_dcir(steps, rpt, nominal_capacity_Ah=NOMINAL)
+    assert len(out) == 2
+    assert out["path"].nunique() == 2
+    by_path = out.set_index("path")["dcir_discharge_ohm"]
+    assert np.isclose(by_path["/r/e.ird"], 0.050, atol=1e-9)
+    assert np.isclose(by_path["/r/l.ird"], 0.071, atol=1e-9)
+
+
 def test_missing_pulse_yields_nan_and_zero_availability():
     steps = _pulse_train(file_id="v0")
     rpt = pd.DataFrame([
-        {"condition": "c", "cell": "A", "visit": 0, "file_id": "v0"},
-        {"condition": "c", "cell": "A", "visit": 1, "file_id": "absent"},
+        {"condition": "c", "cell": "A", "visit": 0, "file_id": "v0", "path": "/r/v0.ird"},
+        {"condition": "c", "cell": "A", "visit": 1, "file_id": "absent", "path": "/r/x.ird"},
     ])
     out = previous_rpt_dcir(steps, rpt, nominal_capacity_Ah=NOMINAL)
     missing = out[out["visit"] == 1].iloc[0]

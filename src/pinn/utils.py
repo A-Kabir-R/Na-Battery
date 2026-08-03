@@ -24,10 +24,46 @@ def set_seeds(seed: int) -> None:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
     except Exception:
         pass
+    # Backend flags are deliberately NOT set here. They are global state, and
+    # setting them from two places (this function and a module-level block in
+    # trainer.py) made the effective configuration depend on import-versus-call
+    # order. Use configure_torch_backend() explicitly instead.
+
+
+def configure_torch_backend(*, deterministic: bool) -> dict[str, object]:
+    """Set every backend flag that affects reproducibility, in one place.
+
+    ``deterministic=True`` is the publication mode: reproducible bitwise on
+    fixed hardware, at some throughput cost. ``False`` is the fast mode, which
+    enables TF32 and cuDNN autotuning -- both change low-order bits, so runs are
+    not comparable across machines or even across repeated runs.
+
+    Returns the resulting state so callers can record it in a run fingerprint;
+    a reproducibility claim that is not recorded is not verifiable.
+    """
+    state: dict[str, object] = {"deterministic_mode": bool(deterministic)}
+    try:
+        import torch
+    except Exception:
+        return state
+    allow_tf32 = not deterministic
+    torch.backends.cudnn.deterministic = bool(deterministic)
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    torch.backends.cudnn.allow_tf32 = allow_tf32
+    try:
+        torch.set_float32_matmul_precision("highest" if deterministic else "high")
+    except AttributeError:
+        pass
+    state.update({
+        "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+    })
+    return state
 
 
 def resolve_device(preferred: str | None = None) -> str:

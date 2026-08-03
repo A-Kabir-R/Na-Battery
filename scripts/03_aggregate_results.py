@@ -24,6 +24,7 @@ from src.evaluation.report import (
     prediction_metric_tables,
 )
 from src.io.loaders import load_config
+from src.pipeline.run_experiment import parse_mode_name
 
 
 def _results_dir(cfg: dict) -> Path:
@@ -109,7 +110,10 @@ def main() -> None:
 
     def _current_completed_partition(path: Path) -> bool:
         relative = path.relative_to(artifacts / "folds")
-        preprocessing, target, model, partition = relative.parts[:4]
+        mode_dir, target, model, partition = relative.parts[:4]
+        # Strip the run-mode suffix ("unified__tuned" -> "unified"); raw_results
+        # stores the bare preprocessing name and would otherwise match nothing.
+        preprocessing, _tuned = parse_mode_name(mode_dir)
         fold = -1 if partition == "holdout" else int(partition.removeprefix("fold_"))
         status_path = path.parent / "fold_status.json"
         if not status_path.exists():

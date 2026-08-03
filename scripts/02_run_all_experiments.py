@@ -271,7 +271,8 @@ def main() -> None:
             rows = run_one(df, pipe, target, name, model, kind=kind,
                             n_splits=n_splits, random_state=rs,
                             split_manifest=split_manifest,
-                            evaluate_holdout=evaluate_holdout)
+                            evaluate_holdout=evaluate_holdout,
+                            tuned=args.tuned)
             tqdm.write(f"[run] {pipe:>3} | {target:>15} | {name:<20} | "
                        f"{len(rows):3d} rows | {time.time()-t0:5.1f}s")
             return rows

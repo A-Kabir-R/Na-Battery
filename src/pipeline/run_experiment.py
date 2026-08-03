@@ -10,6 +10,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
+from sklearn.model_selection._search import BaseSearchCV
 
 from ..evaluation.loss_curves import CURVE_MODELS, fit_with_curves
 from ..evaluation.metrics import classification_metrics, regression_metrics
@@ -36,6 +37,10 @@ REGRESSION_TARGETS = (
 )
 CLASSIFICATION_TARGETS: tuple[str, ...] = ()
 PIPELINE_VERSION = "unified-registry-v4"
+
+#: Grouping unit for every split and every inner CV. One cell contributes
+#: several anchors, so the cell -- not the row -- is the independent unit.
+GROUP_COLUMN = "cell"
 
 #: The one preprocessing level whose feature matrix comes from the fixed
 #: registry. For this level Ridge and ExtraTrees use exactly the columns and
@@ -92,14 +97,75 @@ def _atomic_joblib(value: Any, path: Path) -> None:
     temporary.replace(path)
 
 
-def _fold_dir(preprocessing: str, target: str, model_name: str, fold: int) -> Path:
-    root = Path(load_config()["paths"]["artifacts"]) / "folds"
-    return root / _safe_name(preprocessing) / _safe_name(target) / _safe_name(model_name) / f"fold_{fold}"
+#: Suffix marking a hyperparameter-tuned run's artifact namespace.
+TUNED_SUFFIX = "__tuned"
 
 
-def _holdout_dir(preprocessing: str, target: str, model_name: str) -> Path:
+def _write_traceback(directory: Path, exc: BaseException, *, preprocessing: str,
+                     target: str, model_name: str, fold: int) -> None:
+    """Persist a full traceback beside the failing fold's artifacts.
+
+    Failures are caught and reduced to ``"TypeError: ..."`` in the results
+    tables, which is not enough to debug from. Classical fits run inside loky
+    worker processes whose stdout is not captured by the runner's tee, so
+    without this the traceback exists nowhere at all.
+    """
+    import traceback
+
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "preprocessing": preprocessing,
+            "target": target,
+            "model": model_name,
+            "fold": fold,
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "traceback": "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            ),
+        }
+        _atomic_json(payload, directory / "error_traceback.json")
+    except Exception:
+        # Never let diagnostics turn a recoverable fold failure into a crash.
+        pass
+
+
+def _mode_name(preprocessing: str, tuned: bool) -> str:
+    """Artifact namespace for one run mode.
+
+    Tuned and untuned runs used to share a directory. Their fingerprints differ
+    (the grid search reports different params), so a tuned run treated the
+    untuned outputs as stale and *deleted* them before refitting -- and the
+    finished tree carried no record of which mode produced it.
+    """
+    return _safe_name(preprocessing) + (TUNED_SUFFIX if tuned else "")
+
+
+def parse_mode_name(directory_name: str) -> tuple[str, bool]:
+    """Inverse of :func:`_mode_name`: recover ``(preprocessing, tuned)``.
+
+    Aggregators walk ``artifacts/folds/<mode>/<target>/<model>/...`` and match the
+    first path component against the ``preprocessing`` column of
+    ``raw_results.csv`` -- which stores the *bare* name. Without this inverse a
+    tuned run's directory (``unified__tuned``) matches nothing, and every
+    aggregate table comes out empty with no error raised.
+    """
+    if directory_name.endswith(TUNED_SUFFIX):
+        return directory_name[: -len(TUNED_SUFFIX)], True
+    return directory_name, False
+
+
+def _fold_dir(preprocessing: str, target: str, model_name: str, fold: int,
+              *, tuned: bool = False) -> Path:
     root = Path(load_config()["paths"]["artifacts"]) / "folds"
-    return root / _safe_name(preprocessing) / _safe_name(target) / _safe_name(model_name) / "holdout"
+    return root / _mode_name(preprocessing, tuned) / _safe_name(target) / _safe_name(model_name) / f"fold_{fold}"
+
+
+def _holdout_dir(preprocessing: str, target: str, model_name: str,
+                 *, tuned: bool = False) -> Path:
+    root = Path(load_config()["paths"]["artifacts"]) / "folds"
+    return root / _mode_name(preprocessing, tuned) / _safe_name(target) / _safe_name(model_name) / "holdout"
 
 
 def _experiment_fingerprint(data: pd.DataFrame, preprocessing: str, target: str,
@@ -228,7 +294,14 @@ def _fit_partition(train: pd.DataFrame, test: pd.DataFrame, *, target: str,
         x_train = preprocessor.fit_transform(train, target=target)
     x_test = preprocessor.transform(test)
     estimator = clone(model)
-    estimator.fit(x_train, y_train)
+    # Hyperparameter searches must see cell identity: their inner CV is a
+    # GroupKFold, and without groups the same cell lands on both sides of an
+    # inner split. x_train is a bare ndarray by this point, so the groups have
+    # to come from the frame.
+    if isinstance(estimator, BaseSearchCV):
+        estimator.fit(x_train, y_train, groups=train[GROUP_COLUMN].to_numpy())
+    else:
+        estimator.fit(x_train, y_train)
     train_prediction = estimator.predict(x_train)
     test_prediction = estimator.predict(x_test)
     return (
@@ -432,7 +505,8 @@ def _invalidate_partition(directory: Path) -> None:
 def run_one(df: pd.DataFrame, preprocessing: str, target: str, model_name: str,
             model, kind: str, n_splits: int = 5, random_state: int = 42,
             split_manifest: pd.DataFrame | None = None,
-            evaluate_holdout: bool | None = None) -> List[Dict[str, Any]]:
+            evaluate_holdout: bool | None = None,
+            tuned: bool = False) -> List[Dict[str, Any]]:
     """Run cross-validation and, only when explicitly enabled, the holdout.
 
     ``evaluate_holdout`` defaults to ``experiment.evaluate_holdout`` in the
@@ -489,7 +563,7 @@ def run_one(df: pd.DataFrame, preprocessing: str, target: str, model_name: str,
         fold_fingerprint = _fold_fingerprint(
             experiment_fingerprint, train_cells, validation_cells
         )
-        fold_dir = _fold_dir(preprocessing, target, model_name, fold)
+        fold_dir = _fold_dir(preprocessing, target, model_name, fold, tuned=tuned)
         reused = _completed_rows(fold_dir, fold_fingerprint)
         if reused is not None:
             rows.extend(reused)
@@ -515,7 +589,13 @@ def run_one(df: pd.DataFrame, preprocessing: str, target: str, model_name: str,
                     preprocessing=preprocessing, target=target, model=model_name,
                     fold=fold, validation_role="development_training_cells",
                 )
-                filename = f"{preprocessing}__{target}__{model_name}__fold{fold}.parquet"
+                # Namespaced by run mode for the same reason the fold directory
+                # is: without it a tuned run silently overwrites the untuned
+                # run's diagnostic curves, and the two are not comparable.
+                filename = (
+                    f"{_mode_name(preprocessing, tuned)}__{target}"
+                    f"__{model_name}__fold{fold}.parquet"
+                )
                 _atomic_parquet(curve_output, curve_dir / filename)
 
             (preprocessor, estimator, features, train_prediction, validation_prediction,
@@ -582,6 +662,12 @@ def run_one(df: pd.DataFrame, preprocessing: str, target: str, model_name: str,
             )
         except Exception as exc:
             error_message = f"{type(exc).__name__}: {exc}"
+            # The traceback is the only thing that makes a fold failure
+            # debuggable, and it used to be discarded at the except -- the
+            # fit runs in a loky worker whose stdout is not captured, so
+            # nothing else records it anywhere.
+            _write_traceback(fold_dir, exc, preprocessing=preprocessing,
+                             target=target, model_name=model_name, fold=fold)
             fold_rows.append({
                 "preprocessing": preprocessing, "target": target, "model": model_name,
                 "fold": fold, "split": "cv_validation",
@@ -618,7 +704,7 @@ def run_one(df: pd.DataFrame, preprocessing: str, target: str, model_name: str,
         sorted(data.iloc[development_indices]["cell"].unique()),
         sorted(data.iloc[holdout_indices]["cell"].unique()),
     )
-    final_dir = _holdout_dir(preprocessing, target, model_name)
+    final_dir = _holdout_dir(preprocessing, target, model_name, tuned=tuned)
     reused = _completed_rows(final_dir, holdout_fingerprint)
     if reused is not None:
         rows.extend(reused)
@@ -700,6 +786,8 @@ def run_one(df: pd.DataFrame, preprocessing: str, target: str, model_name: str,
         )
     except Exception as exc:
         error_message = f"{type(exc).__name__}: {exc}"
+        _write_traceback(final_dir, exc, preprocessing=preprocessing,
+                         target=target, model_name=model_name, fold=-1)
         final_rows.append({
             "preprocessing": preprocessing, "target": target, "model": model_name,
             "fold": -1, "split": "holdout",

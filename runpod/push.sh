@@ -140,7 +140,6 @@ for required in \
   scripts/01_build_features.py \
   src/io/canonical.py \
   src/preprocessing/protocol_segmentation.py \
-  src/preprocessing/p3_waveform.py \
   src/preprocessing/unified.py \
   src/preprocessing/unified_feature_registry.py \
   src/preprocessing/curve_features.py \

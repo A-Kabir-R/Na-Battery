@@ -57,6 +57,7 @@ from .dcir import previous_rpt_dcir
 from .p1_aggregate import build_p1
 from .protocol_segmentation import segment_cyc_protocol, summarize_steps
 from .unified_feature_registry import (
+    CAUSAL_REFERENCE_WINDOWS,
     FEATURE_SPECS,
     IDENTITY_COLUMNS,
     MIN_TEMPORAL_OBSERVATIONS,
@@ -394,6 +395,13 @@ def build_temporal_audit(frame: pd.DataFrame) -> pd.DataFrame:
         else:
             missing_rate = 1.0
             finite_rate = 0.0
+        # Derive the causality verdict from the declared reference window and
+        # source columns. These were previously hardcoded True/False literals,
+        # which made assert_causal's unsafe filter empty by construction and
+        # unable to reject anything.
+        backward = spec.reference in CAUSAL_REFERENCE_WINDOWS
+        target_derived = bool(set(spec.sources) & set(TARGET_COLUMNS))
+        reads_next_rpt = target_derived or "next" in spec.reference.lower()
         rows.append({
             "feature": spec.name,
             "group": spec.group,
@@ -402,10 +410,10 @@ def build_temporal_audit(frame: pd.DataFrame) -> pd.DataFrame:
             "unit": spec.unit,
             "source_columns": ";".join(spec.sources),
             "reference_window": spec.reference,
-            "uses_only_past_or_current": True,
-            "uses_future_cycles": False,
-            "uses_future_rpt": False,
-            "target_derived": False,
+            "uses_only_past_or_current": backward,
+            "uses_future_cycles": not backward,
+            "uses_future_rpt": reads_next_rpt,
+            "target_derived": target_derived,
             "present_in_table": present,
             "missingness_rate": missing_rate,
             "finite_rate": finite_rate,
@@ -524,13 +532,17 @@ def build_unified(cycle_metrics: pd.DataFrame | None = None,
         nominal_capacity_Ah=nominal,
         initial_visit=initial_visit,
     )
-    resistance = resistance.rename(columns={"visit": "previous_rpt_visit"})[[
-        "condition", "cell", "previous_rpt_visit", "dcir_discharge_ohm",
+    # Join on the previous RPT's file identity, not its visit label. Visit
+    # labels are not unique (five cells carry two files both labelled V16), so a
+    # visit join deduplicates distinct files and binds anchors to whichever file
+    # happened to sort first -- stale in the observed data, and the target RPT
+    # itself under a different file ordering.
+    resistance = resistance.rename(columns={"path": "previous_rpt_path"})[[
+        "previous_rpt_path", "dcir_discharge_ohm",
         "dcir_delta_from_baseline_ohm", "dcir_available",
-    ]].drop_duplicates(["condition", "cell", "previous_rpt_visit"])
+    ]].drop_duplicates("previous_rpt_path")
     anchors = anchors.merge(
-        resistance, on=["condition", "cell", "previous_rpt_visit"],
-        how="left", validate="many_to_one",
+        resistance, on="previous_rpt_path", how="left", validate="many_to_one",
     )
     anchors = anchors.rename(columns={
         "dcir_discharge_ohm": "dcir_prev_rpt_discharge_ohm",

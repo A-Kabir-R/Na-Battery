@@ -45,20 +45,16 @@ from .physics import (
 )
 from .utils import (
     atomic_write_csv, atomic_write_json, atomic_write_parquet, atomic_write_torch,
-    finite_or_raise, gpu_memory_mb, resolve_device, run_fingerprint, set_seeds,
+    configure_torch_backend, finite_or_raise, gpu_memory_mb, resolve_device,
+    run_fingerprint, set_seeds,
 )
 
 
-# Global GPU performance toggles. TF32 and cudnn.benchmark are safe defaults for
-# training MLPs on Ampere+ GPUs; they let the runtime pick faster kernels without
-# affecting numerical results within tolerance.
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
-try:
-    torch.set_float32_matmul_precision("high")
-except AttributeError:
-    pass
+# Backend flags used to be set here at import time (TF32 on, cudnn.benchmark on)
+# while set_seeds() set the opposite (deterministic on, benchmark off) when it
+# ran. Whichever executed last silently won, so reproducibility depended on
+# import-versus-call order. Both now route through configure_torch_backend(),
+# called explicitly per run below.
 
 
 class FoldTrainingError(RuntimeError):
@@ -82,6 +78,23 @@ class TrainerConfig:
     gradient_clip_norm: float = 1.0
     use_amp: bool = False
     physics_float32: bool = True
+    #: Publication mode. True disables TF32 and cuDNN autotuning so a run is
+    #: reproducible on fixed hardware; False trades that for throughput. The
+    #: resolved backend state is recorded in the fold status artifact.
+    deterministic: bool = True
+    #: Number of cell-grouped inner folds, and which of them this run uses for
+    #: early stopping. Running every ``inner_fold`` in ``range(n_inner_folds)``
+    #: and selecting the epoch count on the mean inner curve is nested selection;
+    #: a single fold is the cheaper, higher-variance approximation.
+    n_inner_folds: int = 3
+    inner_fold: int = 0
+    #: Epoch count for the full-outer-training refit, supplied from outside.
+    #: When None the refit uses this run's own ``best_epoch``, i.e. selection on
+    #: a single inner split. Nested selection sets it to the argmin of the mean
+    #: validation curve across all inner folds -- see
+    #: :mod:`src.pinn.nested_selection` and scripts/15. Phase 1 still runs
+    #: normally; only the refit length changes.
+    forced_best_epoch: int | None = None
     curriculum_warmup_fraction: float = 0.10
     curriculum_ramp_end_fraction: float = 0.30
     huber_delta: float = 1.0
@@ -634,11 +647,13 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             return reused
 
     set_seeds(config.seed)
+    backend_state = configure_torch_backend(deterministic=config.deterministic)
 
     outer_train_idx, outer_val_idx = fold_indices(frame, config.fold)
     outer_train_frame = frame.iloc[outer_train_idx].reset_index(drop=True)
     inner_train_local, inner_val_local = inner_split_indices(
-        outer_train_frame, seed=config.inner_split_seed,
+        outer_train_frame, n_inner=config.n_inner_folds,
+        seed=config.inner_split_seed, inner_fold=config.inner_fold,
     )
     inner_train_idx = outer_train_idx[inner_train_local]
     inner_val_idx = outer_train_idx[inner_val_local]
@@ -871,6 +886,20 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             n_rows_seen = 0
             grad_pde_epoch = 0.0
             grad_total_epoch = torch.zeros((), device=device)
+            # Physics diagnostics accumulated over the whole epoch, exactly like
+            # the losses above. They used to be read off the final mini-batch's
+            # leftover tensors after the loop, which made them a ~32-row sample
+            # taken under dropout while every neighbouring column in the same log
+            # row was a batch-weighted epoch mean. Kept on-device; synced once.
+            diag_res_abs = torch.zeros((), device=device)
+            diag_res_sq = torch.zeros((), device=device)
+            diag_res_n = 0
+            diag_pos_deriv = torch.zeros((), device=device)
+            diag_deriv_n = 0
+            diag_mono_viol = torch.zeros((), device=device)
+            diag_lower_viol = torch.zeros((), device=device)
+            diag_upper_viol = torch.zeros((), device=device)
+            diag_state_n = 0
 
             for b, batch_positions in enumerate(epoch_batches):
                 if batch_positions.numel() == 0:
@@ -902,9 +931,15 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                     stress_current_tensor,
                 )
                 r_next_hat = model.rate(stress_next_tensor, batch_features, u_next_hat)
+                # The anchor coordinate must be detached. Passing the live leaf as
+                # both the evaluation point and the IC anchor makes
+                # u = u_c + (s - s_c) f(s) differentiate to f*(1-1) + 0*df/ds == 0,
+                # so the anchor residual would collapse to mean(r^2). Detaching
+                # leaves the IC value untouched (local_stress is still 0) while
+                # recovering du/ds = f_theta(s_c). Mirrors the collocation path below.
                 u_anchor_hat = model.solution(
                     stress_current_tensor, batch_features, batch_u_current,
-                    stress_current_tensor,
+                    stress_current_tensor.detach(),
                 )
                 r_anchor_hat = model.rate(
                     stress_current_tensor, batch_features, u_anchor_hat
@@ -1103,6 +1138,26 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                     acc_pairwise += float(pairwise_row) * bw
                 rate_coverage_epoch = max(rate_coverage_epoch, float(rate_coverage))
                 pair_count_epoch += int(n_pairs)
+
+                # Physics diagnostics over every row of the epoch. Sums stay on
+                # device; the single CPU sync happens after the loop.
+                with torch.no_grad():
+                    if residual_next.numel():
+                        res_d = residual_next.detach()
+                        diag_res_abs += res_d.abs().sum()
+                        diag_res_sq += (res_d * res_d).sum()
+                        diag_res_n += res_d.numel()
+                    if du_next.numel():
+                        diag_pos_deriv += (du_next.detach() > 0).sum()
+                        diag_deriv_n += du_next.numel()
+                    if u_next_hat.numel():
+                        u_d = u_next_hat.detach()
+                        diag_mono_viol += (
+                            (u_d - batch_u_current - scaler.epsilon_rec) > 0
+                        ).sum()
+                        diag_lower_viol += (u_d < 0).sum()
+                        diag_upper_viol += (u_d > scaler.u_max).sum()
+                        diag_state_n += u_d.numel()
                 grad_pde_epoch = max(grad_pde_epoch, grad_pde)
                 # Keep grad_total on-device; take the running max as a tensor
                 # op and sync only at epoch end.
@@ -1183,35 +1238,33 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             scheduler.step(val_mae)
             lr_current = float(optimizer.param_groups[0]["lr"])
 
-            # Consolidate physics diagnostics into a single CPU sync. The
-            # previous code did six separate ``.cpu().numpy()`` round-trips
-            # per epoch — each one forced a full CUDA queue flush.
+            # Reduce the epoch-wide physics accumulators in a single CPU sync.
+            # These describe every row the epoch trained on, not the last batch.
             nan_t = torch.full((), float("nan"), device=device)
-            u_next_det = u_next_hat.detach()
-            du_det = du_next.detach()
-            has_u = u_next_hat.numel() > 0
-            has_du = du_next.numel() > 0
-            has_res = residual_next.numel() > 0
-            if has_res:
-                res_det = residual_next.detach()
-                pde_mae_t = res_det.abs().mean()
-                pde_rmse_t = (res_det * res_det).mean().sqrt()
+            if diag_res_n:
+                pde_mae_t = diag_res_abs / diag_res_n
+                pde_rmse_t = (diag_res_sq / diag_res_n).sqrt()
             else:
                 pde_mae_t = nan_t
                 pde_rmse_t = nan_t
-            pos_deriv_t = (du_det > 0).float().mean() if has_du else nan_t
-            if has_u:
-                mono_frac_t = ((u_next_det - batch_u_current - scaler.epsilon_rec) > 0).float().mean()
-                lower_viol_frac_t = (u_next_det < 0).float().mean()
-                upper_viol_frac_t = (u_next_det > scaler.u_max).float().mean()
+            pos_deriv_t = (
+                diag_pos_deriv / diag_deriv_n if diag_deriv_n else nan_t
+            )
+            if diag_state_n:
+                mono_frac_t = diag_mono_viol / diag_state_n
+                lower_viol_frac_t = diag_lower_viol / diag_state_n
+                upper_viol_frac_t = diag_upper_viol / diag_state_n
             else:
                 mono_frac_t = nan_t
                 lower_viol_frac_t = nan_t
                 upper_viol_frac_t = nan_t
-            diag_np = torch.stack((
-                pde_mae_t, pde_rmse_t, pos_deriv_t,
-                mono_frac_t, lower_viol_frac_t, upper_viol_frac_t,
-            )).cpu().numpy()
+            diag_np = torch.stack([
+                torch.as_tensor(value, device=device, dtype=torch.float32)
+                for value in (
+                    pde_mae_t, pde_rmse_t, pos_deriv_t,
+                    mono_frac_t, lower_viol_frac_t, upper_viol_frac_t,
+                )
+            ]).cpu().numpy()
             pde_residual_mae = float(diag_np[0])
             pde_residual_rmse = float(diag_np[1])
             positive_derivative_fraction = float(diag_np[2])
@@ -1446,12 +1499,24 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
     used_refit = False
     refit_model = None
     refit_scaler = scaler
+    # Where the refit length comes from. Selecting it on this run's own single
+    # inner split is high variance when that split holds four or five cells;
+    # nested selection supplies the argmin of the mean curve across all inner
+    # folds instead. Phase 1 is unchanged either way.
+    selected_epoch = (
+        int(config.forced_best_epoch)
+        if config.forced_best_epoch is not None else best_epoch
+    )
+    epoch_selection_source = (
+        "nested_inner_folds" if config.forced_best_epoch is not None
+        else "single_inner_split"
+    )
     if (config.two_phase_refit and np.isfinite(best_val)
-            and best_epoch >= 0):
+            and selected_epoch >= 0):
         try:
             refit_model, refit_scaler = _refit_full_outer_train(
                 dataset=dataset, frame=frame, outer_train_idx=outer_train_idx,
-                original_scaler=scaler, best_epoch=best_epoch,
+                original_scaler=scaler, best_epoch=selected_epoch,
                 config=config, loss_weights=loss_weights,
                 u_max_source=u_max_source, u_max_constant=u_max_constant,
                 u_max_margin=u_max_margin,
@@ -1469,7 +1534,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                     "preprocessing": config.preprocessing,
                     "fold": config.fold,
                     "seed": config.seed,
-                    "refit_epochs": best_epoch + 1,
+                    "refit_epochs": selected_epoch + 1,
                     "fingerprint": fingerprint,
                 },
                 fold_paths.final_model,
@@ -1484,7 +1549,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                           architecture=config.architecture,
                           preprocessing=config.preprocessing,
                           fold=config.fold, seed=config.seed,
-                          refit_epochs=best_epoch + 1)
+                          refit_epochs=selected_epoch + 1)
         except FoldTrainingError:
             # Refit failure is a hard failure — do not silently fall back to
             # the inner-only model, since the reported outer-val MAE would
@@ -1545,7 +1610,14 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
         "final_refit_stress_std": float(outer_eval_scaler.stress_std),
         "stress_std": float(outer_eval_scaler.stress_std),
         "two_phase_refit_used": bool(used_refit),
-        "refit_epochs": int(best_epoch + 1) if used_refit else 0,
+        "refit_epochs": int(selected_epoch + 1) if used_refit else 0,
+        "refit_selected_epoch": int(selected_epoch),
+        "refit_epoch_selection_source": epoch_selection_source,
+        "inner_fold": int(config.inner_fold),
+        "n_inner_folds": int(config.n_inner_folds),
+        # Resolved backend flags. Recorded because a reproducibility claim that
+        # is not written down cannot be checked after the fact.
+        **backend_state,
     }, fold_paths.status_path)
 
     if logger is not None:
@@ -1618,6 +1690,7 @@ def _refit_full_outer_train(
         )
 
     set_seeds(config.seed)
+    backend_state = configure_torch_backend(deterministic=config.deterministic)
     feature_dim = 2 + len(original_cols)
     refit_model = NaPINNQ(
         feature_dim=feature_dim,
@@ -1723,9 +1796,10 @@ def _refit_full_outer_train(
             r_next_hat = refit_model.rate(
                 stress_next_tensor, batch_features, u_next_hat
             )
+            # Anchor coordinate detached: see the note in the phase-1 loop.
             u_anchor_hat = refit_model.solution(
                 stress_current_tensor, batch_features, batch_u_current,
-                stress_current_tensor,
+                stress_current_tensor.detach(),
             )
             r_anchor_hat = refit_model.rate(
                 stress_current_tensor, batch_features, u_anchor_hat

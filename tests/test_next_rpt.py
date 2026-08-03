@@ -143,3 +143,50 @@ def test_chronologically_late_initial_rpt_does_not_normalize_soh():
     assert pd.isna(anchor["initial_rpt_Q_Ah"])
     assert pd.isna(anchor["next_rpt_SOH_pct"])
     assert anchor["next_rpt_soh_status"] == "missing_initial_rpt"
+
+
+def test_non_adjacent_blocks_are_demoted_not_regressed_on():
+    """Only the block adjacent to the target RPT may keep the target.
+
+    Observed for ``S2000FM42G``: CYC V03, V04 and V05 all sit between CU V02 and
+    CU V06, so all three point at the same next RPT. That gives duplicate targets
+    on non-independent rows, and for the earlier blocks the features describe
+    only part of the interval the stress delta spans.
+    """
+    from src.targets.next_rpt import (
+        DELTA_Q_TARGET,
+        DELTA_SOH_TARGET,
+        SOH_TARGET,
+        TARGET,
+        _drop_non_adjacent_blocks,
+    )
+
+    frame = pd.DataFrame([
+        # three blocks, one shared target RPT; V05 is adjacent to it
+        {"condition": "c", "cell": "A", "visit": 3, "next_rpt_path": "/r/V06.ird",
+         "next_rpt_horizon_days": 30.0},
+        {"condition": "c", "cell": "A", "visit": 4, "next_rpt_path": "/r/V06.ird",
+         "next_rpt_horizon_days": 18.0},
+        {"condition": "c", "cell": "A", "visit": 5, "next_rpt_path": "/r/V06.ird",
+         "next_rpt_horizon_days": 4.0},
+        # an ordinary, unaffected anchor
+        {"condition": "c", "cell": "A", "visit": 7, "next_rpt_path": "/r/V08.ird",
+         "next_rpt_horizon_days": 3.0},
+    ])
+    for column in (TARGET, SOH_TARGET, DELTA_Q_TARGET, DELTA_SOH_TARGET):
+        frame[column] = 1.0
+    frame["next_rpt_target_status"] = "available"
+    frame["target_unavailable_reason"] = pd.NA
+
+    out = _drop_non_adjacent_blocks(frame.copy())
+
+    kept = out[out["next_rpt_target_status"].eq("available")]
+    assert sorted(kept["visit"]) == [5, 7], "only the adjacent block keeps the target"
+
+    demoted = out[out["visit"].isin([3, 4])]
+    assert (demoted["target_unavailable_reason"] == "superseded_by_adjacent_block").all()
+    for column in (TARGET, SOH_TARGET, DELTA_Q_TARGET, DELTA_SOH_TARGET):
+        assert demoted[column].isna().all(), f"{column} must be cleared"
+
+    # one row per (cell, next RPT) among the survivors
+    assert not kept.duplicated(["condition", "cell", "next_rpt_path"]).any()
