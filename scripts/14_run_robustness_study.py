@@ -43,6 +43,7 @@ from src.evaluation.conformal import (  # noqa: E402
 from src.evaluation.robustness import build_perturbations, run_robustness  # noqa: E402
 from src.io.loaders import load_config  # noqa: E402
 from src.models.regressors import STUDY_RIDGE_ALPHA  # noqa: E402
+from src.pinn.inference import PINNInferenceSession, find_run_dir  # noqa: E402
 from src.pinn.logging_utils import run_log  # noqa: E402
 from src.splits.group_kfold import make_folds  # noqa: E402
 
@@ -81,6 +82,7 @@ def _load(cfg: dict) -> tuple[pd.DataFrame, list[str]]:
     artifacts = Path(cfg["paths"]["artifacts"])
     unified = artifacts / "features" / "unified.parquet"
     manifest = artifacts / "features" / "unified_feature_manifest.json"
+    split_manifest_path = artifacts / "splits" / "split_manifest.parquet"
     if not unified.exists():
         raise SystemExit(
             f"missing {unified}. Run scripts/01_build_features.py first, or point "
@@ -88,7 +90,19 @@ def _load(cfg: dict) -> tuple[pd.DataFrame, list[str]]:
         )
     frame = pd.read_parquet(unified)
     frame = frame[frame[TARGET].notna()].reset_index(drop=True)
+    if split_manifest_path.exists():
+        split_manifest = pd.read_parquet(split_manifest_path)[["cell", "outer_role"]]
+        frame = frame.merge(split_manifest, on="cell", how="left")
+        frame = frame[frame["outer_role"].eq("development")].reset_index(drop=True)
+        assert int((frame.get("outer_role", pd.Series()) == "holdout").sum()) == 0
     return frame, json.loads(manifest.read_text())["feature_columns"]
+
+
+def _pinn_results_dir(cfg: dict) -> Path:
+    return (
+        Path(cfg["paths"]["artifacts"]) / "results"
+        / str((cfg.get("pinn") or {}).get("results_subdir", "pinn_unified_study"))
+    )
 
 
 def _main() -> int:
@@ -102,6 +116,14 @@ def _main() -> int:
     parser.add_argument("--current-gain", type=float, default=1.02)
     parser.add_argument("--no-intervals", action="store_true",
                         help="skip conformal; report error degradation only")
+    parser.add_argument("--pinn", action="store_true",
+                        help="add NaPINN-Q by loading the seed-42 final-refit "
+                             "checkpoint per fold (requires script 06 to have run)")
+    parser.add_argument("--pinn-seed", type=int, default=42)
+    parser.add_argument("--pinn-architecture", type=str, default="NaPINN-Q")
+    parser.add_argument("--pinn-preprocessing", type=str, default="unified")
+    parser.add_argument("--device", type=str, default="cpu",
+                        help="torch device for PINN inference")
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
 
@@ -117,8 +139,10 @@ def _main() -> int:
         voltage_noise_V=args.voltage_noise,
         current_gain=args.current_gain,
     )
-    print(f"[robust] {len(perturbations)} perturbations x {len(_models(feature_columns))} "
-          f"models x {args.folds} folds")
+    n_classical = len(_models(feature_columns))
+    n_pinn = 1 if args.pinn else 0
+    print(f"[robust] {len(perturbations)} perturbations x "
+          f"{n_classical + n_pinn} models x {args.folds} folds")
 
     reports: list[pd.DataFrame] = []
     for fold, (train_idx, test_idx) in enumerate(
@@ -170,6 +194,40 @@ def _main() -> int:
                 interval_half_width=half_width, seed=fold,
             )
             report.insert(0, "model", name)
+            report.insert(1, "fold", fold)
+            reports.append(report)
+
+        # ---- NaPINN-Q robustness via checkpoint inference -------------------
+        if args.pinn:
+            pinn_dir = _pinn_results_dir(cfg)
+            run_dir = find_run_dir(
+                pinn_dir,
+                architecture=args.pinn_architecture,
+                preprocessing=args.pinn_preprocessing,
+                fold=fold,
+                seed=args.pinn_seed,
+            )
+            try:
+                session = PINNInferenceSession(run_dir, device=args.device)
+            except FileNotFoundError as exc:
+                print(f"[robust] fold {fold} NaPINN-Q: skipping ({exc})")
+                continue
+
+            # Perturbations act on the raw feature frame; the scaler picks up
+            # the corrupted values when transform_features is called inside
+            # session.predict(), so the propagation is physically consistent.
+            def pinn_predict(subject: pd.DataFrame) -> np.ndarray:
+                u_next = session.predict(subject)
+                u_current = subject["u_current"].to_numpy(dtype=float)
+                return (u_next - u_current).astype(float)
+
+            report = run_robustness(
+                test, TARGET, pinn_predict,
+                perturbations=perturbations,
+                interval_half_width=None,
+                seed=fold,
+            )
+            report.insert(0, "model", "NaPINN-Q")
             report.insert(1, "fold", fold)
             reports.append(report)
 

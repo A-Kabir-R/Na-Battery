@@ -110,9 +110,12 @@ check-clean:  ## Fail if the working tree is dirty
 # `features` exists.
 .NOTPARALLEL:
 
-# pinn-nested precedes pinn: the refit epoch count is a hyperparameter, and
-# choosing it on the outer validation fold is exactly the leak nested CV closes.
-paper: check-clean test features classical pinn-nested pinn pinn-ablation \
+# Execution order: pinn first (five-seed sweep), then pinn-nested (epoch
+# selection + seed-42 refit), then pinn-ablation, then aggregate.
+# pinn-nested must run AFTER pinn so that nested selection replaces only the
+# seed-42 checkpoint and the remaining seeds are already present for
+# seed-sensitivity reporting.
+paper: check-clean test features classical pinn pinn-nested pinn-ablation \
        studies aggregate figures  ## Full reproduction
 	@echo
 	@echo "reproduction complete at commit $$(git rev-parse HEAD)"

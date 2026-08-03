@@ -68,8 +68,8 @@ def main() -> int:
     parser.add_argument("--preprocessing", default="unified")
     parser.add_argument("--device", default=None, help="cpu or cuda")
     parser.add_argument("--max-epochs", type=int, default=None)
-    parser.add_argument("--min-epoch", type=int, default=0,
-                        help="mirror the checkpoint-eligibility gate")
+    parser.add_argument("--min-epoch", type=int, default=None,
+                        help="mirror the checkpoint-eligibility gate (default: physics_full_epoch from config)")
     parser.add_argument("--skip-refit", action="store_true",
                         help="select only; do not run the final refit")
     parser.add_argument("--dry-run", action="store_true")
@@ -79,6 +79,20 @@ def main() -> int:
     cfg = load_config()
     pinn_cfg = cfg["pinn"]
     artifacts = Path(cfg["paths"]["artifacts"])
+
+    # Default --min-epoch to physics_full_epoch so the selection only considers
+    # checkpoints after full physics activation. Epochs before this were trained
+    # without full physics, so picking them would silently report a data-only
+    # model as the full PINN.
+    if args.min_epoch is None:
+        import math as _math
+        _train_cfg = pinn_cfg.get("training", {})
+        _curriculum_cfg = pinn_cfg.get("curriculum", {})
+        args.min_epoch = int(_math.ceil(
+            float(_train_cfg.get("maximum_epochs", 500))
+            * float(_curriculum_cfg.get("ramp_end_fraction", 0.20))
+        ))
+        print(f"[nested] min_epoch defaulted to physics_full_epoch={args.min_epoch}")
     features_dir = artifacts / "features"
     # Same resolution as scripts/06 `_results_dir`, so both runners agree on
     # where the fold artifacts live.

@@ -31,9 +31,23 @@ from src.pinn.logging_utils import get_logger, log_event  # noqa: E402
 from src.pinn.utils import atomic_write_csv, atomic_write_parquet, git_commit  # noqa: E402
 
 CLASSICAL_FAMILY_MAP = {
-    "DummyMean": "statistical_baseline",
-    "PreviousRPT": "persistence_baseline",
-    "ExtraTrees": "classical_machine_learning",
+    "DummyMean":        "statistical_baseline",
+    "DummyMedian":      "statistical_baseline",
+    "PreviousRPT":      "persistence_baseline",
+    "Ridge":            "classical_machine_learning",
+    "Lasso":            "classical_machine_learning",
+    "ElasticNet":       "classical_machine_learning",
+    "SVR-linear":       "classical_machine_learning",
+    "SVR-RBF":          "classical_machine_learning",
+    "KNN":              "classical_machine_learning",
+    "DecisionTree":     "classical_machine_learning",
+    "RandomForest":     "classical_machine_learning",
+    "ExtraTrees":       "classical_machine_learning",
+    "GradientBoosting": "classical_machine_learning",
+    "XGBoost":          "classical_machine_learning",
+    "LightGBM":         "classical_machine_learning",
+    "CatBoost":         "classical_machine_learning",
+    "MLP":              "data_driven_neural_network",
 }
 
 
@@ -73,11 +87,13 @@ def _read_parquet(path: Path) -> pd.DataFrame:
 
 
 def _normalize_classical(classical: pd.DataFrame) -> pd.DataFrame:
-    """Ensure classical rows carry a valid ``architecture`` column.
+    """Normalize classical rows to the shared schema used by PINN rows.
 
-    Pre-fix behaviour: after concatenating with PINN rows, classical rows
-    could end up with ``NaN`` architecture and disappear from grouped tables
-    because pandas excludes NaN group keys.
+    Fixes:
+    - architecture: falls back to model column when missing or NaN.
+    - value: the classical report emits "estimate"; rename to "value" so that
+      the _pm_required check passes and the publication table is populated.
+    - evaluation_role: map legacy split labels to canonical names.
     """
     if classical.empty:
         return classical
@@ -88,6 +104,13 @@ def _normalize_classical(classical: pd.DataFrame) -> pd.DataFrame:
         out["architecture"] = out["architecture"].fillna(out["model"])
     elif "architecture" not in out.columns:
         out["architecture"] = "unknown"
+    if "estimate" in out.columns and "value" not in out.columns:
+        out = out.rename(columns={"estimate": "value"})
+    if "evaluation_role" not in out.columns and "split" in out.columns:
+        out["evaluation_role"] = out["split"].map(
+            {"cv_train": "cv_train", "cv_validation": "cv_oof",
+             "holdout": "holdout"}
+        ).fillna(out["split"])
     return out
 
 

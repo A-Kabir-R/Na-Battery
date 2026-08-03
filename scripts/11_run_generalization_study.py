@@ -81,6 +81,7 @@ def _load_frame(cfg: dict) -> tuple[pd.DataFrame, list[str]]:
     artifacts = Path(cfg["paths"]["artifacts"])
     unified = artifacts / "features" / "unified.parquet"
     manifest = artifacts / "features" / "unified_feature_manifest.json"
+    split_manifest_path = artifacts / "splits" / "split_manifest.parquet"
     if not unified.exists():
         raise SystemExit(
             f"missing {unified}. Run scripts/01_build_features.py first, or point "
@@ -88,6 +89,12 @@ def _load_frame(cfg: dict) -> tuple[pd.DataFrame, list[str]]:
         )
     frame = pd.read_parquet(unified)
     frame = frame[frame[TARGET].notna()].reset_index(drop=True)
+    if split_manifest_path.exists():
+        split_manifest = pd.read_parquet(split_manifest_path)[["cell", "outer_role"]]
+        frame = frame.merge(split_manifest, on="cell", how="left")
+        frame = frame[frame["outer_role"].eq("development")].reset_index(drop=True)
+        holdout_remaining = int((frame.get("outer_role", pd.Series()) == "holdout").sum())
+        assert holdout_remaining == 0, "Holdout cells leaked into development frame"
     features = json.loads(manifest.read_text())["feature_columns"]
     return frame, features
 

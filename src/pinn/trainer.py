@@ -1295,6 +1295,33 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             scheduler.step(val_mae)
             lr_current = float(optimizer.param_groups[0]["lr"])
 
+            # Per-epoch rate-head validation: MAE and R² vs observed degradation
+            # rate on the inner-validation rows. Logged to epoch_log so training
+            # curves for rate quality are available for post-hoc plotting without
+            # re-running the model.
+            with torch.no_grad():
+                val_r_full = model.rate(stress_next_dev, features, val_u)
+                val_r_sel = val_r_full[val_selector].detach()
+                val_obs_rate, val_rate_mask = observed_degradation_rate(
+                    u_current[val_selector], u_true[val_selector],
+                    delta_full[val_selector],
+                    epsilon=1.0e-6,
+                    regeneration_tolerance=scaler.epsilon_rec,
+                )
+                if val_rate_mask.any():
+                    _rp = val_r_sel[val_rate_mask].cpu().numpy()
+                    _ro = val_obs_rate[val_rate_mask].cpu().numpy()
+                    val_rate_mae = float(np.mean(np.abs(_rp - _ro)))
+                    _ss_r = float(np.sum((_rp - _ro) ** 2))
+                    _ro_mean = float(_ro.mean())
+                    _ss_t = float(np.sum((_ro - _ro_mean) ** 2))
+                    val_rate_r2 = 1.0 - _ss_r / _ss_t if _ss_t > 0 else float("nan")
+                    val_rate_coverage = float(int(val_rate_mask.sum()) / max(int(val_rate_mask.numel()), 1))
+                else:
+                    val_rate_mae = float("nan")
+                    val_rate_r2 = float("nan")
+                    val_rate_coverage = 0.0
+
             # Reduce the epoch-wide physics accumulators in a single CPU sync.
             # These describe every row the epoch trained on, not the last batch.
             nan_t = torch.full((), float("nan"), device=device)
@@ -1376,6 +1403,9 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                 "loss_rate_data": rate_data_row,
                 "loss_pairwise": pairwise_row,
                 "rate_target_coverage": rate_coverage_epoch,
+                "validation_rate_MAE": val_rate_mae,
+                "validation_rate_R2": val_rate_r2,
+                "validation_rate_coverage": val_rate_coverage,
                 "pairwise_pair_count": pair_count_epoch,
                 "learning_rate": lr_current,
                 "gradient_norm_total": grad_total,

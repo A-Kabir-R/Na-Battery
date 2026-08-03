@@ -34,10 +34,13 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import tempfile  # noqa: E402
+
 from src.evaluation.low_data import (  # noqa: E402
     DEFAULT_FRACTIONS, LowDataStudy, cells_to_reach, summarize_curve,
 )
 from src.io.loaders import load_config  # noqa: E402
+from src.pinn.inference import PINNInferenceSession, find_run_dir  # noqa: E402
 from src.pinn.logging_utils import run_log  # noqa: E402
 from src.models.degradation_baselines import build_degradation_baselines  # noqa: E402
 from src.models.regressors import STUDY_RIDGE_ALPHA  # noqa: E402
@@ -79,10 +82,142 @@ def _statistical_models(feature_columns: list[str]):
     }
 
 
+def _pinn_results_dir(cfg: dict) -> Path:
+    return (
+        Path(cfg["paths"]["artifacts"]) / "results"
+        / str((cfg.get("pinn") or {}).get("results_subdir", "pinn_unified_study"))
+    )
+
+
+def _make_pinn_fit_predict(
+    pinn_results_dir: Path,
+    cfg: dict,
+    fold: int,
+    pinn_seed: int,
+    pinn_architecture: str,
+    pinn_preprocessing: str,
+    device: str,
+    max_epochs: int | None,
+):
+    """Return a fit_predict callable for NaPINN-Q for use in LowDataStudy.
+
+    The PINN is retrained from scratch on each training subset (proper_train
+    cells only) so the learning curve reflects genuine data budget -- not a
+    model that was already exposed to the full training set.
+
+    The epoch count is read from the nested-selected best epoch stored in the
+    seed-42 fold's status.json (if available), or falls back to max_epochs.
+    Training uses the frozen loss configuration from config.yaml so no
+    hyperparameter search occurs within each cell-budget draw.
+    """
+    import json as _json
+    import time as _time
+    from src.pinn.config_builder import build_trainer_config
+    from src.pinn.dataset import apply_split_manifest, build_anchor_dataset
+    from src.pinn.losses import LossWeights
+    from src.pinn.trainer import FoldPaths, FoldTrainingError, train_fold
+    from src.pinn.utils import resolve_device
+
+    pinn_cfg = cfg["pinn"]
+    features_dir = Path(cfg["paths"]["artifacts"]) / "features"
+    real_device = resolve_device(device)
+
+    # Read best_epoch from the seed-42 status so the epoch count is frozen.
+    best_epoch: int | None = None
+    seed42_status = (
+        pinn_results_dir / "runs" / pinn_architecture / pinn_preprocessing
+        / f"fold_{fold}" / f"seed_{pinn_seed}" / "status.json"
+    )
+    if seed42_status.exists():
+        try:
+            status = _json.loads(seed42_status.read_text())
+            best_epoch = int(status.get("best_epoch", status.get("refit_epochs", 0)))
+        except Exception:
+            best_epoch = None
+    if best_epoch is None or best_epoch <= 0:
+        best_epoch = max_epochs or int(pinn_cfg["training"]["maximum_epochs"])
+
+    # Load the anchor dataset once; reuse across cell budgets for this fold.
+    frame_raw = pd.read_parquet(features_dir / f"{pinn_preprocessing}.parquet")
+    TARGET_COL = "delta_next_rpt_Q_Ah"
+    dataset = build_anchor_dataset(
+        frame_raw, preprocessing=pinn_preprocessing,
+        stress_cfg=pinn_cfg["stress"],
+        audit_cfg=pinn_cfg.get("audit"),
+        audit_path=None,
+        features_dir=features_dir,
+    )
+    loss_weights = LossWeights.from_mapping(pinn_cfg["losses"])
+
+    def fit_predict(train_sub: pd.DataFrame, test_sub: pd.DataFrame) -> np.ndarray:
+        """Train NaPINN-Q on train_sub cells, predict TARGET on test_sub."""
+        train_cells = set(train_sub["cell"].astype(str).unique())
+        test_cells = set(test_sub["cell"].astype(str).unique())
+        all_cells = train_cells | test_cells
+
+        # Build a fake split manifest: train cells → cv_fold=1, test → cv_fold=0.
+        # fold_indices(frame, fold=0) → outer_train = cv_fold != 0,
+        #                                outer_val   = cv_fold == 0.
+        anchor_frame = dataset.frame.copy()
+        anchor_frame = anchor_frame[
+            anchor_frame["cell"].astype(str).isin(all_cells)
+        ].reset_index(drop=True)
+        anchor_frame["outer_role"] = "development"
+        anchor_frame["cv_fold"] = anchor_frame["cell"].astype(str).map(
+            lambda c: 0 if c in test_cells else 1
+        )
+
+        with tempfile.TemporaryDirectory(prefix="pinn_ld_") as tmp:
+            run_dir = Path(tmp)
+            paths = FoldPaths(root=run_dir)
+            trainer_cfg = build_trainer_config(
+                pinn_cfg, architecture=pinn_architecture,
+                preprocessing=pinn_preprocessing,
+                fold=0, seed=pinn_seed, device=real_device,
+                max_epochs=best_epoch,
+                two_phase_refit=False,
+                forced_best_epoch=None,
+            )
+            try:
+                result = train_fold(
+                    dataset=dataset, frame=anchor_frame,
+                    config=trainer_cfg, fold_paths=paths,
+                    loss_weights=loss_weights,
+                    u_max_source=str(pinn_cfg["bounds"]["u_max_source"]),
+                    u_max_constant=float(pinn_cfg["bounds"]["u_max_constant"]),
+                    u_max_margin=float(pinn_cfg["bounds"]["u_max_margin"]),
+                    tolerance_source=str(pinn_cfg["monotonicity"]["tolerance_source"]),
+                    tolerance_constant=float(pinn_cfg["monotonicity"]["tolerance_constant"]),
+                    tolerance_quantile=float(pinn_cfg["monotonicity"]["tolerance_quantile"]),
+                    force=True,
+                )
+            except FoldTrainingError as exc:
+                print(f"[low-data/pinn] training failed: {exc}")
+                return np.full(len(test_sub), float("nan"))
+
+            # Load the trained checkpoint and predict on test_sub.
+            try:
+                session = PINNInferenceSession(run_dir, device=real_device)
+                test_rows = dataset.frame[
+                    dataset.frame["cell"].astype(str).isin(test_cells)
+                ]
+                if test_rows.empty:
+                    return np.full(len(test_sub), float("nan"))
+                u_next = session.predict(test_rows)
+                u_current = test_rows["u_current"].to_numpy(dtype=float)
+                return (u_next - u_current).astype(float)
+            except Exception as exc:
+                print(f"[low-data/pinn] inference failed: {exc}")
+                return np.full(len(test_sub), float("nan"))
+
+    return fit_predict
+
+
 def _load(cfg: dict) -> tuple[pd.DataFrame, list[str]]:
     artifacts = Path(cfg["paths"]["artifacts"])
     unified = artifacts / "features" / "unified.parquet"
     manifest = artifacts / "features" / "unified_feature_manifest.json"
+    split_manifest_path = artifacts / "splits" / "split_manifest.parquet"
     if not unified.exists():
         raise SystemExit(
             f"missing {unified}. Run scripts/01_build_features.py first, or point "
@@ -90,6 +225,11 @@ def _load(cfg: dict) -> tuple[pd.DataFrame, list[str]]:
         )
     frame = pd.read_parquet(unified)
     frame = frame[frame[TARGET].notna()].reset_index(drop=True)
+    if split_manifest_path.exists():
+        split_manifest = pd.read_parquet(split_manifest_path)[["cell", "outer_role"]]
+        frame = frame.merge(split_manifest, on="cell", how="left")
+        frame = frame[frame["outer_role"].eq("development")].reset_index(drop=True)
+        assert int((frame.get("outer_role", pd.Series()) == "holdout").sum()) == 0
     return frame, json.loads(manifest.read_text())["feature_columns"]
 
 
@@ -104,6 +244,18 @@ def _main() -> int:
                         help="subset of model names; default is all")
     parser.add_argument("--reference-model", default="ExtraTrees",
                         help="model whose full-data error defines the threshold")
+    parser.add_argument("--pinn", action="store_true",
+                        help="include NaPINN-Q in the learning curve. "
+                             "Trains a fresh PINN per (fold, fraction, repeat) — "
+                             "GPU recommended; use --pinn-max-epochs to limit cost.")
+    parser.add_argument("--pinn-seed", type=int, default=42)
+    parser.add_argument("--pinn-architecture", type=str, default="NaPINN-Q")
+    parser.add_argument("--pinn-preprocessing", type=str, default="unified")
+    parser.add_argument("--pinn-max-epochs", type=int, default=None,
+                        help="override epoch count for low-data PINN training; "
+                             "defaults to the nested-selected best epoch from the "
+                             "seed-42 status.json (or config max_epochs as fallback)")
+    parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
 
@@ -119,13 +271,16 @@ def _main() -> int:
         **_statistical_models(feature_columns),
     }
     if args.models:
-        unknown = set(args.models) - set(models)
+        unknown = set(args.models) - (set(models) | ({"NaPINN-Q"} if args.pinn else set()))
         if unknown:
             raise SystemExit(f"unknown model(s): {sorted(unknown)}")
-        models = {name: models[name] for name in args.models}
+        models = {name: models[name] for name in args.models if name != "NaPINN-Q"}
 
     print(f"[low-data] anchors={len(frame)} cells={frame['cell'].nunique()} "
-          f"models={len(models)} repeats={args.repeats}")
+          f"models={len(models) + (1 if args.pinn else 0)} repeats={args.repeats}")
+    if args.pinn:
+        print("[low-data] NaPINN-Q: will retrain from scratch at each cell budget "
+              "(slow; one GPU run per fold × fraction × repeat)")
 
     records: list[pd.DataFrame] = []
     for fold, (train_idx, test_idx) in enumerate(
@@ -150,6 +305,33 @@ def _main() -> int:
             )
             records.append(study.run(
                 pool, test, TARGET, fit_predict, model_name=name, fold=fold,
+            ))
+
+        # ---- NaPINN-Q learning curve ----------------------------------------
+        if args.pinn:
+            pinn_dir = _pinn_results_dir(cfg)
+            pinn_fit_predict = _make_pinn_fit_predict(
+                pinn_dir, cfg, fold,
+                pinn_seed=args.pinn_seed,
+                pinn_architecture=args.pinn_architecture,
+                pinn_preprocessing=args.pinn_preprocessing,
+                device=args.device,
+                max_epochs=args.pinn_max_epochs,
+            )
+
+            def pinn_fit_predict_wrapped(train, test_frame):
+                return pinn_fit_predict(train, test_frame)
+
+            pinn_study = LowDataStudy(
+                fractions=tuple(args.fractions),
+                repeats=args.repeats,
+                seed=fold,
+            )
+            records.append(pinn_study.run(
+                pool, test, TARGET,
+                pinn_fit_predict_wrapped,
+                model_name="NaPINN-Q",
+                fold=fold,
             ))
 
     if not records:

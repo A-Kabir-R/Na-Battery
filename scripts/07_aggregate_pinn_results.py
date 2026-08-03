@@ -294,12 +294,46 @@ def main() -> None:
     raw = pd.DataFrame(long_rows)
     atomic_write_csv(raw, results / "raw_results.csv")
 
-    # Development-only CV ranking table
+    # Development-only CV ranking tables
     dev = metrics[metrics.get("evaluation_role", "").astype(str) == "outer_validation"] \
         if "evaluation_role" in metrics.columns else pd.DataFrame()
     if not dev.empty:
+        dev_cell = dev[dev["aggregation"] == "cell_macro"]
+
+        # Headline: seed 42 only (preregistered primary seed — do not average seeds).
+        primary_seed = int(
+            ((cfg.get("pinn") or {}).get("training") or {}).get("primary_seed", 42)
+        )
+        dev_primary = (
+            dev_cell[dev_cell["seed"].astype(str) == str(primary_seed)]
+            if "seed" in dev_cell.columns else dev_cell
+        )
+        ranking_primary = (
+            dev_primary
+            .groupby(["architecture", "preprocessing", "target"])["MAE"]
+            .mean().reset_index()
+            .sort_values("MAE")
+        )
+        atomic_write_csv(ranking_primary, results / "development_ranking_primary_seed.csv")
+
+        # Sensitivity: statistics over all seeds.
+        if "seed" in dev_cell.columns and dev_cell["seed"].nunique() > 1:
+            sensitivity = (
+                dev_cell
+                .groupby(["architecture", "preprocessing", "target", "seed"])["MAE"]
+                .mean()
+                .reset_index()
+                .groupby(["architecture", "preprocessing", "target"])["MAE"]
+                .agg(mean_MAE="mean", std_MAE="std", min_MAE="min", max_MAE="max",
+                     n_seeds="count")
+                .reset_index()
+                .sort_values("mean_MAE")
+            )
+            atomic_write_csv(sensitivity, results / "seed_sensitivity.csv")
+
+        # Legacy all-seed mean ranking (labeled sensitivity, not headline).
         ranking = (
-            dev[dev["aggregation"] == "cell_macro"]
+            dev_cell
             .groupby(["architecture", "preprocessing", "target"])["MAE"]
             .mean().reset_index()
             .sort_values("MAE")

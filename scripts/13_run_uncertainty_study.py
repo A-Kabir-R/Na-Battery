@@ -15,6 +15,16 @@ Two facts this script is built around:
   and 95% intervals are simply not certifiable here. The script checks this up
   front and says so rather than emitting a mislabelled interval.
 
+For NaPINN-Q, the conformal protocol mirrors the classical arm exactly:
+  1. Split the outer-training pool into proper-train and calibration cells.
+  2. Retrain NaPINN-Q from scratch on proper-train cells only (frozen loss config,
+     nested-selected epoch count from the full seed-42 run).
+  3. Predict on calibration cells → nonconformity scores.
+  4. Apply split conformal to outer-val cells.
+This is the only valid protocol: the final-refit model trains on all outer-training
+cells (including inner-calibration cells), so its residuals on any outer-training
+cell are not exchangeable with outer-val residuals.
+
 Writes, under ``artifacts/results/uncertainty/``:
 
     uncertainty_predictions.parquet  per-row predictions with lower/upper bounds
@@ -25,6 +35,7 @@ Writes, under ``artifacts/results/uncertainty/``:
 Usage::
 
     python3 scripts/13_run_uncertainty_study.py --alpha 0.1 --calibration-fraction 0.45
+    python3 scripts/13_run_uncertainty_study.py --pinn --device cuda
 """
 from __future__ import annotations
 
@@ -32,6 +43,7 @@ import argparse
 import copy
 import json
 import sys
+import tempfile  # noqa: E402
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +57,7 @@ from src.evaluation.conformal import (  # noqa: E402
 )
 from src.io.loaders import load_config  # noqa: E402
 from src.models.regressors import STUDY_RIDGE_ALPHA  # noqa: E402
+from src.pinn.inference import PINNInferenceSession  # noqa: E402
 from src.pinn.logging_utils import run_log  # noqa: E402
 from src.splits.group_kfold import make_folds  # noqa: E402
 
@@ -96,6 +109,7 @@ def _load(cfg: dict) -> tuple[pd.DataFrame, list[str]]:
     artifacts = Path(cfg["paths"]["artifacts"])
     unified = artifacts / "features" / "unified.parquet"
     manifest = artifacts / "features" / "unified_feature_manifest.json"
+    split_manifest_path = artifacts / "splits" / "split_manifest.parquet"
     if not unified.exists():
         raise SystemExit(
             f"missing {unified}. Run scripts/01_build_features.py first, or point "
@@ -103,7 +117,136 @@ def _load(cfg: dict) -> tuple[pd.DataFrame, list[str]]:
         )
     frame = pd.read_parquet(unified)
     frame = frame[frame[TARGET].notna()].reset_index(drop=True)
+    if split_manifest_path.exists():
+        split_manifest = pd.read_parquet(split_manifest_path)[["cell", "outer_role"]]
+        frame = frame.merge(split_manifest, on="cell", how="left")
+        frame = frame[frame["outer_role"].eq("development")].reset_index(drop=True)
+        assert int((frame.get("outer_role", pd.Series()) == "holdout").sum()) == 0
     return frame, json.loads(manifest.read_text())["feature_columns"]
+
+
+def _pinn_results_dir(cfg: dict) -> Path:
+    return (
+        Path(cfg["paths"]["artifacts"]) / "results"
+        / str((cfg.get("pinn") or {}).get("results_subdir", "pinn_unified_study"))
+    )
+
+
+def _pinn_train_and_predict(
+    cfg: dict,
+    fold: int,
+    proper_train: pd.DataFrame,
+    calibration: pd.DataFrame,
+    test: pd.DataFrame,
+    pinn_seed: int,
+    pinn_architecture: str,
+    pinn_preprocessing: str,
+    device: str,
+    max_epochs: int | None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Retrain PINN on proper_train cells; predict calibration and test cells.
+
+    Protocol mirrors the classical arm exactly:
+      - proper_train cells → PINN training (scaler fitted here only)
+      - calibration cells  → nonconformity scores (model never saw these)
+      - test cells         → conformal interval evaluation
+
+    Returns (cal_y_pred, test_y_pred) as delta predictions (u_next - u_current),
+    or None if training or checkpoint loading fails.
+    """
+    import json as _json
+    from src.pinn.config_builder import build_trainer_config
+    from src.pinn.dataset import build_anchor_dataset
+    from src.pinn.losses import LossWeights
+    from src.pinn.trainer import FoldPaths, FoldTrainingError, train_fold
+    from src.pinn.utils import resolve_device
+
+    pinn_cfg = cfg["pinn"]
+    features_dir = Path(cfg["paths"]["artifacts"]) / "features"
+    real_device = resolve_device(device)
+    pinn_results_dir = _pinn_results_dir(cfg)
+
+    # Frozen epoch count from nested-selection status.json (seed-42 full run)
+    best_epoch: int | None = None
+    seed_status = (
+        pinn_results_dir / "runs" / pinn_architecture / pinn_preprocessing
+        / f"fold_{fold}" / f"seed_{pinn_seed}" / "status.json"
+    )
+    if seed_status.exists():
+        try:
+            status = _json.loads(seed_status.read_text())
+            best_epoch = int(status.get("best_epoch", status.get("refit_epochs", 0)))
+        except Exception:
+            best_epoch = None
+    if best_epoch is None or best_epoch <= 0:
+        best_epoch = max_epochs or int(pinn_cfg["training"]["maximum_epochs"])
+
+    frame_raw = pd.read_parquet(features_dir / f"{pinn_preprocessing}.parquet")
+    dataset = build_anchor_dataset(
+        frame_raw, preprocessing=pinn_preprocessing,
+        stress_cfg=pinn_cfg["stress"],
+        audit_cfg=pinn_cfg.get("audit"),
+        audit_path=None,
+        features_dir=features_dir,
+    )
+    loss_weights = LossWeights.from_mapping(pinn_cfg["losses"])
+
+    train_cells = set(proper_train["cell"].astype(str).unique())
+    cal_cells = set(calibration["cell"].astype(str).unique())
+    test_cells = set(test["cell"].astype(str).unique())
+    all_cells = train_cells | cal_cells | test_cells
+
+    # cv_fold=1 → proper_train (outer_train); cv_fold=0 → cal+test (outer_val)
+    anchor_frame = dataset.frame.copy()
+    anchor_frame = anchor_frame[
+        anchor_frame["cell"].astype(str).isin(all_cells)
+    ].reset_index(drop=True)
+    anchor_frame["outer_role"] = "development"
+    anchor_frame["cv_fold"] = anchor_frame["cell"].astype(str).map(
+        lambda c: 1 if c in train_cells else 0
+    )
+
+    with tempfile.TemporaryDirectory(prefix="pinn_uq_") as tmp:
+        run_dir = Path(tmp)
+        paths = FoldPaths(root=run_dir)
+        trainer_cfg = build_trainer_config(
+            pinn_cfg, architecture=pinn_architecture,
+            preprocessing=pinn_preprocessing,
+            fold=0, seed=pinn_seed, device=real_device,
+            max_epochs=best_epoch,
+            two_phase_refit=False,
+            forced_best_epoch=None,
+        )
+        try:
+            train_fold(
+                dataset=dataset, frame=anchor_frame,
+                config=trainer_cfg, fold_paths=paths,
+                loss_weights=loss_weights,
+                u_max_source=str(pinn_cfg["bounds"]["u_max_source"]),
+                u_max_constant=float(pinn_cfg["bounds"]["u_max_constant"]),
+                u_max_margin=float(pinn_cfg["bounds"]["u_max_margin"]),
+                tolerance_source=str(pinn_cfg["monotonicity"]["tolerance_source"]),
+                tolerance_constant=float(pinn_cfg["monotonicity"]["tolerance_constant"]),
+                tolerance_quantile=float(pinn_cfg["monotonicity"]["tolerance_quantile"]),
+                force=True,
+            )
+        except FoldTrainingError as exc:
+            print(f"[uq/pinn] fold {fold}: training failed: {exc}")
+            return None
+
+        try:
+            session = PINNInferenceSession(run_dir, device=real_device)
+        except FileNotFoundError as exc:
+            print(f"[uq/pinn] fold {fold}: checkpoint not found: {exc}")
+            return None
+
+        cal_u_next = session.predict(calibration)
+        cal_y_pred = (cal_u_next - calibration["u_current"].to_numpy(dtype=float)).astype(float)
+
+        test_u_next = session.predict(test)
+        test_y_pred = (test_u_next - test["u_current"].to_numpy(dtype=float)).astype(float)
+
+    return cal_y_pred, test_y_pred
 
 
 def _main() -> int:
@@ -119,6 +262,16 @@ def _main() -> int:
                              "magnitude (defined for unseen cells)")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44, 45, 46])
+    parser.add_argument("--pinn", action="store_true",
+                        help="add NaPINN-Q by retraining per fold on proper-train cells "
+                             "(GPU recommended; mirrors the classical conformal arm exactly)")
+    parser.add_argument("--pinn-seed", type=int, default=42)
+    parser.add_argument("--pinn-architecture", type=str, default="NaPINN-Q")
+    parser.add_argument("--pinn-preprocessing", type=str, default="unified")
+    parser.add_argument("--pinn-max-epochs", type=int, default=None,
+                        help="override epoch count; default reads nested-selected epoch "
+                             "from seed-42 status.json")
+    parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
 
@@ -201,6 +354,50 @@ def _main() -> int:
             intervals = conformal.predict_interval(test_frame)
             predictions.append(pd.concat([test_frame, intervals], axis=1))
 
+        # ---- NaPINN-Q: same proper-train/calibration/test split as classical ---
+        if args.pinn:
+            print(f"[uq/pinn] fold {fold}: retraining on "
+                  f"{proper['cell'].nunique()} proper-train cells, "
+                  f"calibrating on {n_calibration_cells} cells")
+            pinn_result = _pinn_train_and_predict(
+                cfg=cfg, fold=fold,
+                proper_train=proper, calibration=calibration, test=test,
+                pinn_seed=args.pinn_seed,
+                pinn_architecture=args.pinn_architecture,
+                pinn_preprocessing=args.pinn_preprocessing,
+                device=args.device,
+                max_epochs=args.pinn_max_epochs,
+            )
+            if pinn_result is not None:
+                cal_y_pred_pinn, test_y_pred_pinn = pinn_result
+
+                cal_frame_pinn = calibration[["cell", "condition"]].copy()
+                cal_frame_pinn["y_true"] = calibration[TARGET].to_numpy(dtype=float)
+                cal_frame_pinn["y_pred"] = cal_y_pred_pinn
+                try:
+                    conformal_pinn = GroupedConformal(
+                        alpha=args.alpha, normalize=args.normalize,
+                        score_reduction=args.score_reduction,
+                    ).fit(cal_frame_pinn)
+                except ConformalError as exc:
+                    print(f"[uq/pinn] fold {fold}: conformal failed ({exc}); skipping")
+                    conformal_pinn = None
+
+                if conformal_pinn is not None:
+                    test_frame_pinn = test[["cell", "condition"]].copy()
+                    test_frame_pinn["y_true"] = test[TARGET].to_numpy(dtype=float)
+                    test_frame_pinn["y_pred"] = test_y_pred_pinn
+                    test_frame_pinn["ensemble_std"] = float("nan")
+                    test_frame_pinn["n_members"] = 1
+                    test_frame_pinn["model"] = "NaPINN-Q"
+                    test_frame_pinn["fold"] = fold
+                    test_frame_pinn["alpha"] = args.alpha
+                    test_frame_pinn["n_calibration_cells"] = n_calibration_cells
+                    if "anchor_id" in test.columns:
+                        test_frame_pinn["anchor_id"] = test["anchor_id"].to_numpy()
+                    intervals_pinn = conformal_pinn.predict_interval(test_frame_pinn)
+                    predictions.append(pd.concat([test_frame_pinn, intervals_pinn], axis=1))
+
     if not predictions:
         print("[uq] no fold could be calibrated at this level")
         return 1
@@ -231,6 +428,10 @@ def _main() -> int:
             ["model", "condition", "n", "PICP", "MPIW"]
         ].to_string(index=False)
     )
+    if args.pinn:
+        print("\n[uq/pinn] protocol: retrain on proper-train cells, calibrate on "
+              "held-back calibration cells, evaluate on outer-val cells "
+              "(mirrors classical conformal arm; no exchangeability violation)")
     print(f"\n[uq] wrote {out}")
     return 0
 
