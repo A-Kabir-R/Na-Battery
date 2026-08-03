@@ -1,4 +1,4 @@
-"""Render publication tables as raster and vector figures."""
+"""Render publication figures in every configured format (vector + raster)."""
 from __future__ import annotations
 
 import sys
@@ -411,10 +411,17 @@ def main() -> None:
     out = results / "plots"
     out.mkdir(parents=True, exist_ok=True)
     plotting = cfg.get("plotting", {})
-    formats = ["png"]  # PNG-only per publication figure spec.
+    # Driven by config.yaml plotting.formats. This used to be a hardcoded
+    # ["png"], which silently ignored the config key and contradicted the
+    # module docstring and README, both of which promised vector output.
+    formats = [str(f).lstrip(".") for f in (plotting.get("formats") or ["pdf", "png"])]
     dpi = int(plotting.get("dpi", 300))
     for extension in formats:
         for stale in out.glob(f"*.{extension}"):
+            stale.unlink()
+        # Supplementary figures were never cleaned, so a shrinking model set
+        # left last run's curves sitting in the new figure directory.
+        for stale in (out / "supplementary").glob(f"*.{extension}"):
             stale.unlink()
     sns.set_theme(style="whitegrid", context="paper")
 

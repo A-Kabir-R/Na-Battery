@@ -10,3 +10,9 @@ runpod/pod.env
 .fuse_hidden*
 *.pt
 *.pth
+
+# Derived study outputs. Results must be reproducible from a commit, not
+# carried in the tree; see `make paper`.
+# requirements.lock.txt is deliberately NOT ignored: it is the record of which
+# environment produced the results, and is useless if it is not committed.
+artifacts/

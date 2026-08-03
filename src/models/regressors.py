@@ -3,11 +3,12 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+import numpy as np
 from sklearn.ensemble import (ExtraTreesRegressor, GradientBoostingRegressor,
                               RandomForestRegressor)
 from sklearn.dummy import DummyRegressor
 from sklearn.linear_model import ElasticNet, Lasso, Ridge
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import GridSearchCV, GroupKFold
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.neural_network import MLPRegressor
 from sklearn.svm import SVR
@@ -19,6 +20,19 @@ RS = 42
 # 3 is safe for small battery datasets where training folds can have ~8-12 cells.
 _INNER_CV = 3
 
+#: Frozen ridge penalty for the *study* scripts (11-14), where Ridge is a fixed
+#: comparator rather than the model under test.
+#:
+#: Those scripts must not use ``RidgeCV``. Its default ``cv=None`` selects alpha
+#: by efficient leave-one-out **over rows**, and anchors from one cell are not
+#: independent -- so the penalty is chosen having already seen the held-out
+#: anchors of every training cell. That is the same leak ``_gs`` closes with
+#: GroupKFold, and RidgeCV cannot take ``groups`` through a Pipeline. Freezing
+#: the value is the honest alternative: features are standardised upstream, so
+#: one prespecified penalty applies across every split, and the manuscript can
+#: state it rather than reporting a tuned value that was tuned incorrectly.
+STUDY_RIDGE_ALPHA = 10.0
+
 
 def _try(name: str, factory):
     try:
@@ -28,14 +42,27 @@ def _try(name: str, factory):
 
 
 def _gs(estimator, param_grid: dict, *, scoring: str = "r2") -> GridSearchCV:
+    """Grid search with **cell-grouped** inner folds.
+
+    ``cv`` must be a GroupKFold, not an integer. An integer resolves to plain
+    KFold over contiguous row blocks, and because each cell contributes several
+    anchors that put the same cell on both sides of an inner split -- selecting
+    hyperparameters that exploit cell identity. The caller is responsible for
+    passing ``groups`` to ``fit``; see ``run_experiment._fit_partition``.
+
+    ``error_score`` must be NaN, not 0.0. With ``scoring="r2"`` zero is not a
+    sentinel, it is the score of "predict the training mean". Honest inner-CV R2
+    on this task is frequently negative, so a 0.0 error score ranks *failed*
+    candidates above legitimately-scoring ones.
+    """
     return GridSearchCV(
         estimator,
         param_grid,
-        cv=_INNER_CV,
+        cv=GroupKFold(n_splits=_INNER_CV),
         scoring=scoring,
         refit=True,
         n_jobs=1,
-        error_score=0.0,
+        error_score=np.nan,
     )
 
 
@@ -84,9 +111,9 @@ def build_regressors() -> Dict[str, Any]:
 def build_tuned_regressors() -> Dict[str, Any]:
     """Same models as build_regressors() but wrapped in GridSearchCV for hyperparameter tuning.
 
-    Uses 3-fold inner CV (regular KFold, within each outer training fold) scored on R².
-    This eliminates the negative R² caused by default hyperparameters that are poorly
-    suited to the battery degradation feature space.
+    Uses 3-fold **cell-grouped** inner CV within each outer training fold, scored
+    on R². Grouping is required: cells contribute multiple anchors, so ungrouped
+    inner folds leak cell identity into hyperparameter selection.
     """
     reg: Dict[str, Any] = {
         "DummyMean":    DummyRegressor(strategy="mean"),

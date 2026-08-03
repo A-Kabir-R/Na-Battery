@@ -49,11 +49,17 @@ def test_macro_r2_reports_contributing_group_count():
         }),
     ], ignore_index=True)
     summary, _, _, _ = prediction_metric_tables(predictions, bootstrap_replicates=0)
+    # The macro aggregation reports the mean of per-group R2 under an explicit
+    # name; a row labelled plainly "R2" must only ever be the pooled value.
     row = summary[
-        (summary["aggregation"] == "cell_macro") & (summary["metric"] == "R2")
+        (summary["aggregation"] == "cell_macro")
+        & (summary["metric"] == "R2_group_mean")
     ].iloc[0]
     assert row["n_groups_total"] == 3
     assert row["n_groups_metric_valid"] == 2
+    assert summary[
+        (summary["aggregation"] != "pooled") & (summary["metric"] == "R2")
+    ].empty, "no macro row may be labelled R2"
 
 
 def test_empty_prediction_tables_keep_stable_schemas():

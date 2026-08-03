@@ -637,31 +637,57 @@ def fold_indices(frame: pd.DataFrame, fold: int) -> tuple[np.ndarray, np.ndarray
     )
 
 
-def inner_split_indices(outer_train_frame: pd.DataFrame, *,
-                        n_inner: int = 3,
-                        seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
-    """Group-shuffle split of outer-training cells into (inner_train, inner_val).
+def inner_fold_indices(outer_train_frame: pd.DataFrame, *,
+                       n_inner: int = 3,
+                       seed: int = 0) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Cell-grouped k-fold partition of the outer-training rows.
 
-    The ``seed`` argument controls the inner shuffle and is intentionally
-    decoupled from the model-training seed (Stage 2 diagnosis fix #13). Callers
-    that must hold the inner split fixed across seeds should pass a fixed value
-    derived from the outer fold index rather than the model training seed.
+    Returns ``n_inner`` ``(inner_train, inner_val)`` index pairs whose
+    validation halves are disjoint and together cover every outer-training cell
+    exactly once. This is the primitive for nested selection: choosing the epoch
+    count on a single split is unstable when the validation half holds only four
+    or five cells, which is the regime here (26 development cells, 5 outer
+    folds).
+
+    ``seed`` controls only the shuffle of cells before they are dealt into
+    folds, and is deliberately decoupled from the model-training seed so the
+    inner partition can be held fixed while seeds vary.
     """
     cells = sorted(outer_train_frame["cell"].astype(str).unique())
     if len(cells) < 2:
         raise ValueError("need at least two cells for inner validation")
-    rng = np.random.default_rng(seed)
-    shuffled = rng.permutation(cells)
-    cutoff = max(1, len(shuffled) // n_inner)
-    inner_val_cells = set(shuffled[:cutoff])
-    inner_train_cells = set(shuffled[cutoff:])
-    if not inner_train_cells:
-        inner_train_cells.add(next(iter(inner_val_cells)))
-        inner_val_cells.remove(next(iter(inner_val_cells)))
+    n_folds = int(max(2, min(n_inner, len(cells))))
+    shuffled = np.random.default_rng(seed).permutation(cells)
+    # Deal cells round-robin so fold sizes differ by at most one.
+    fold_of_cell = {cell: i % n_folds for i, cell in enumerate(shuffled)}
     outer_cells = outer_train_frame["cell"].astype(str).to_numpy()
-    train_mask = np.array([c in inner_train_cells for c in outer_cells])
-    val_mask = np.array([c in inner_val_cells for c in outer_cells])
-    return np.flatnonzero(train_mask), np.flatnonzero(val_mask)
+    assignment = np.array([fold_of_cell[c] for c in outer_cells])
+    folds: list[tuple[np.ndarray, np.ndarray]] = []
+    for k in range(n_folds):
+        val_mask = assignment == k
+        train_mask = ~val_mask
+        if not train_mask.any() or not val_mask.any():
+            continue
+        folds.append((np.flatnonzero(train_mask), np.flatnonzero(val_mask)))
+    if not folds:
+        raise ValueError("could not build any usable inner fold")
+    return folds
+
+
+def inner_split_indices(outer_train_frame: pd.DataFrame, *,
+                        n_inner: int = 3,
+                        seed: int = 0,
+                        inner_fold: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """One ``(inner_train, inner_val)`` pair from the grouped k-fold partition.
+
+    ``inner_fold`` selects which fold of :func:`inner_fold_indices` to return.
+    This used to be a single group-*shuffle* split, so repeated calls could
+    never cover the outer-training cells systematically; it is now fold ``k`` of
+    a proper partition, which keeps the existing single-split callers working
+    while making nested selection expressible.
+    """
+    folds = inner_fold_indices(outer_train_frame, n_inner=n_inner, seed=seed)
+    return folds[int(inner_fold) % len(folds)]
 
 
 # ---------------------------------------------------------------------------

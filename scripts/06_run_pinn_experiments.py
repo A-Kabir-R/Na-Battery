@@ -22,6 +22,7 @@ import numpy as np  # noqa: E402
 from tqdm.auto import tqdm  # noqa: E402
 
 from src.io.loaders import load_config  # noqa: E402
+from src.pinn.config_builder import build_trainer_config  # noqa: E402
 from src.pinn.dataset import (  # noqa: E402
     apply_split_manifest, build_anchor_dataset,
 )
@@ -235,62 +236,11 @@ def main() -> None:
             )
             attached = apply_split_manifest(dataset.frame, split_manifest)
             log_dataset_summary(logger, dataset, attached, preprocessing=prep)
-            trainer_cfg = TrainerConfig(
-                architecture=arch, preprocessing=prep, fold=fold, seed=seed,
-                max_epochs=max_epochs,
-                min_epochs=int(pinn_cfg["training"]["minimum_epochs"]),
-                early_stopping_patience=int(pinn_cfg["training"]["early_stopping_patience"]),
-                learning_rate=float(pinn_cfg["training"]["learning_rate"]),
-                weight_decay=float(pinn_cfg["training"]["weight_decay"]),
-                scheduler_factor=float(pinn_cfg["training"]["scheduler_factor"]),
-                scheduler_patience=int(pinn_cfg["training"]["scheduler_patience"]),
-                minimum_learning_rate=float(pinn_cfg["training"]["minimum_learning_rate"]),
-                gradient_clip_norm=float(pinn_cfg["training"]["gradient_clip_norm"]),
-                use_amp=bool(pinn_cfg["training"]["use_amp"]),
-                physics_float32=bool(pinn_cfg["training"]["physics_float32"]),
-                curriculum_warmup_fraction=float(pinn_cfg["curriculum"]["warmup_fraction"]),
-                curriculum_ramp_end_fraction=float(pinn_cfg["curriculum"]["ramp_end_fraction"]),
-                huber_delta=float(pinn_cfg["losses"]["huber_delta"]),
-                collocation_points=int(pinn_cfg["collocation"]["points_per_transition"]),
-                quadrature_method=str(pinn_cfg["quadrature"]["method"]),
-                quadrature_nodes=int(pinn_cfg["quadrature"]["nodes"]),
-                solution_hidden_dims=tuple(int(h) for h in pinn_cfg["model"]["solution_hidden_dims"]),
-                rate_hidden_dims=tuple(int(h) for h in pinn_cfg["model"]["rate_hidden_dims"]),
-                solution_activation=str(pinn_cfg["model"]["solution_activation"]),
-                rate_activation=str(pinn_cfg["model"]["rate_activation"]),
-                solution_dropout=float(pinn_cfg["model"].get("solution_dropout", 0.0)),
-                rate_dropout=float(pinn_cfg["model"].get("rate_dropout", 0.0)),
-                rate_uses_u_hat=bool(pinn_cfg["model"].get("rate_uses_u_hat", True)),
-                predict_delta_u=bool(pinn_cfg["model"].get("predict_delta_u", False)),
-                batch_size=int(pinn_cfg["training"].get("batch_size", 0)),
-                batch_mode=str(pinn_cfg["training"].get("batch_mode", "cell_balanced")),
-                maximum_parameters=int(pinn_cfg["model"]["maximum_parameters"]),
-                inner_split_seed=int(pinn_cfg.get("audit", {}).get(
-                    "inner_split_seed", 20240117)),
-                two_phase_refit=bool(pinn_cfg["training"].get("two_phase_refit", True)),
-                pde_gradient_min_norm=float(pinn_cfg["training"].get(
-                    "pde_gradient_min_norm", 1.0e-8)),
-                pde_gradient_zero_patience=int(pinn_cfg["training"].get(
-                    "pde_gradient_zero_patience", 5)),
-                use_gradient_balance=bool(pinn_cfg["training"].get(
-                    "use_gradient_balance", True)),
-                gradient_balance_ema=float(pinn_cfg["training"].get(
-                    "gradient_balance_ema", 0.95)),
-                gradient_balance_min_multiplier=float(pinn_cfg["training"].get(
-                    "gradient_balance_min_multiplier", 0.1)),
-                gradient_balance_max_multiplier=float(pinn_cfg["training"].get(
-                    "gradient_balance_max_multiplier", 10.0)),
-                checkpoint_after_physics_active=bool(pinn_cfg["training"].get(
-                    "checkpoint_after_physics_active", True)),
-                rate_data_weight=float(pinn_cfg["losses"].get("rate_data", 0.0)),
-                pairwise_weight=float(pinn_cfg["losses"].get("pairwise", 0.0)),
-                pairwise_max_pairs=int(pinn_cfg["training"].get(
-                    "pairwise_max_pairs", 256)),
-                log_every_epochs=int(pinn_cfg["logging"]["log_every_epochs"]),
-                save_checkpoint_every_epochs=int(pinn_cfg["logging"]["save_checkpoint_every_epochs"]),
-                log_gpu_memory=bool(pinn_cfg["logging"]["log_gpu_memory"]),
-                log_gradient_norms=bool(pinn_cfg["logging"]["log_gradient_norms"]),
-                device=device,
+            # Built by the shared builder so the main sweep, the ablation
+            # runner and nested selection (scripts/15) cannot drift apart.
+            trainer_cfg = build_trainer_config(
+                pinn_cfg, architecture=arch, preprocessing=prep, fold=fold,
+                seed=seed, max_epochs=max_epochs, device=device,
             )
             weights = LossWeights.from_mapping(pinn_cfg["losses"])
             result = train_fold(

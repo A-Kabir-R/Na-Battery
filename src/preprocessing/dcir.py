@@ -159,16 +159,21 @@ def canonical_dcir_per_file(steps: pd.DataFrame, *, nominal_capacity_Ah: float
 def previous_rpt_dcir(steps: pd.DataFrame, rpt_measurements: pd.DataFrame, *,
                       nominal_capacity_Ah: float,
                       initial_visit: int = 0) -> pd.DataFrame:
-    """Per-(condition, cell, visit) DCIR of the *previous* RPT and its drift.
+    """Per-RPT-file DCIR of the *previous* RPT and its drift.
 
-    Returns one row per RPT visit carrying that visit's own DCIR plus the
+    Returns one row per RPT **file** carrying that file's own DCIR plus the
     deviation from the cell's first valid RPT DCIR. The caller joins this onto
-    anchors using the anchor's ``previous_rpt_visit``, so no future RPT is read.
+    anchors using the anchor's ``previous_rpt_path``, so no future RPT is read.
+
+    ``path`` is carried through deliberately: visit labels are not unique (five
+    cells carry two RPT files both labelled ``V16``), so joining on
+    ``(condition, cell, visit)`` silently collapses distinct files and can bind
+    an anchor to the wrong — or, under a different file ordering, the target — RPT.
     """
     per_file = canonical_dcir_per_file(
         steps, nominal_capacity_Ah=nominal_capacity_Ah
     )
-    keys = ["condition", "cell", "visit", "file_id"]
+    keys = ["condition", "cell", "visit", "file_id", "path"]
     missing = [key for key in keys if key not in rpt_measurements.columns]
     if missing:
         raise ValueError(f"rpt_measurements is missing columns: {missing}")

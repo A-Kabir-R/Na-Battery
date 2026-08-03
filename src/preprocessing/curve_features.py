@@ -120,7 +120,11 @@ def delta_q_of_v(voltage_current: np.ndarray, capacity_current: np.ndarray,
     """
     v_cur, q_cur = _clean_monotone_xy(voltage_current, capacity_current)
     v_ref, q_ref = _clean_monotone_xy(voltage_reference, capacity_reference)
-    if v_cur.size < 2 or v_ref.size < 2:
+    # Require the same sample density as every other curve feature. The former
+    # guard was `< 2`, which let a two-point curve through: the 100-point grid
+    # below would then be interpolated from a single straight segment, and the
+    # shape statistics (logvar, skew, kurtosis) would be finite but meaningless.
+    if v_cur.size < MIN_CURVE_POINTS or v_ref.size < MIN_CURVE_POINTS:
         return dict(_DQV_NAN)
 
     low = max(float(v_cur[0]), float(v_ref[0]))

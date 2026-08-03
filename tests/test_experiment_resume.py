@@ -20,13 +20,15 @@ def test_completed_fold_is_reused_only_when_fingerprint_matches(tmp_path, monkey
     monkeypatch.setattr(
         experiment,
         "_fold_dir",
-        lambda preprocessing, target, model_name, fold: tmp_path / f"fold-{fold}",
+        lambda preprocessing, target, model_name, fold, *, tuned=False:
+            tmp_path / f"fold-{fold}{'-tuned' if tuned else ''}",
     )
     monkeypatch.setattr(experiment, "_curve_dir", lambda: tmp_path / "curves")
     monkeypatch.setattr(
         experiment,
         "_holdout_dir",
-        lambda preprocessing, target, model_name: tmp_path / "holdout",
+        lambda preprocessing, target, model_name, *, tuned=False:
+            tmp_path / f"holdout{'-tuned' if tuned else ''}",
     )
     first = experiment.run_one(
         _data(), "p1", "next_rpt_Q_Ah", "Ridge", Ridge(), "regression", n_splits=3
@@ -49,13 +51,15 @@ def test_failed_rerun_removes_stale_predictions(tmp_path, monkeypatch):
     monkeypatch.setattr(
         experiment,
         "_fold_dir",
-        lambda preprocessing, target, model_name, fold: tmp_path / f"fold-{fold}",
+        lambda preprocessing, target, model_name, fold, *, tuned=False:
+            tmp_path / f"fold-{fold}{'-tuned' if tuned else ''}",
     )
     monkeypatch.setattr(experiment, "_curve_dir", lambda: tmp_path / "curves")
     monkeypatch.setattr(
         experiment,
         "_holdout_dir",
-        lambda preprocessing, target, model_name: tmp_path / "holdout",
+        lambda preprocessing, target, model_name, *, tuned=False:
+            tmp_path / f"holdout{'-tuned' if tuned else ''}",
     )
     experiment.run_one(
         _data(), "p1", "next_rpt_Q_Ah", "Ridge", Ridge(), "regression", n_splits=3

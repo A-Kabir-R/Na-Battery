@@ -1,8 +1,10 @@
 """Publication-quality plots for NaPINN-Q.
 
-Every plot is written as PNG (300 dpi) plus PDF. Missing data raises a warning
-but does not crash the pipeline — combined reports must remain resilient to
-partial runs.
+Every plot is written in each format listed in ``config.yaml`` ``plotting.formats``
+(default: 300-dpi PNG **and** vector PDF). Journals require vector artwork for
+line figures; the module previously hardcoded PNG-only while its docstring
+claimed otherwise. Missing data raises a warning but does not crash the pipeline
+— combined reports must remain resilient to partial runs.
 
 Stage-4 diagnosis fixes applied here:
 
@@ -29,14 +31,37 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 
-FORMATS = ("png",)
+#: Fallback when the config cannot be read. Vector first: PDF is what a journal
+#: needs for line art, PNG is the convenience preview.
+FORMATS: tuple[str, ...] = ("pdf", "png")
+DEFAULT_DPI = 300
 DEFAULT_ROLE = "outer_validation"
+
+
+def _plot_settings() -> tuple[tuple[str, ...], int]:
+    """Resolve output formats and dpi from ``config.yaml``.
+
+    Falls back to the module defaults when the config is unavailable, so the
+    plotting module stays importable in tests without a configured environment.
+    """
+    try:
+        from ..io.loaders import load_config
+
+        plotting = (load_config().get("plotting") or {})
+        formats = tuple(str(f).lstrip(".") for f in (plotting.get("formats") or ()))
+        dpi = int(plotting.get("dpi", DEFAULT_DPI))
+        return (formats or FORMATS), dpi
+    except Exception:
+        return FORMATS, DEFAULT_DPI
 
 
 def _save(fig, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    for fmt in FORMATS:
-        fig.savefig(path.with_suffix(f".{fmt}"), dpi=300, bbox_inches="tight")
+    formats, dpi = _plot_settings()
+    for fmt in formats:
+        # dpi is ignored by vector backends; passing it is harmless and keeps
+        # one call site for both.
+        fig.savefig(path.with_suffix(f".{fmt}"), dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -268,7 +293,7 @@ def plot_seed_stability(target_metrics: pd.DataFrame, output_dir: Path,
     labels = [name for name, _ in per_seed.groupby("architecture")]
     if not groups:
         _skip("seed_stability", "no groups"); return
-    ax.boxplot(groups, labels=labels)
+    ax.boxplot(groups, tick_labels=labels)
     ax.set_ylabel(f"{metric} (per-seed average across folds)")
     ax.set_title(f"Seed stability ({metric}, outer validation, cell macro)")
     _save(fig, output_dir / f"seed_stability_{metric.lower()}")

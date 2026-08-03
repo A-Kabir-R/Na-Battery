@@ -14,6 +14,9 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from .metrics import REGRESSION_METRIC_NAMES, aggregated_regression_metrics, regression_metrics
+# The fold-directory naming scheme is owned by the runner; import the inverse
+# rather than re-deriving it here, so the two cannot drift.
+from ..pipeline.run_experiment import parse_mode_name
 
 
 def _ensure_split(df: pd.DataFrame) -> pd.DataFrame:
@@ -101,7 +104,11 @@ def collect_predictions(artifacts: Path | str,
         if expected is None:
             return True
         relative = path.relative_to(artifacts / "folds")
-        preprocessing, target, model, partition = relative.parts[:4]
+        mode_dir, target, model, partition = relative.parts[:4]
+        # The directory is namespaced by run mode ("unified__tuned"); the
+        # raw-results table stores the bare preprocessing name. Matching the
+        # decorated name would silently yield zero rows and an empty aggregate.
+        preprocessing, _tuned = parse_mode_name(mode_dir)
         fold = -1 if partition == "holdout" else int(partition.removeprefix("fold_"))
         rows = expected[
             expected["preprocessing"].astype(str).eq(preprocessing)
@@ -290,6 +297,17 @@ def prediction_metric_tables(predictions: pd.DataFrame, *, bootstrap_replicates:
             for metric, estimate in aggregate_metrics.items():
                 if str(base["target"]).startswith("delta_") and metric == "MAPE":
                     continue
+                # A macro R2 is the mean of per-group R2, and per-group R2 is
+                # undefined for single-anchor groups (11 of 35 cells here) --
+                # those are silently dropped by the nanmean, so the average
+                # describes an unstated subset. Averaging it is what produced the
+                # cell-macro R2 of -119 that led to a model being dropped. Report
+                # it under an accurate name so no row labelled "R2" ever carries a
+                # macro value; read n_groups_metric_valid alongside it.
+                reported_metric = (
+                    "R2_group_mean"
+                    if aggregation != "pooled" and metric == "R2" else metric
+                )
                 ci = intervals.get((aggregation, metric), (np.nan, np.nan))
                 if group_source is None:
                     group_metrics_values = [estimate]
@@ -298,7 +316,7 @@ def prediction_metric_tables(predictions: pd.DataFrame, *, bootstrap_replicates:
                         metric_dict[metric] for metric_dict in group_source.values()
                     ]
                 summary_rows.append({
-                    **base, "aggregation": aggregation, "metric": metric,
+                    **base, "aggregation": aggregation, "metric": reported_metric,
                     "estimate": estimate, "ci_low": ci[0], "ci_high": ci[1],
                     "n_rows": n_rows_total,
                     "n_valid_rows": n_valid_rows_total,

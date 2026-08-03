@@ -61,13 +61,15 @@ def _pooled_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
 
 
-def _within_cell_rmse_ratio(predictions: pd.DataFrame, true_col: str,
-                             pred_col: str, group_col: str) -> float:
-    """Bounded generalization metric that never blows up on tiny groups.
+def _pooled_rmse_over_global_sd(predictions: pd.DataFrame, true_col: str,
+                                 pred_col: str) -> float:
+    """Pooled RMSE divided by the global standard deviation of ``y_true``.
 
-    Numerator: overall pooled RMSE.
-    Denominator: standard deviation of y_true across ALL rows (not per-cell).
-    Result is on [0, ∞); ratio < 1 means predictions beat the global mean.
+    Bounded on [0, inf); a value below 1 means the predictions beat the global
+    mean. Deliberately **not** a within-cell quantity: it takes no grouping and
+    is identical on the pooled, cell_macro and condition_macro rows. It was
+    previously named ``within_cell_rmse_ratio`` and accepted a ``group_col``
+    that it never used, which made it read as a per-cell metric.
     """
     y = pd.to_numeric(predictions[true_col], errors="coerce").to_numpy(dtype=float)
     p = pd.to_numeric(predictions[pred_col], errors="coerce").to_numpy(dtype=float)
@@ -85,13 +87,26 @@ def _within_cell_rmse_ratio(predictions: pd.DataFrame, true_col: str,
 def target_metric_rows(predictions: pd.DataFrame) -> pd.DataFrame:
     """Compute per-target metrics for pooled, cell-macro and condition-macro.
 
-    Stage-3 fix #5: for cell_macro and condition_macro:
-      * MAE / RMSE / MaxError / MAPE remain mean-of-per-group.
-      * R² is now the *pooled* R² across all rows (bounded, stable on
-        tiny groups). The historical mean-of-per-group R² is preserved as
-        ``R2_group_mean`` for backwards compatibility with older plots.
-    A new column ``within_cell_rmse_ratio`` is added: RMSE / std(y_true)
-    over all rows, bounded on [0, ∞).
+    MAE / RMSE / MaxError / MAPE are genuine group-then-average macros on the
+    ``cell_macro`` and ``condition_macro`` rows.
+
+    R² is reported in three explicitly-named columns so that no value ever
+    contradicts the label of the row it sits on:
+
+    ``R2``
+        Pooled R² on the ``pooled`` row; **NaN** on the macro rows. A macro R²
+        is not reported because per-group R² is undefined for single-anchor
+        groups (11 of 35 cells here) and unstable for the rest -- averaging it
+        is what produced the notorious cell-macro R² of -119 that led to a model
+        being dropped. Use cell-macro *MAE* as the primary macro metric.
+    ``R2_pooled``
+        The pooled R², repeated on every row for convenience.
+    ``R2_group_mean``
+        Mean of the per-group R² on macro rows, NaN on the pooled row. Retained
+        for diagnostics only; read ``n_groups_R2_valid`` alongside it, since
+        groups with fewer than two rows are silently dropped from the mean.
+
+    Previously ``R2`` on a macro row silently carried the pooled value.
     """
     rows: list[dict[str, object]] = []
     for target in TARGET_VIEWS:
@@ -114,6 +129,7 @@ def target_metric_rows(predictions: pd.DataFrame) -> pd.DataFrame:
                 metrics = _regression_metrics(y_true_all, y_pred_all,
                                                target=target)
                 metrics["R2_group_mean"] = float("nan")
+                metrics["n_groups_R2_valid"] = 0
                 group_col = None
             else:
                 group_col = "cell_id" if aggregation == "cell_macro" else "condition_id"
@@ -128,26 +144,34 @@ def target_metric_rows(predictions: pd.DataFrame) -> pd.DataFrame:
                     metrics = {"MAE": float("nan"), "RMSE": float("nan"),
                                "R2": float("nan"), "MaxError": float("nan"),
                                "MAPE": float("nan"), "n": 0,
-                               "R2_group_mean": float("nan")}
+                               "R2_group_mean": float("nan"),
+                               "n_groups_R2_valid": 0}
                 else:
                     metrics = {
                         key: float(np.nanmean([row[key] for row in per_group]))
                         if key != "n" else int(sum(row["n"] for row in per_group))
                         for key in ("MAE", "RMSE", "MaxError", "MAPE", "n")
                     }
-                    # Preserve the legacy mean-of-per-group R² for reference,
-                    # but promote the pooled R² to the primary column.
-                    metrics["R2_group_mean"] = float(
-                        np.nanmean([row["R2"] for row in per_group])
+                    group_r2 = np.asarray(
+                        [row["R2"] for row in per_group], dtype=float
                     )
-                    metrics["R2"] = pooled_r2
+                    metrics["R2_group_mean"] = (
+                        float(np.nanmean(group_r2))
+                        if np.isfinite(group_r2).any() else float("nan")
+                    )
+                    # How many groups actually admitted an R2. Single-row groups
+                    # yield NaN and vanish from the mean above; without this the
+                    # macro R2 silently describes a subset of the groups.
+                    metrics["n_groups_R2_valid"] = int(np.isfinite(group_r2).sum())
+                    # A macro R2 is not reported -- see the docstring.
+                    metrics["R2"] = float("nan")
             row = {
                 "target": target,
                 "aggregation": aggregation,
                 **metrics,
-                "within_cell_rmse_ratio":
-                    _within_cell_rmse_ratio(predictions, true_col, pred_col,
-                                              group_col or "cell_id"),
+                "R2_pooled": pooled_r2,
+                "pooled_rmse_over_global_sd":
+                    _pooled_rmse_over_global_sd(predictions, true_col, pred_col),
             }
             for column in ("architecture", "preprocessing", "fold", "seed",
                            "evaluation_role", "ablation"):
