@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Physics-loss ablation suite (A0..A5) using the winning development preprocessing.
+"""Physics-loss and hybrid-rate ablation suite (A0–A13) using the winning development preprocessing.
 
 Each ablation configuration is specified in ``config.yaml`` under
-``pinn.ablation.configurations``. The winning preprocessing is selected by the
-development-only CV ranking table produced by scripts/07.
+``pinn.ablation.configurations``. A8–A13 isolate hybrid-rate components and use
+``model_overrides`` dicts to override model-level flags per ablation. The winning
+preprocessing is selected by the development-only CV ranking table produced by scripts/07.
 """
 from __future__ import annotations
 
@@ -170,9 +171,11 @@ def main() -> None:
         arch = str(config_row["architecture"])
         weights = LossWeights.from_mapping(config_row["weights"])
         include_discrete = bool(config_row["weights"].get("discrete_state_transition", 0.0))
-        # Per-ablation override for rate_uses_u_hat (A6 constrained rate).
-        rate_uses_u_hat = bool(config_row.get(
-            "rate_uses_u_hat", pinn_cfg["model"].get("rate_uses_u_hat", True)))
+        # Merge per-ablation model_overrides (A8–A13) on top of global model config.
+        model_overrides = config_row.get("model_overrides") or {}
+        model_cfg = {**pinn_cfg["model"], **model_overrides}
+        # Top-level rate_uses_u_hat on the config_row (A6 legacy path) wins over model_overrides.
+        rate_uses_u_hat = bool(config_row.get("rate_uses_u_hat", model_cfg.get("rate_uses_u_hat", True)))
         run_dir = results / "ablation" / str(config_row["name"]) / preprocessing / f"fold_{fold}" / f"seed_{seed}"
         paths = FoldPaths(root=run_dir)
         trainer_cfg = TrainerConfig(
@@ -194,16 +197,17 @@ def main() -> None:
             collocation_points=int(pinn_cfg["collocation"]["points_per_transition"]),
             quadrature_method=str(pinn_cfg["quadrature"]["method"]),
             quadrature_nodes=int(pinn_cfg["quadrature"]["nodes"]),
-            solution_hidden_dims=tuple(int(h) for h in pinn_cfg["model"]["solution_hidden_dims"]),
-            rate_hidden_dims=tuple(int(h) for h in pinn_cfg["model"]["rate_hidden_dims"]),
-            solution_activation=str(pinn_cfg["model"]["solution_activation"]),
-            rate_activation=str(pinn_cfg["model"]["rate_activation"]),
-            solution_dropout=float(pinn_cfg["model"].get("solution_dropout", 0.0)),
-            rate_dropout=float(pinn_cfg["model"].get("rate_dropout", 0.0)),
+            solution_hidden_dims=tuple(int(h) for h in model_cfg["solution_hidden_dims"]),
+            rate_hidden_dims=tuple(int(h) for h in model_cfg["rate_hidden_dims"]),
+            solution_activation=str(model_cfg["solution_activation"]),
+            rate_activation=str(model_cfg["rate_activation"]),
+            solution_dropout=float(model_cfg.get("solution_dropout", 0.0)),
+            rate_dropout=float(model_cfg.get("rate_dropout", 0.0)),
             rate_uses_u_hat=rate_uses_u_hat,
-            predict_delta_u=bool(pinn_cfg["model"].get("predict_delta_u", False)),
+            predict_delta_u=bool(model_cfg.get("predict_delta_u", False)),
             batch_size=int(pinn_cfg["training"].get("batch_size", 0)),
-            maximum_parameters=int(pinn_cfg["model"]["maximum_parameters"]),
+            batch_mode=str(pinn_cfg["training"].get("batch_mode", "cell_balanced")),
+            maximum_parameters=int(model_cfg["maximum_parameters"]),
             inner_split_seed=int(pinn_cfg.get("audit", {}).get(
                 "inner_split_seed", 20240117)),
             two_phase_refit=bool(pinn_cfg["training"].get("two_phase_refit", True)),
@@ -213,6 +217,23 @@ def main() -> None:
                 "pde_gradient_zero_patience", 5)),
             use_gradient_balance=bool(pinn_cfg["training"].get(
                 "use_gradient_balance", True)),
+            gradient_balance_ema=float(pinn_cfg["training"].get(
+                "gradient_balance_ema", 0.95)),
+            gradient_balance_min_multiplier=float(pinn_cfg["training"].get(
+                "gradient_balance_min_multiplier", 0.1)),
+            gradient_balance_max_multiplier=float(pinn_cfg["training"].get(
+                "gradient_balance_max_multiplier", 10.0)),
+            checkpoint_after_physics_active=bool(pinn_cfg["training"].get(
+                "checkpoint_after_physics_active", True)),
+            rate_data_weight=float(pinn_cfg["losses"].get("rate_data", 0.0)),
+            pairwise_weight=float(pinn_cfg["losses"].get("pairwise", 0.0)),
+            use_hybrid_rate=bool(model_cfg.get("use_hybrid_rate", False)),
+            hybrid_temperature_feature=str(model_cfg.get("hybrid_temperature_feature", "T_degC")),
+            hybrid_dod_feature=str(model_cfg.get("hybrid_dod_feature", "DOD_pct")),
+            hybrid_c_rate_feature=str(model_cfg.get("hybrid_c_rate_feature", "")),
+            hybrid_enable_cold_regime=bool(model_cfg.get("hybrid_enable_cold_regime", True)),
+            hybrid_fit_c_rate_exponent=bool(model_cfg.get("hybrid_fit_c_rate_exponent", False)),
+            hybrid_residual_share_limit=float(model_cfg.get("hybrid_residual_share_limit", 0.5)),
             log_every_epochs=int(pinn_cfg["logging"]["log_every_epochs"]),
             save_checkpoint_every_epochs=int(pinn_cfg["logging"]["save_checkpoint_every_epochs"]),
             log_gpu_memory=bool(pinn_cfg["logging"]["log_gpu_memory"]),

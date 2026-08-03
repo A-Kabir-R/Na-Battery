@@ -426,7 +426,7 @@ pinn:
     # use_hybrid_rate: true is set at the model level; set them to false
     # and run A0–A7 first to establish the generic-rate baseline, then
     # set use_hybrid_rate: true and re-enable A8–A13.
-    enabled: false  # set true to run; separate sweep from the main fold run
+    enabled: true  # set true to run; separate sweep from the main fold run
     configurations:
       # ---- A0–A7: generic NaPINN-Q ablations (ODE loss weight keys) ---------
       - name: "A0_Data_Only"

@@ -46,12 +46,23 @@ def test_trainer_config_declares_field(field):
 
 
 def test_runner_passes_every_required_field_to_trainer_config():
-    """The runner script must actually set each field, not rely on defaults."""
-    source = (CONFIG_PATH.parent / "scripts" / "06_run_pinn_experiments.py").read_text(
+    """Every required field must be explicitly wired somewhere in the training pipeline.
+
+    06_run_pinn_experiments.py delegates to build_trainer_config(), so the field
+    assignment lives in config_builder.py.  Either location counts as explicitly
+    wired — relying on TrainerConfig dataclass defaults is not acceptable.
+    """
+    runner_src = (CONFIG_PATH.parent / "scripts" / "06_run_pinn_experiments.py").read_text(
         encoding="utf-8"
     )
+    builder_src = (CONFIG_PATH.parent / "src" / "pinn" / "config_builder.py").read_text(
+        encoding="utf-8"
+    )
+    combined = runner_src + builder_src
     for field in REQUIRED_TRAINER_FIELDS:
-        assert f"{field}=" in source, f"06_run_pinn_experiments.py never sets {field}"
+        assert f"{field}=" in combined, (
+            f"Neither 06_run_pinn_experiments.py nor config_builder.py sets {field}"
+        )
 
 
 def test_config_declares_the_new_loss_and_batching_keys():

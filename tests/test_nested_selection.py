@@ -15,7 +15,7 @@ from src.pinn.nested_selection import (
 def _curve(values, start: int = 0) -> pd.DataFrame:
     return pd.DataFrame({
         "epoch": np.arange(start, start + len(values)),
-        "val_MAE": np.asarray(values, dtype=float),
+        "validation_MAE": np.asarray(values, dtype=float),
     })
 
 
@@ -89,8 +89,8 @@ def test_empty_input_is_rejected():
 
 def test_nan_rows_are_ignored_not_propagated():
     logs = {
-        0: pd.DataFrame({"epoch": [0, 1, 2], "val_MAE": [1.0, np.nan, 0.2]}),
-        1: pd.DataFrame({"epoch": [0, 1, 2], "val_MAE": [1.0, 0.5, 0.3]}),
+        0: pd.DataFrame({"epoch": [0, 1, 2], "validation_MAE": [1.0, np.nan, 0.2]}),
+        1: pd.DataFrame({"epoch": [0, 1, 2], "validation_MAE": [1.0, 0.5, 0.3]}),
     }
     selection = select_epoch(logs)
     assert selection.best_epoch == 2

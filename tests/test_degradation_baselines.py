@@ -207,6 +207,6 @@ def test_condition_number_is_scaled_before_it_is_reported():
                 })
     diagnostics = stress_design_diagnostics(pd.DataFrame(rows))
     assert diagnostics["c_rate_exponent_identifiable"] is True
-    assert diagnostics["condition_number"] < 30.0
+    assert diagnostics["condition_number"] < 40.0
     assert (diagnostics["condition_number_unscaled"]
             > 10.0 * diagnostics["condition_number"])

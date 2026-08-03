@@ -369,9 +369,14 @@ def _diagnostic_curve(data: pd.DataFrame, train_indices: np.ndarray, target: str
         )
     x_inner_val = preprocessor.transform(outer_train.iloc[inner_val])
     y = outer_train[target].to_numpy()
+    # Unwrap GridSearchCV: diagnostic curves only need the base estimator with
+    # default (or best) hyperparameters. GridSearchCV.fit() requires groups via
+    # the metadata routing API in sklearn ≥1.6, but fit_with_curves calls plain
+    # fit(X, y) with no groups argument, so we extract the inner estimator here.
+    base_model = getattr(model, "estimator", model)
     _, curve = fit_with_curves(
         model_name,
-        clone(model),
+        clone(base_model),
         x_inner_train,
         y[inner_train],
         x_inner_val,

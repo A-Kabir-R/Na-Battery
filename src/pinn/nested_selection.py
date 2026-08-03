@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-VALIDATION_COLUMN = "val_MAE"
+VALIDATION_COLUMN = "validation_MAE"
 EPOCH_COLUMN = "epoch"
 
 
