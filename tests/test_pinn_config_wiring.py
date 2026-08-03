@@ -212,6 +212,36 @@ def test_loss_weights_round_trip_the_new_components():
     assert "rate_data" in weights.as_dict()
 
 
+def test_loss_weights_pde_alias_maps_to_ode():
+    """Legacy 'pde' key must be accepted and stored under the 'ode' field."""
+    weights = LossWeights.from_mapping({"data": 1.0, "pde": 0.07})
+    assert weights.ode == pytest.approx(0.07)
+    assert weights.pde == pytest.approx(0.07)   # property alias
+    assert "ode" in weights.as_dict()
+    assert "pde" not in weights.as_dict()        # dict uses canonical name
+
+
+def test_loss_weights_ode_key_accepted():
+    """New 'ode' key must also be accepted (takes precedence over 'pde')."""
+    weights = LossWeights.from_mapping({"data": 1.0, "ode": 0.03, "pde": 0.07})
+    assert weights.ode == pytest.approx(0.03)    # ode wins
+
+
+def test_loss_weights_residual_share_defaults_to_zero():
+    weights = LossWeights.from_mapping({"data": 1.0, "ode": 0.01})
+    assert weights.residual_share == pytest.approx(0.0)
+    assert "residual_share" in weights.as_dict()
+
+
+def test_residual_share_is_not_curriculum_ramped():
+    """Like rate_data and pairwise, it is a data-like penalty."""
+    weights = LossWeights.from_mapping({
+        "data": 1.0, "ode": 0.5, "residual_share": 0.05,
+    })
+    effective = weights.effective(0.0)
+    assert effective.residual_share == pytest.approx(0.05)
+
+
 def test_rate_data_and_pairwise_are_not_curriculum_ramped():
     """They are data-like supervision, so they must be active from epoch 0."""
     weights = LossWeights.from_mapping({

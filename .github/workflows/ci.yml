@@ -41,11 +41,12 @@ jobs:
         run: python -m pytest tests/ -q --durations=10
 
       - name: Leakage guards
-        # These encode the correctness properties that are expensive to notice
-        # by eye and cheap to assert: no cell on both sides of any split, and no
-        # metric column carrying a value that contradicts its label.
+        # Re-run the cell-disjoint split and leakage assertions in isolation
+        # with verbose output so failures are easy to triage. The files below
+        # are a subset of tests/ already run above; pytest deduplicates them
+        # automatically, so the step only adds the -v flag for these targets.
         run: |
-          python -m pytest tests/ -q \
+          python -m pytest -v \
             tests/test_grouped_inner_cv.py \
             tests/test_condition_holdout.py \
             tests/test_inner_fold_partition.py \

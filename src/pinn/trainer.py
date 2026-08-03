@@ -38,6 +38,7 @@ from .losses import (
     integral_consistency_loss, monotonicity_loss, observed_degradation_rate,
     pairwise_delta_loss, pde_loss, rate_data_loss, rate_regularization_loss,
 )
+from .degradation_laws import HybridRateModel, parameter_prior_penalty, residual_share_penalty
 from .models import NaPINNQ, count_parameters
 from .physics import (
     autograd_du_ds, discrete_state_transition_residual, integral_transition,
@@ -148,6 +149,18 @@ class TrainerConfig:
     # Cross-cell relative-degradation regulariser. 0.0 disables it.
     pairwise_weight: float = 0.0
     pairwise_max_pairs: int = 256
+    # Hybrid rate model. When True, NaPINNQ uses HybridRateModel instead of
+    # RateNet and the named rate components (cycling/cold/diagnostic/residual)
+    # are available for decomposition analysis and the residual-share penalty.
+    use_hybrid_rate: bool = False
+    hybrid_temperature_feature: str = "T_degC"
+    hybrid_dod_feature: str = "DOD_pct"
+    hybrid_c_rate_feature: str = ""  # empty → use DOD index; C-rate frozen at 0
+    hybrid_enable_cold_regime: bool = True
+    hybrid_fit_c_rate_exponent: bool = False
+    # Upper bound on the neural residual's share of the total rate. Only
+    # applied when use_hybrid_rate=True and residual_share weight > 0.
+    hybrid_residual_share_limit: float = 0.5
 
 
 @dataclass
@@ -691,6 +704,33 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
             f"unsupported architecture: {config.architecture} (only NaPINN-Q is supported)"
         )
     feature_dim = 2 + len(scaler.feature_columns_used or [])
+
+    # Resolve hybrid-rate feature indices if requested. The feature matrix is
+    # [horizon, u_current, *scaled_features], so each registry column sits at
+    # index 2 + position_in_feature_columns_used.
+    hybrid_temp_idx: int | None = None
+    hybrid_dod_idx: int | None = None
+    hybrid_crate_idx: int | None = None
+    if config.use_hybrid_rate:
+        cols = list(scaler.feature_columns_used or [])
+        if config.hybrid_temperature_feature not in cols:
+            raise FoldTrainingError(
+                f"Hybrid rate: temperature feature "
+                f"'{config.hybrid_temperature_feature}' not found in feature "
+                f"columns {cols[:10]}…"
+            )
+        if config.hybrid_dod_feature not in cols:
+            raise FoldTrainingError(
+                f"Hybrid rate: DOD feature '{config.hybrid_dod_feature}' not "
+                f"found in feature columns {cols[:10]}…"
+            )
+        hybrid_temp_idx = 2 + cols.index(config.hybrid_temperature_feature)
+        hybrid_dod_idx = 2 + cols.index(config.hybrid_dod_feature)
+        if config.hybrid_c_rate_feature and config.hybrid_c_rate_feature in cols:
+            hybrid_crate_idx = 2 + cols.index(config.hybrid_c_rate_feature)
+        else:
+            hybrid_crate_idx = hybrid_dod_idx
+
     model = NaPINNQ(
         feature_dim=feature_dim,
         solution_hidden_dims=config.solution_hidden_dims,
@@ -701,6 +741,12 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
         rate_dropout=config.rate_dropout,
         rate_uses_u_hat=config.rate_uses_u_hat,
         predict_delta_u=config.predict_delta_u,
+        use_hybrid_rate=config.use_hybrid_rate,
+        hybrid_temperature_index=hybrid_temp_idx,
+        hybrid_dod_index=hybrid_dod_idx,
+        hybrid_c_rate_index=hybrid_crate_idx,
+        hybrid_enable_cold_regime=config.hybrid_enable_cold_regime,
+        hybrid_fit_c_rate_exponent=config.hybrid_fit_c_rate_exponent,
     )
 
     trainable_parameters = count_parameters(model)
@@ -1092,7 +1138,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
 
                 total_loss = (
                     effective_weights.data * train_data_loss
-                    + effective_weights.pde * multipliers["pde"] * pde_anchor_and_collo
+                    + effective_weights.ode * multipliers["pde"] * pde_anchor_and_collo
                     + effective_weights.initial_condition * ic_loss
                     + effective_weights.integral * multipliers["integral"] * integral_loss
                     + effective_weights.monotonicity * multipliers["monotonicity"] * mono_loss_val
@@ -1102,6 +1148,17 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                     + effective_weights.pairwise * multipliers["pairwise"] * pairwise_val
                     + effective_weights.discrete_state_transition * discrete_val
                 )
+                if (effective_weights.residual_share > 0.0
+                        and isinstance(model.rate, HybridRateModel)):
+                    comps = model.rate.components(
+                        stress_next_tensor, batch_features, u_next_hat.detach()
+                    )
+                    rshare_pen = residual_share_penalty(
+                        comps, limit=config.hybrid_residual_share_limit,
+                    )
+                    total_loss = total_loss + effective_weights.residual_share * rshare_pen
+                    if config.use_hybrid_rate:
+                        total_loss = total_loss + parameter_prior_penalty(model.rate)
 
                 if not torch.isfinite(total_loss):
                     raise FoldTrainingError(
@@ -1692,6 +1749,19 @@ def _refit_full_outer_train(
     set_seeds(config.seed)
     backend_state = configure_torch_backend(deterministic=config.deterministic)
     feature_dim = 2 + len(original_cols)
+
+    refit_hybrid_temp_idx: int | None = None
+    refit_hybrid_dod_idx: int | None = None
+    refit_hybrid_crate_idx: int | None = None
+    if config.use_hybrid_rate:
+        rcols = list(original_cols)
+        refit_hybrid_temp_idx = 2 + rcols.index(config.hybrid_temperature_feature)
+        refit_hybrid_dod_idx = 2 + rcols.index(config.hybrid_dod_feature)
+        if config.hybrid_c_rate_feature and config.hybrid_c_rate_feature in rcols:
+            refit_hybrid_crate_idx = 2 + rcols.index(config.hybrid_c_rate_feature)
+        else:
+            refit_hybrid_crate_idx = refit_hybrid_dod_idx
+
     refit_model = NaPINNQ(
         feature_dim=feature_dim,
         solution_hidden_dims=config.solution_hidden_dims,
@@ -1702,6 +1772,12 @@ def _refit_full_outer_train(
         rate_dropout=config.rate_dropout,
         rate_uses_u_hat=config.rate_uses_u_hat,
         predict_delta_u=config.predict_delta_u,
+        use_hybrid_rate=config.use_hybrid_rate,
+        hybrid_temperature_index=refit_hybrid_temp_idx,
+        hybrid_dod_index=refit_hybrid_dod_idx,
+        hybrid_c_rate_index=refit_hybrid_crate_idx,
+        hybrid_enable_cold_regime=config.hybrid_enable_cold_regime,
+        hybrid_fit_c_rate_exponent=config.hybrid_fit_c_rate_exponent,
     )
     refit_model.to(device)
     optimizer = _init_optimizer(refit_model, config)
@@ -1916,7 +1992,7 @@ def _refit_full_outer_train(
 
             total = (
                 effective_weights.data * data_l
-                + effective_weights.pde * multipliers["pde"] * pde_total
+                + effective_weights.ode * multipliers["pde"] * pde_total
                 + effective_weights.initial_condition * ic_l
                 + effective_weights.integral * multipliers["integral"] * integral_l
                 + effective_weights.monotonicity * multipliers["monotonicity"] * mono_l
@@ -1926,6 +2002,15 @@ def _refit_full_outer_train(
                 + effective_weights.pairwise * multipliers["pairwise"] * pairwise_l
                 + effective_weights.discrete_state_transition * discrete_l
             )
+            if (effective_weights.residual_share > 0.0
+                    and isinstance(refit_model.rate, HybridRateModel)):
+                refit_comps = refit_model.rate.components(
+                    stress_next_tensor, batch_features, u_next_hat.detach()
+                )
+                total = total + effective_weights.residual_share * residual_share_penalty(
+                    refit_comps, limit=config.hybrid_residual_share_limit,
+                )
+                total = total + parameter_prior_penalty(refit_model.rate)
             if not torch.isfinite(total):
                 raise FoldTrainingError(
                     f"non-finite refit loss at refit epoch {epoch} batch {b}: {total.item()}"

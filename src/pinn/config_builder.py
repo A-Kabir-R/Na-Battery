@@ -92,6 +92,21 @@ def build_trainer_config(pinn_cfg: dict[str, Any], *, architecture: str,
         log_gpu_memory=bool(logging_cfg["log_gpu_memory"]),
         log_gradient_norms=bool(logging_cfg["log_gradient_norms"]),
         device=device,
+        use_hybrid_rate=bool(model.get("use_hybrid_rate", False)),
+        hybrid_temperature_feature=str(
+            model.get("hybrid_temperature_feature", "T_degC")
+        ),
+        hybrid_dod_feature=str(model.get("hybrid_dod_feature", "DOD_pct")),
+        hybrid_c_rate_feature=str(model.get("hybrid_c_rate_feature", "")),
+        hybrid_enable_cold_regime=bool(
+            model.get("hybrid_enable_cold_regime", True)
+        ),
+        hybrid_fit_c_rate_exponent=bool(
+            model.get("hybrid_fit_c_rate_exponent", False)
+        ),
+        hybrid_residual_share_limit=float(
+            model.get("hybrid_residual_share_limit", 0.5)
+        ),
     )
     for key, value in overrides.items():
         if not hasattr(config, key):

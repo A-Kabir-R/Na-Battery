@@ -261,6 +261,31 @@ pinn:
     # which does NOT satisfy the initial condition; it was merely penalised.)
     predict_delta_u: true
     maximum_parameters: 50000
+    # ---------------------------------------------------------------------------
+    # Hybrid rate model (opt-in). When use_hybrid_rate is true, NaPINNQ
+    # replaces the generic RateNet with HybridRateModel, which decomposes the
+    # degradation rate into named physical components:
+    #
+    #   r_total = r_cycling + r_cold + r_calendar + r_diagnostic + r_residual
+    #
+    # r_cycling is an Arrhenius × DOD power law; r_cold is a sigmoidal
+    # low-temperature term; r_residual is a neural correction penalised toward
+    # zero (weight = losses.residual_share). The two stress-condition features
+    # (T_degC, DOD_pct) must be present in the unified feature registry.
+    #
+    # NOTE: DOD20 and DOD80 are both tested at 2C only, so DOD and C-rate
+    # exponents are confounded (condition number ~1.3e4). The C-rate exponent
+    # is frozen at zero (hybrid_fit_c_rate_exponent: false) following Klick et
+    # al. (Batteries & Supercaps 2025), who report no significant C-rate effect.
+    # Set hybrid_fit_c_rate_exponent: true to test that published finding.
+    # ---------------------------------------------------------------------------
+    use_hybrid_rate: false          # set true to activate
+    hybrid_temperature_feature: "T_degC"
+    hybrid_dod_feature: "DOD_pct"
+    hybrid_c_rate_feature: ""       # empty → DOD column reused; exponent frozen 0
+    hybrid_enable_cold_regime: true
+    hybrid_fit_c_rate_exponent: false
+    hybrid_residual_share_limit: 0.5
 
   collocation:
     enabled: true
@@ -326,7 +351,10 @@ pinn:
     # raw scale mismatch between components, so these express intent rather than
     # magnitude. Any retuning must use INNER-validation only.
     data: 1.0
-    pde: 0.01
+    # ODE residual: du/ds + r = 0. The governing equation is an ordinary (not
+    # partial) differential equation in the stress coordinate s; "pde" is
+    # accepted as a legacy alias by LossWeights.from_mapping.
+    ode: 0.01
     # With the hard initial condition the IC residual is identically zero, so
     # this weight is inert by construction. It is kept at a small non-zero value
     # only so the logged residual keeps acting as a runtime assertion that the
@@ -345,6 +373,10 @@ pinn:
     # as a reported ablation.
     pairwise: 0.0
     huber_delta: 1.0
+    # Neural-residual share penalty (HybridRateModel only). Active only when
+    # pinn.model.use_hybrid_rate is true. Penalises the neural residual for
+    # carrying more than hybrid_residual_share_limit of the total rate.
+    residual_share: 0.01
 
   bounds:
     u_min: 0.0
@@ -387,43 +419,103 @@ pinn:
     log_physics_metrics: true
 
   ablation:
-    enabled: false  # DISABLED: ablation suite deferred; re-enable when ready to run A0–A7
+    # A0–A7 isolate existing NaPINN-Q components (ODE residual, integral
+    # consistency, monotonicity, bounds, IC, rate supervision, pairwise).
+    # A8–A13 isolate the new hybrid-rate components (parametric law, cold
+    # regime, diagnostics, residual share). A8–A13 only make sense when
+    # use_hybrid_rate: true is set at the model level; set them to false
+    # and run A0–A7 first to establish the generic-rate baseline, then
+    # set use_hybrid_rate: true and re-enable A8–A13.
+    enabled: false  # set true to run; separate sweep from the main fold run
     configurations:
+      # ---- A0–A7: generic NaPINN-Q ablations (ODE loss weight keys) ---------
       - name: "A0_Data_Only"
         architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.0, initial_condition: 0.0, integral: 0.0,
+        weights: {data: 1.0, ode: 0.0, initial_condition: 0.0, integral: 0.0,
                   monotonicity: 0.0, bounds: 0.0, rate_regularization: 0.0}
-      - name: "A1_No_PDE"
+      - name: "A1_No_ODE_Residual"
         architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.0, initial_condition: 0.1, integral: 0.005,
+        weights: {data: 1.0, ode: 0.0, initial_condition: 0.1, integral: 0.005,
                   monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4}
       - name: "A2_No_Integral"
         architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.0,
+        weights: {data: 1.0, ode: 0.01, initial_condition: 0.1, integral: 0.0,
                   monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4}
       - name: "A3_No_Monotonicity"
         architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.005,
+        weights: {data: 1.0, ode: 0.01, initial_condition: 0.1, integral: 0.005,
                   monotonicity: 0.0, bounds: 0.5, rate_regularization: 1.0e-4}
       - name: "A4_No_Bounds"
         architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.005,
+        weights: {data: 1.0, ode: 0.01, initial_condition: 0.1, integral: 0.005,
                   monotonicity: 0.5, bounds: 0.0, rate_regularization: 1.0e-4}
       - name: "A5_Full_NaPINN_Q"
         architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.005,
+        weights: {data: 1.0, ode: 0.01, initial_condition: 0.1, integral: 0.005,
                   monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4,
                   rate_data: 0.05, pairwise: 0.0}
-      # Isolates the new direct rate supervision.
+      # Isolates the direct rate supervision contribution.
       - name: "A6_No_Rate_Supervision"
         architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.005,
+        weights: {data: 1.0, ode: 0.01, initial_condition: 0.1, integral: 0.005,
                   monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4,
                   rate_data: 0.0, pairwise: 0.0}
       # Reports the cross-cell pairwise loss as an ablation rather than baking
       # an inner-validation-tuned weight into the headline model.
       - name: "A7_With_Pairwise"
         architecture: "NaPINN-Q"
-        weights: {data: 1.0, pde: 0.01, initial_condition: 0.1, integral: 0.005,
+        weights: {data: 1.0, ode: 0.01, initial_condition: 0.1, integral: 0.005,
                   monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4,
                   rate_data: 0.05, pairwise: 0.02}
+      # ---- A8–A13: hybrid-rate component ablations (require use_hybrid_rate) -
+      # A8: replace HybridRateModel with generic RateNet (hard IC + all physics
+      # losses active). This is the "no parametric law" baseline.
+      - name: "A8_Generic_Rate_Baseline"
+        architecture: "NaPINN-Q"
+        model_overrides: {use_hybrid_rate: false}
+        weights: {data: 1.0, ode: 0.01, initial_condition: 0.1, integral: 0.005,
+                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4,
+                  rate_data: 0.05, pairwise: 0.0, residual_share: 0.0}
+      # A9: hybrid model, cold-regime term disabled. Isolates the low-temperature
+      # gating contribution. Most cells are at 25 °C or 50 °C; this ablation is
+      # only meaningfully different for the two -10 °C cells.
+      - name: "A9_No_Cold_Regime"
+        architecture: "NaPINN-Q"
+        model_overrides: {use_hybrid_rate: true, hybrid_enable_cold_regime: false}
+        weights: {data: 1.0, ode: 0.01, initial_condition: 0.1, integral: 0.005,
+                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4,
+                  rate_data: 0.05, pairwise: 0.0, residual_share: 0.01}
+      # A10: hybrid model, no residual-share penalty. Lets the neural residual
+      # grow without constraint, turning the model back toward a black box.
+      - name: "A10_No_Residual_Share_Penalty"
+        architecture: "NaPINN-Q"
+        model_overrides: {use_hybrid_rate: true}
+        weights: {data: 1.0, ode: 0.01, initial_condition: 0.1, integral: 0.005,
+                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4,
+                  rate_data: 0.05, pairwise: 0.0, residual_share: 0.0}
+      # A11: hybrid model, C-rate exponent fitted (not frozen at 0). Tests the
+      # Klick et al. finding that C-rate has no significant effect; expected to
+      # converge to near-zero alpha given the confounded test matrix.
+      - name: "A11_Fit_C_Rate_Exponent"
+        architecture: "NaPINN-Q"
+        model_overrides: {use_hybrid_rate: true, hybrid_fit_c_rate_exponent: true}
+        weights: {data: 1.0, ode: 0.01, initial_condition: 0.1, integral: 0.005,
+                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4,
+                  rate_data: 0.05, pairwise: 0.0, residual_share: 0.01}
+      # A12: full hybrid model, all components active. This is the headline
+      # hybrid-NaPINN-Q configuration that the paper reports.
+      - name: "A12_Full_Hybrid_NaPINN_Q"
+        architecture: "NaPINN-Q"
+        model_overrides: {use_hybrid_rate: true}
+        weights: {data: 1.0, ode: 0.01, initial_condition: 0.1, integral: 0.005,
+                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4,
+                  rate_data: 0.05, pairwise: 0.0, residual_share: 0.01}
+      # A13: hard initial condition disabled (soft IC, penalised). Tests whether
+      # the exact IC enforcement is necessary or whether a strong IC penalty
+      # achieves the same result. Uses hybrid model for fair comparison.
+      - name: "A13_Soft_Initial_Condition"
+        architecture: "NaPINN-Q"
+        model_overrides: {use_hybrid_rate: true, predict_delta_u: false}
+        weights: {data: 1.0, ode: 0.01, initial_condition: 1.0, integral: 0.005,
+                  monotonicity: 0.5, bounds: 0.5, rate_regularization: 1.0e-4,
+                  rate_data: 0.05, pairwise: 0.0, residual_share: 0.01}

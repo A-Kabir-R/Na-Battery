@@ -249,7 +249,11 @@ class CurriculumSchedule:
 @dataclass
 class LossWeights:
     data: float = 1.0
-    pde: float = 0.5
+    #: ODE residual (du/ds + r = 0). The field is named ``ode`` to reflect
+    #: the governing equation's correct type (ordinary, not partial), but the
+    #: legacy alias ``pde`` is accepted by :meth:`from_mapping` for backwards
+    #: compatibility with existing configs and checkpoints.
+    ode: float = 0.5
     initial_condition: float = 0.5
     integral: float = 0.25
     monotonicity: float = 0.1
@@ -260,11 +264,21 @@ class LossWeights:
     rate_data: float = 0.0
     #: Cross-cell relative-degradation regulariser. Data-like, not ramped.
     pairwise: float = 0.0
+    #: Penalise the hybrid rate's neural residual for exceeding its allowed
+    #: share of the total rate. Zero disables; only active when the model uses
+    #: HybridRateModel. Data-like (not curriculum-ramped) so the
+    #: interpretability constraint is always active.
+    residual_share: float = 0.0
+
+    @property
+    def pde(self) -> float:
+        """Backward-compatible alias for :attr:`ode`."""
+        return self.ode
 
     def effective(self, curriculum_factor: float) -> "LossWeights":
         return LossWeights(
             data=self.data,
-            pde=self.pde * curriculum_factor,
+            ode=self.ode * curriculum_factor,
             initial_condition=self.initial_condition,
             integral=self.integral * curriculum_factor,
             monotonicity=self.monotonicity * curriculum_factor,
@@ -273,13 +287,23 @@ class LossWeights:
             discrete_state_transition=self.discrete_state_transition * curriculum_factor,
             rate_data=self.rate_data,
             pairwise=self.pairwise,
+            residual_share=self.residual_share,
         )
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, float]) -> "LossWeights":
+        # Accept both ``ode`` (new) and ``pde`` (legacy) for the governing-
+        # equation residual weight. ``ode`` takes precedence if both appear.
+        ode_default = 0.5
+        if "ode" in mapping:
+            ode_val = float(mapping["ode"])
+        elif "pde" in mapping:
+            ode_val = float(mapping["pde"])
+        else:
+            ode_val = ode_default
         return cls(
             data=float(mapping.get("data", 1.0)),
-            pde=float(mapping.get("pde", 0.5)),
+            ode=ode_val,
             initial_condition=float(mapping.get("initial_condition", 0.5)),
             integral=float(mapping.get("integral", 0.25)),
             monotonicity=float(mapping.get("monotonicity", 0.1)),
@@ -288,12 +312,13 @@ class LossWeights:
             discrete_state_transition=float(mapping.get("discrete_state_transition", 0.0)),
             rate_data=float(mapping.get("rate_data", 0.0)),
             pairwise=float(mapping.get("pairwise", 0.0)),
+            residual_share=float(mapping.get("residual_share", 0.0)),
         )
 
     def as_dict(self) -> dict[str, float]:
         return {
             "data": self.data,
-            "pde": self.pde,
+            "ode": self.ode,
             "initial_condition": self.initial_condition,
             "integral": self.integral,
             "monotonicity": self.monotonicity,
@@ -302,6 +327,7 @@ class LossWeights:
             "discrete_state_transition": self.discrete_state_transition,
             "rate_data": self.rate_data,
             "pairwise": self.pairwise,
+            "residual_share": self.residual_share,
         }
 
 
