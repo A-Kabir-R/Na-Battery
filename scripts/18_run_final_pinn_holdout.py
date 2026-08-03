@@ -46,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.evaluation.bootstrap import paired_cell_bootstrap  # noqa: E402
 from src.io.loaders import load_config  # noqa: E402
-from src.pinn.inference import PINNInferenceSession  # noqa: E402
+from src.pinn.inference import PINNInferenceSession, prepare_anchor_frame  # noqa: E402
 from src.pinn.logging_utils import run_log  # noqa: E402
 
 TARGET = "delta_next_rpt_Q_Ah"
@@ -75,26 +75,40 @@ def _read_nested_epoch(
     runs_root = pinn_results_dir / "runs" / architecture / preprocessing
     epochs = []
     details: dict = {}
+    rejected: list[str] = []
     for fold in range(n_outer_folds):
         status_path = runs_root / f"fold_{fold}" / f"seed_{seed}" / "status.json"
         if not status_path.exists():
             print(f"[holdout] fold {fold}: status.json missing; skipping epoch")
+            rejected.append(f"fold_{fold}: status.json missing")
             continue
         status = json.loads(status_path.read_text())
-        ep = int(status.get("best_epoch", status.get("refit_epochs", 0)))
+        if not (status.get("refit_epoch_selection_source") == "nested_inner_folds"
+                and status.get("two_phase_refit_used")
+                and status.get("status") == "completed"):
+            msg = (f"fold_{fold}: selection_source="
+                   f"{status.get('refit_epoch_selection_source')!r} "
+                   f"two_phase_refit={status.get('two_phase_refit_used')} "
+                   f"status={status.get('status')!r}")
+            print(f"[holdout] {msg} — not a valid nested-selected run; skipping")
+            rejected.append(msg)
+            continue
+        ep = int(status["refit_selected_epoch"])
         if ep > 0:
             epochs.append(ep)
             details[f"fold_{fold}"] = ep
 
     if not epochs:
         raise SystemExit(
-            "[holdout] No nested-selected epochs found. "
-            "Run scripts/15_run_nested_pinn_selection.py first."
+            "[holdout] No valid nested-selected epochs found. "
+            "Run scripts/15_run_nested_pinn_selection.py with two_phase_refit=True "
+            "first. Rejected folds: " + "; ".join(rejected)
         )
 
     median_epoch = int(np.median(epochs))
     details["median_epoch_used"] = median_epoch
     details["per_fold_epochs"] = {k: v for k, v in details.items() if k.startswith("fold_")}
+    details["rejected_folds"] = rejected
     print(f"[holdout] nested epochs per fold: {details['per_fold_epochs']}")
     print(f"[holdout] median epoch (used for final training): {median_epoch}")
     return median_epoch, details
@@ -184,8 +198,8 @@ def _train_final_model(
         preprocessing=pinn_preprocessing,
         fold=0, seed=pinn_seed, device=real_device,
         max_epochs=best_epoch,
-        two_phase_refit=False,
-        forced_best_epoch=None,
+        two_phase_refit=True,
+        forced_best_epoch=best_epoch,
     )
     try:
         train_fold(
@@ -203,23 +217,27 @@ def _train_final_model(
     except FoldTrainingError as exc:
         raise SystemExit(f"[holdout] Final model training failed: {exc}") from exc
 
-    return PINNInferenceSession(run_dir, device=real_device)
+    return PINNInferenceSession(run_dir, device=real_device), dataset
 
 
 def _predict_split(
     session: PINNInferenceSession,
     frame: pd.DataFrame,
+    dataset,
     split_label: str,
 ) -> pd.DataFrame:
-    """Predict delta_Q for all rows in frame, return annotated DataFrame."""
-    u_next = session.predict(frame)
-    u_current = frame["u_current"].to_numpy(dtype=float)
-    y_pred = (u_next - u_current).astype(float)
+    """Predict delta_Q in Ah for all rows in frame, return annotated DataFrame.
+
+    ``frame`` must be a unified.parquet slice with anchor_id; it is joined to
+    ``dataset.frame`` to get the PINN-required physics columns before inference.
+    """
+    anchor_frame = prepare_anchor_frame(frame, dataset)
+    y_pred = session.predict_delta_q_ah(anchor_frame)
     y_true = frame[TARGET].to_numpy(dtype=float)
 
-    out = frame[["cell", "condition"]].copy()
+    out = frame[["cell", "condition"]].copy().reset_index(drop=True)
     if "anchor_id" in frame.columns:
-        out["anchor_id"] = frame["anchor_id"].to_numpy()
+        out["anchor_id"] = frame["anchor_id"].reset_index(drop=True).to_numpy()
     out["y_true"] = y_true
     out["y_pred"] = y_pred
     out["error"] = y_pred - y_true
@@ -291,6 +309,14 @@ def _main() -> int:
     )
     out.mkdir(parents=True, exist_ok=True)
 
+    # Safeguard: refuse to overwrite completed holdout results.
+    if (out / "pinn_holdout_predictions.parquet").exists() and not args.dry_run:
+        raise SystemExit(
+            f"[holdout] {out}/pinn_holdout_predictions.parquet already exists. "
+            "This script is intended to run EXACTLY ONCE. If you need to rerun, "
+            "manually delete the output directory first."
+        )
+
     # Step 1: determine epoch from nested selection
     best_epoch, epoch_details = _read_nested_epoch(
         pinn_dir, args.pinn_architecture, args.pinn_preprocessing,
@@ -312,7 +338,7 @@ def _main() -> int:
     model_dir.mkdir(exist_ok=True)
     print(f"[holdout] training final model ({best_epoch} epochs) on "
           f"{dev['cell'].nunique()} development cells ...")
-    session = _train_final_model(
+    session, dataset = _train_final_model(
         cfg=cfg, dev=dev, best_epoch=best_epoch,
         pinn_seed=args.pinn_seed,
         pinn_architecture=args.pinn_architecture,
@@ -322,8 +348,8 @@ def _main() -> int:
     )
 
     # Step 4: predict both splits (development fit check + holdout)
-    dev_preds = _predict_split(session, dev, "development_fit")
-    holdout_preds = _predict_split(session, holdout, "locked_holdout")
+    dev_preds = _predict_split(session, dev, dataset, "development_fit")
+    holdout_preds = _predict_split(session, holdout, dataset, "locked_holdout")
     all_preds = pd.concat([dev_preds, holdout_preds], ignore_index=True)
     all_preds.to_parquet(out / "pinn_holdout_predictions.parquet", index=False)
 
@@ -345,10 +371,13 @@ def _main() -> int:
         bootstrap_rows = []
         for model_name, grp in classical.groupby("model"):
             grp = grp.reset_index(drop=True)
-            # Align by cell; simple alignment assumes same anchor order per cell
-            merged = holdout_preds[["cell", "error"]].merge(
-                grp[["cell", "error"]].rename(columns={"error": "error_classical"}),
-                on="cell", how="inner",
+            join_key = "anchor_id" if (
+                "anchor_id" in holdout_preds.columns and "anchor_id" in grp.columns
+            ) else "cell"
+            merged = holdout_preds[["cell", join_key, "error"]].merge(
+                grp[[join_key, "error"]].rename(columns={"error": "error_classical"}),
+                on=join_key, how="inner",
+                validate="one_to_one" if join_key == "anchor_id" else None,
             )
             if len(merged) == 0:
                 continue

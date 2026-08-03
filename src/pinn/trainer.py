@@ -438,6 +438,7 @@ def _prediction_frame(architecture: str, preprocessing: str, fold: int, seed: in
         "evaluation_role": evaluation_role,
         "ablation": ablation_name or "",
         "cell_id": sub["cell"].astype(str).to_numpy(),
+        "anchor_id": sub["anchor_id"].to_numpy() if "anchor_id" in sub.columns else np.full(len(sub), np.nan),
         "condition_id": sub.get("condition", pd.Series([""] * len(sub))).astype(str).to_numpy(),
         "current_visit": sub.get("visit", pd.Series([np.nan] * len(sub))).to_numpy(),
         "target_visit": sub.get("next_rpt_visit", pd.Series([np.nan] * len(sub))).to_numpy(),

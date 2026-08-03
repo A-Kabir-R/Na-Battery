@@ -57,9 +57,8 @@ from src.evaluation.conformal import (  # noqa: E402
 )
 from src.io.loaders import load_config  # noqa: E402
 from src.models.regressors import STUDY_RIDGE_ALPHA  # noqa: E402
-from src.pinn.inference import PINNInferenceSession  # noqa: E402
+from src.pinn.inference import PINNInferenceSession, prepare_anchor_frame  # noqa: E402
 from src.pinn.logging_utils import run_log  # noqa: E402
-from src.splits.group_kfold import make_folds  # noqa: E402
 
 TARGET = "delta_next_rpt_Q_Ah"
 
@@ -115,13 +114,24 @@ def _load(cfg: dict) -> tuple[pd.DataFrame, list[str]]:
             f"missing {unified}. Run scripts/01_build_features.py first, or point "
             f"SIB_ARTIFACTS at a built artifacts directory."
         )
+    if not split_manifest_path.exists():
+        raise SystemExit(
+            f"missing {split_manifest_path}. Cannot isolate development cells from "
+            "holdout. Run the split step (scripts/00_build_canonical.py) first."
+        )
     frame = pd.read_parquet(unified)
     frame = frame[frame[TARGET].notna()].reset_index(drop=True)
-    if split_manifest_path.exists():
-        split_manifest = pd.read_parquet(split_manifest_path)[["cell", "outer_role"]]
-        frame = frame.merge(split_manifest, on="cell", how="left")
-        frame = frame[frame["outer_role"].eq("development")].reset_index(drop=True)
-        assert int((frame.get("outer_role", pd.Series()) == "holdout").sum()) == 0
+    split_manifest = pd.read_parquet(split_manifest_path)[["cell", "outer_role", "cv_fold"]]
+    frame = frame.merge(split_manifest, on="cell", how="left", validate="many_to_one")
+    holdout_count = int(frame["outer_role"].eq("holdout").sum())
+    if holdout_count > 0:
+        raise SystemExit(
+            f"[uq] {holdout_count} holdout rows found after merge — "
+            "aborting to prevent data leakage."
+        )
+    frame = frame[frame["outer_role"].eq("development")].reset_index(drop=True)
+    if frame.empty:
+        raise SystemExit("[uq] No development cells found in split manifest.")
     return frame, json.loads(manifest.read_text())["feature_columns"]
 
 
@@ -166,7 +176,7 @@ def _pinn_train_and_predict(
     real_device = resolve_device(device)
     pinn_results_dir = _pinn_results_dir(cfg)
 
-    # Frozen epoch count from nested-selection status.json (seed-42 full run)
+    # Frozen epoch count from nested-selection status.json; verify provenance.
     best_epoch: int | None = None
     seed_status = (
         pinn_results_dir / "runs" / pinn_architecture / pinn_preprocessing
@@ -175,7 +185,13 @@ def _pinn_train_and_predict(
     if seed_status.exists():
         try:
             status = _json.loads(seed_status.read_text())
-            best_epoch = int(status.get("best_epoch", status.get("refit_epochs", 0)))
+            if (status.get("refit_epoch_selection_source") == "nested_inner_folds"
+                    and status.get("two_phase_refit_used")
+                    and status.get("status") == "completed"):
+                best_epoch = int(status["refit_selected_epoch"])
+            else:
+                best_epoch = int(status.get("refit_selected_epoch",
+                                            status.get("best_epoch", 0)))
         except Exception:
             best_epoch = None
     if best_epoch is None or best_epoch <= 0:
@@ -214,8 +230,8 @@ def _pinn_train_and_predict(
             preprocessing=pinn_preprocessing,
             fold=0, seed=pinn_seed, device=real_device,
             max_epochs=best_epoch,
-            two_phase_refit=False,
-            forced_best_epoch=None,
+            two_phase_refit=True,
+            forced_best_epoch=best_epoch,
         )
         try:
             train_fold(
@@ -240,11 +256,10 @@ def _pinn_train_and_predict(
             print(f"[uq/pinn] fold {fold}: checkpoint not found: {exc}")
             return None
 
-        cal_u_next = session.predict(calibration)
-        cal_y_pred = (cal_u_next - calibration["u_current"].to_numpy(dtype=float)).astype(float)
-
-        test_u_next = session.predict(test)
-        test_y_pred = (test_u_next - test["u_current"].to_numpy(dtype=float)).astype(float)
+        cal_anchor = prepare_anchor_frame(calibration, dataset)
+        test_anchor = prepare_anchor_frame(test, dataset)
+        cal_y_pred = session.predict_delta_q_ah(cal_anchor)
+        test_y_pred = session.predict_delta_q_ah(test_anchor)
 
     return cal_y_pred, test_y_pred
 
@@ -289,11 +304,11 @@ def _main() -> int:
     models = _models(feature_columns, tuple(args.seeds))
     predictions: list[pd.DataFrame] = []
 
-    for fold, (train_idx, test_idx) in enumerate(
-        make_folds(frame, n_splits=args.folds)
-    ):
-        pool = frame.iloc[train_idx].reset_index(drop=True)
-        test = frame.iloc[test_idx].reset_index(drop=True)
+    cv_folds = sorted(frame["cv_fold"].dropna().unique())
+    for fold in cv_folds:
+        fold = int(fold)
+        test = frame[frame["cv_fold"].eq(fold)].reset_index(drop=True)
+        pool = frame[frame["cv_fold"].ne(fold) & frame["cv_fold"].notna()].reset_index(drop=True)
         try:
             proper_idx, calibration_idx = split_calibration_cells(
                 pool, calibration_fraction=args.calibration_fraction, seed=fold,

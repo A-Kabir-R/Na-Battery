@@ -301,9 +301,7 @@ def main() -> None:
         dev_cell = dev[dev["aggregation"] == "cell_macro"]
 
         # Headline: seed 42 only (preregistered primary seed — do not average seeds).
-        primary_seed = int(
-            ((cfg.get("pinn") or {}).get("training") or {}).get("primary_seed", 42)
-        )
+        primary_seed = int((cfg.get("pinn") or {}).get("primary_seed", 42))
         dev_primary = (
             dev_cell[dev_cell["seed"].astype(str) == str(primary_seed)]
             if "seed" in dev_cell.columns else dev_cell

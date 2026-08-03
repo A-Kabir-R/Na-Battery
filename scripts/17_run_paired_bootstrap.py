@@ -46,7 +46,6 @@ from src.evaluation.bootstrap import paired_cell_bootstrap  # noqa: E402
 from src.io.loaders import load_config  # noqa: E402
 from src.pinn.inference import load_fold_predictions  # noqa: E402
 from src.pinn.logging_utils import run_log  # noqa: E402
-from src.splits.group_kfold import make_folds  # noqa: E402
 
 TARGET = "delta_next_rpt_Q_Ah"
 
@@ -87,13 +86,24 @@ def _load(cfg: dict) -> tuple[pd.DataFrame, list[str]]:
     split_manifest_path = artifacts / "splits" / "split_manifest.parquet"
     if not unified.exists():
         raise SystemExit(f"missing {unified}. Run scripts/01_build_features.py first.")
+    if not split_manifest_path.exists():
+        raise SystemExit(
+            f"missing {split_manifest_path}. Cannot isolate development cells from "
+            "holdout. Run the split step (scripts/00_build_canonical.py) first."
+        )
     frame = pd.read_parquet(unified)
     frame = frame[frame[TARGET].notna()].reset_index(drop=True)
-    if split_manifest_path.exists():
-        split_manifest = pd.read_parquet(split_manifest_path)[["cell", "outer_role"]]
-        frame = frame.merge(split_manifest, on="cell", how="left")
-        frame = frame[frame["outer_role"].eq("development")].reset_index(drop=True)
-        assert int((frame.get("outer_role", pd.Series()) == "holdout").sum()) == 0
+    split_manifest = pd.read_parquet(split_manifest_path)[["cell", "outer_role", "cv_fold"]]
+    frame = frame.merge(split_manifest, on="cell", how="left", validate="many_to_one")
+    holdout_count = int(frame["outer_role"].eq("holdout").sum())
+    if holdout_count > 0:
+        raise SystemExit(
+            f"[bootstrap] {holdout_count} holdout rows found after merge — "
+            "aborting to prevent data leakage."
+        )
+    frame = frame[frame["outer_role"].eq("development")].reset_index(drop=True)
+    if frame.empty:
+        raise SystemExit("[bootstrap] No development cells found in split manifest.")
     return frame, json.loads(manifest.read_text())["feature_columns"]
 
 
@@ -107,29 +117,33 @@ def _pinn_results_dir(cfg: dict) -> Path:
 def _collect_classical_oof(
     frame: pd.DataFrame,
     feature_columns: list[str],
-    n_folds: int,
 ) -> pd.DataFrame:
-    """Run 5-fold development CV; return per-anchor OOF errors for each model."""
+    """Run CV on development folds; return per-anchor OOF errors for each model."""
     models = _classical_models(feature_columns)
     records = []
+    has_anchor_id = "anchor_id" in frame.columns
 
-    for fold, (train_idx, test_idx) in enumerate(make_folds(frame, n_splits=n_folds)):
-        train = frame.iloc[train_idx]
-        test = frame.iloc[test_idx].reset_index(drop=True)
+    cv_folds = sorted(frame["cv_fold"].dropna().unique())
+    for fold in cv_folds:
+        fold = int(fold)
+        train = frame[frame["cv_fold"].ne(fold) & frame["cv_fold"].notna()]
+        test = frame[frame["cv_fold"].eq(fold)].reset_index(drop=True)
         for name, template in models.items():
             model = copy.deepcopy(template)
             model.fit(train[feature_columns], train[TARGET])
             preds = model.predict(test[feature_columns])
             for i in range(len(test)):
-                records.append({
+                rec: dict = {
                     "model": name,
                     "fold": fold,
                     "cell": str(test["cell"].iloc[i]),
-                    "anchor_key": f"{test['cell'].iloc[i]}_{test.index[i]}",
                     "y_true": float(test[TARGET].iloc[i]),
                     "y_pred": float(preds[i]),
                     "error": float(preds[i] - test[TARGET].iloc[i]),
-                })
+                }
+                if has_anchor_id:
+                    rec["anchor_id"] = str(test["anchor_id"].iloc[i])
+                records.append(rec)
 
     return pd.DataFrame(records)
 
@@ -138,23 +152,33 @@ def _collect_pinn_oof(
     pinn_results_dir: Path,
     seed: int,
 ) -> pd.DataFrame | None:
-    """Load per-anchor outer-val predictions for one PINN seed."""
+    """Load per-anchor outer-val predictions for one PINN seed.
+
+    predictions.parquet schema (written by trainer._prediction_frame):
+        cell_id, anchor_id, fold, evaluation_role,
+        true_delta_Q_Ah, predicted_delta_Q_Ah, ...
+    """
     try:
         df = load_fold_predictions(pinn_results_dir, seed=seed)
     except FileNotFoundError as exc:
         print(f"[bootstrap] PINN seed {seed}: no predictions ({exc})")
         return None
 
-    # Map u_next - u_current to the delta target for alignment with classical.
-    if "u_current" in df.columns and "u_next" in df.columns:
-        df = df.copy()
-        df["y_pred"] = (df["u_next"] - df["u_current"]).to_numpy(dtype=float)
+    # Normalise column names to the shared schema.
+    if "cell_id" in df.columns:
+        df = df.rename(columns={"cell_id": "cell"})
+    elif "cell" not in df.columns:
+        print(f"[bootstrap] PINN seed {seed}: no cell/cell_id column; skipping")
+        return None
+
+    if "predicted_delta_Q_Ah" in df.columns:
+        df["y_pred"] = df["predicted_delta_Q_Ah"].to_numpy(dtype=float)
     elif "y_pred" not in df.columns:
         print(f"[bootstrap] PINN seed {seed}: cannot derive y_pred; skipping")
         return None
 
-    if "delta_next_rpt_Q_Ah" in df.columns:
-        df["y_true"] = df["delta_next_rpt_Q_Ah"].to_numpy(dtype=float)
+    if "true_delta_Q_Ah" in df.columns:
+        df["y_true"] = df["true_delta_Q_Ah"].to_numpy(dtype=float)
     elif "y_true" not in df.columns:
         print(f"[bootstrap] PINN seed {seed}: no y_true column; skipping")
         return None
@@ -163,12 +187,10 @@ def _collect_pinn_oof(
     df["model"] = "NaPINN-Q"
     df["cell"] = df["cell"].astype(str)
 
-    # Build anchor_key matching the classical convention: cell_rowindex within fold.
-    # Use fold + sequential index as a stable anchor key.
-    df["anchor_key"] = (
-        df["cell"].astype(str) + "_" + df.groupby(["fold", "cell"]).cumcount().astype(str)
-    )
-    return df[["model", "fold", "cell", "anchor_key", "y_true", "y_pred", "error"]]
+    keep = ["model", "fold", "cell", "y_true", "y_pred", "error"]
+    if "anchor_id" in df.columns:
+        keep.append("anchor_id")
+    return df[keep]
 
 
 def _run_bootstrap_for_seed(
@@ -197,10 +219,13 @@ def _run_bootstrap_for_seed(
     for comparator in comparators:
         comp_df = all_oof[all_oof["model"].eq(comparator)].copy()
 
-        # Align on fold + anchor_key (same anchor, same fold split)
-        merged = ref_df[["fold", "anchor_key", "cell", "error"]].merge(
-            comp_df[["fold", "anchor_key", "error"]].rename(columns={"error": "error_comp"}),
-            on=["fold", "anchor_key"], how="inner",
+        # Align on fold + anchor_id when available; fall back to fold + cell.
+        join_key = "anchor_id" if (
+            "anchor_id" in ref_df.columns and "anchor_id" in comp_df.columns
+        ) else "cell"
+        merged = ref_df[["fold", join_key, "cell", "error"]].merge(
+            comp_df[["fold", join_key, "error"]].rename(columns={"error": "error_comp"}),
+            on=["fold", join_key], how="inner",
         )
         if len(merged) == 0:
             print(f"[bootstrap] no paired anchors for {reference} vs {comparator}; skipping")
@@ -260,8 +285,8 @@ def _main() -> int:
     )
     out.mkdir(parents=True, exist_ok=True)
 
-    print(f"[bootstrap] collecting classical OOF ({args.folds} folds) ...")
-    classical_oof = _collect_classical_oof(frame, feature_columns, args.folds)
+    print(f"[bootstrap] collecting classical OOF (cv_folds from split manifest) ...")
+    classical_oof = _collect_classical_oof(frame, feature_columns)
     print(f"[bootstrap] {len(classical_oof)} classical anchor-predictions "
           f"({classical_oof['model'].nunique()} models)")
 

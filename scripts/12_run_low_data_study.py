@@ -44,7 +44,6 @@ from src.pinn.inference import PINNInferenceSession, find_run_dir  # noqa: E402
 from src.pinn.logging_utils import run_log  # noqa: E402
 from src.models.degradation_baselines import build_degradation_baselines  # noqa: E402
 from src.models.regressors import STUDY_RIDGE_ALPHA  # noqa: E402
-from src.splits.group_kfold import make_folds  # noqa: E402
 
 TARGET = "delta_next_rpt_Q_Ah"
 
@@ -122,7 +121,7 @@ def _make_pinn_fit_predict(
     features_dir = Path(cfg["paths"]["artifacts"]) / "features"
     real_device = resolve_device(device)
 
-    # Read best_epoch from the seed-42 status so the epoch count is frozen.
+    # Read the nested-selected epoch from status.json; verify provenance.
     best_epoch: int | None = None
     seed42_status = (
         pinn_results_dir / "runs" / pinn_architecture / pinn_preprocessing
@@ -131,7 +130,13 @@ def _make_pinn_fit_predict(
     if seed42_status.exists():
         try:
             status = _json.loads(seed42_status.read_text())
-            best_epoch = int(status.get("best_epoch", status.get("refit_epochs", 0)))
+            if (status.get("refit_epoch_selection_source") == "nested_inner_folds"
+                    and status.get("two_phase_refit_used")
+                    and status.get("status") == "completed"):
+                best_epoch = int(status["refit_selected_epoch"])
+            else:
+                best_epoch = int(status.get("refit_selected_epoch",
+                                            status.get("best_epoch", 0)))
         except Exception:
             best_epoch = None
     if best_epoch is None or best_epoch <= 0:
@@ -175,8 +180,8 @@ def _make_pinn_fit_predict(
                 preprocessing=pinn_preprocessing,
                 fold=0, seed=pinn_seed, device=real_device,
                 max_epochs=best_epoch,
-                two_phase_refit=False,
-                forced_best_epoch=None,
+                two_phase_refit=True,
+                forced_best_epoch=best_epoch,
             )
             try:
                 result = train_fold(
@@ -197,15 +202,14 @@ def _make_pinn_fit_predict(
 
             # Load the trained checkpoint and predict on test_sub.
             try:
+                from src.pinn.inference import prepare_anchor_frame
                 session = PINNInferenceSession(run_dir, device=real_device)
                 test_rows = dataset.frame[
                     dataset.frame["cell"].astype(str).isin(test_cells)
                 ]
                 if test_rows.empty:
                     return np.full(len(test_sub), float("nan"))
-                u_next = session.predict(test_rows)
-                u_current = test_rows["u_current"].to_numpy(dtype=float)
-                return (u_next - u_current).astype(float)
+                return session.predict_delta_q_ah(test_rows)
             except Exception as exc:
                 print(f"[low-data/pinn] inference failed: {exc}")
                 return np.full(len(test_sub), float("nan"))
@@ -223,13 +227,24 @@ def _load(cfg: dict) -> tuple[pd.DataFrame, list[str]]:
             f"missing {unified}. Run scripts/01_build_features.py first, or point "
             f"SIB_ARTIFACTS at a built artifacts directory."
         )
+    if not split_manifest_path.exists():
+        raise SystemExit(
+            f"missing {split_manifest_path}. Cannot isolate development cells from "
+            "holdout. Run the split step (scripts/00_build_canonical.py) first."
+        )
     frame = pd.read_parquet(unified)
     frame = frame[frame[TARGET].notna()].reset_index(drop=True)
-    if split_manifest_path.exists():
-        split_manifest = pd.read_parquet(split_manifest_path)[["cell", "outer_role"]]
-        frame = frame.merge(split_manifest, on="cell", how="left")
-        frame = frame[frame["outer_role"].eq("development")].reset_index(drop=True)
-        assert int((frame.get("outer_role", pd.Series()) == "holdout").sum()) == 0
+    split_manifest = pd.read_parquet(split_manifest_path)[["cell", "outer_role", "cv_fold"]]
+    frame = frame.merge(split_manifest, on="cell", how="left", validate="many_to_one")
+    holdout_count = int(frame["outer_role"].eq("holdout").sum())
+    if holdout_count > 0:
+        raise SystemExit(
+            f"[low-data] {holdout_count} holdout rows found after merge — "
+            "aborting to prevent data leakage."
+        )
+    frame = frame[frame["outer_role"].eq("development")].reset_index(drop=True)
+    if frame.empty:
+        raise SystemExit("[low-data] No development cells found in split manifest.")
     return frame, json.loads(manifest.read_text())["feature_columns"]
 
 
@@ -283,14 +298,14 @@ def _main() -> int:
               "(slow; one GPU run per fold × fraction × repeat)")
 
     records: list[pd.DataFrame] = []
-    for fold, (train_idx, test_idx) in enumerate(
-        make_folds(frame, n_splits=args.folds)
-    ):
-        pool = frame.iloc[train_idx].reset_index(drop=True)
-        test = frame.iloc[test_idx].reset_index(drop=True)
-        print(f"[low-data] fold {fold}: pool {pool['cell'].nunique()} cells, "
+    cv_folds = sorted(frame["cv_fold"].dropna().unique())
+    for fold in cv_folds:
+        test = frame[frame["cv_fold"].eq(fold)].reset_index(drop=True)
+        pool = frame[frame["cv_fold"].ne(fold) & frame["cv_fold"].notna()].reset_index(drop=True)
+        print(f"[low-data] fold {int(fold)}: pool {pool['cell'].nunique()} cells, "
               f"test {test['cell'].nunique()} cells")
 
+        fold_int = int(fold)
         for name, template in models.items():
             def fit_predict(train, test_frame, _template=template, _name=name):
                 model = copy.deepcopy(_template)
@@ -301,17 +316,17 @@ def _main() -> int:
                 return model.predict(test_frame[feature_columns])
 
             study = LowDataStudy(
-                fractions=tuple(args.fractions), repeats=args.repeats, seed=fold,
+                fractions=tuple(args.fractions), repeats=args.repeats, seed=fold_int,
             )
             records.append(study.run(
-                pool, test, TARGET, fit_predict, model_name=name, fold=fold,
+                pool, test, TARGET, fit_predict, model_name=name, fold=fold_int,
             ))
 
         # ---- NaPINN-Q learning curve ----------------------------------------
         if args.pinn:
             pinn_dir = _pinn_results_dir(cfg)
             pinn_fit_predict = _make_pinn_fit_predict(
-                pinn_dir, cfg, fold,
+                pinn_dir, cfg, fold_int,
                 pinn_seed=args.pinn_seed,
                 pinn_architecture=args.pinn_architecture,
                 pinn_preprocessing=args.pinn_preprocessing,
@@ -325,13 +340,13 @@ def _main() -> int:
             pinn_study = LowDataStudy(
                 fractions=tuple(args.fractions),
                 repeats=args.repeats,
-                seed=fold,
+                seed=fold_int,
             )
             records.append(pinn_study.run(
                 pool, test, TARGET,
                 pinn_fit_predict_wrapped,
                 model_name="NaPINN-Q",
-                fold=fold,
+                fold=fold_int,
             ))
 
     if not records:

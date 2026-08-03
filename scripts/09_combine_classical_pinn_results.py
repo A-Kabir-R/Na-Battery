@@ -210,7 +210,7 @@ def main() -> None:
     # PINN:      outer_validation cell-macro MAE.
     # No blank-fill fallback is used; mixing roles would average training MAE
     # with validation MAE and invalidate the headline comparison.
-    classical_pm = _read_csv(classical_dir / "prediction_metrics.csv")
+    classical_pm = _normalize_classical(_read_csv(classical_dir / "prediction_metrics.csv"))
     pinn_pm = _read_csv(pinn_dir / "prediction_metrics.csv")
     pub_parts: list[pd.DataFrame] = []
     _pm_required = {"evaluation_role", "aggregation", "metric", "value"}

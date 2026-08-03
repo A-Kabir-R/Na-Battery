@@ -43,9 +43,8 @@ from src.evaluation.conformal import (  # noqa: E402
 from src.evaluation.robustness import build_perturbations, run_robustness  # noqa: E402
 from src.io.loaders import load_config  # noqa: E402
 from src.models.regressors import STUDY_RIDGE_ALPHA  # noqa: E402
-from src.pinn.inference import PINNInferenceSession, find_run_dir  # noqa: E402
+from src.pinn.inference import PINNInferenceSession, find_run_dir, prepare_anchor_frame  # noqa: E402
 from src.pinn.logging_utils import run_log  # noqa: E402
-from src.splits.group_kfold import make_folds  # noqa: E402
 
 TARGET = "delta_next_rpt_Q_Ah"
 
@@ -88,13 +87,24 @@ def _load(cfg: dict) -> tuple[pd.DataFrame, list[str]]:
             f"missing {unified}. Run scripts/01_build_features.py first, or point "
             f"SIB_ARTIFACTS at a built artifacts directory."
         )
+    if not split_manifest_path.exists():
+        raise SystemExit(
+            f"missing {split_manifest_path}. Cannot isolate development cells from "
+            "holdout. Run the split step (scripts/00_build_canonical.py) first."
+        )
     frame = pd.read_parquet(unified)
     frame = frame[frame[TARGET].notna()].reset_index(drop=True)
-    if split_manifest_path.exists():
-        split_manifest = pd.read_parquet(split_manifest_path)[["cell", "outer_role"]]
-        frame = frame.merge(split_manifest, on="cell", how="left")
-        frame = frame[frame["outer_role"].eq("development")].reset_index(drop=True)
-        assert int((frame.get("outer_role", pd.Series()) == "holdout").sum()) == 0
+    split_manifest = pd.read_parquet(split_manifest_path)[["cell", "outer_role", "cv_fold"]]
+    frame = frame.merge(split_manifest, on="cell", how="left", validate="many_to_one")
+    holdout_count = int(frame["outer_role"].eq("holdout").sum())
+    if holdout_count > 0:
+        raise SystemExit(
+            f"[robust] {holdout_count} holdout rows found after merge — "
+            "aborting to prevent data leakage."
+        )
+    frame = frame[frame["outer_role"].eq("development")].reset_index(drop=True)
+    if frame.empty:
+        raise SystemExit("[robust] No development cells found in split manifest.")
     return frame, json.loads(manifest.read_text())["feature_columns"]
 
 
@@ -141,15 +151,30 @@ def _main() -> int:
     )
     n_classical = len(_models(feature_columns))
     n_pinn = 1 if args.pinn else 0
+    cv_folds = sorted(frame["cv_fold"].dropna().unique())
     print(f"[robust] {len(perturbations)} perturbations x "
-          f"{n_classical + n_pinn} models x {args.folds} folds")
+          f"{n_classical + n_pinn} models x {len(cv_folds)} folds")
+
+    # Build the anchor dataset once for PINN inference (avoids re-reading per fold).
+    pinn_dataset = None
+    if args.pinn:
+        from src.pinn.dataset import build_anchor_dataset
+        pinn_cfg = cfg["pinn"]
+        features_dir = Path(cfg["paths"]["artifacts"]) / "features"
+        frame_raw = pd.read_parquet(features_dir / f"{args.pinn_preprocessing}.parquet")
+        pinn_dataset = build_anchor_dataset(
+            frame_raw, preprocessing=args.pinn_preprocessing,
+            stress_cfg=pinn_cfg["stress"],
+            audit_cfg=pinn_cfg.get("audit"),
+            audit_path=None,
+            features_dir=features_dir,
+        )
 
     reports: list[pd.DataFrame] = []
-    for fold, (train_idx, test_idx) in enumerate(
-        make_folds(frame, n_splits=args.folds)
-    ):
-        pool = frame.iloc[train_idx].reset_index(drop=True)
-        test = frame.iloc[test_idx].reset_index(drop=True)
+    for fold in cv_folds:
+        fold = int(fold)
+        test = frame[frame["cv_fold"].eq(fold)].reset_index(drop=True)
+        pool = frame[frame["cv_fold"].ne(fold) & frame["cv_fold"].notna()].reset_index(drop=True)
 
         for name, template in _models(feature_columns).items():
             model = copy.deepcopy(template)
@@ -213,16 +238,16 @@ def _main() -> int:
                 print(f"[robust] fold {fold} NaPINN-Q: skipping ({exc})")
                 continue
 
-            # Perturbations act on the raw feature frame; the scaler picks up
-            # the corrupted values when transform_features is called inside
-            # session.predict(), so the propagation is physically consistent.
+            # Perturbations act on anchor-dataset rows (which carry all feature
+            # columns plus the PINN-required physics columns u_current, stress_*).
+            # This matches how fold checkpoints were originally trained.
+            anchor_test = prepare_anchor_frame(test, pinn_dataset)
+
             def pinn_predict(subject: pd.DataFrame) -> np.ndarray:
-                u_next = session.predict(subject)
-                u_current = subject["u_current"].to_numpy(dtype=float)
-                return (u_next - u_current).astype(float)
+                return session.predict_delta_q_ah(subject)
 
             report = run_robustness(
-                test, TARGET, pinn_predict,
+                anchor_test, TARGET, pinn_predict,
                 perturbations=perturbations,
                 interval_half_width=None,
                 seed=fold,

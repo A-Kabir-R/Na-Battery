@@ -24,7 +24,7 @@ export SIB_LOGS := $(ARTIFACTS)/logs
 .DEFAULT_GOAL := help
 .PHONY: help venv lock test test-fast lint canonical features classical pinn \
         pinn-nested pinn-ablation generalization low-data uncertainty \
-        robustness studies aggregate figures clean-results check-clean paper
+        robustness bootstrap studies aggregate figures clean-results check-clean paper
 
 help:  ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -74,16 +74,19 @@ pinn-ablation:  ## Physics ablations (trains PINNs; GPU)
 generalization:  ## LOCO + factor-level-out study
 	$(PYTHON) scripts/11_run_generalization_study.py
 
-low-data:  ## Learning curves in units of training cells
-	$(PYTHON) scripts/12_run_low_data_study.py
+low-data:  ## Learning curves in units of training cells (classical + NaPINN-Q)
+	SIB_DEVICE=$(SIB_DEVICE) $(PYTHON) scripts/12_run_low_data_study.py --pinn
 
 uncertainty:  ## Cell-grouped conformal intervals + coverage by condition
-	$(PYTHON) scripts/13_run_uncertainty_study.py
+	SIB_DEVICE=$(SIB_DEVICE) $(PYTHON) scripts/13_run_uncertainty_study.py --pinn
 
 robustness:  ## Input perturbations; checks that intervals widen
-	$(PYTHON) scripts/14_run_robustness_study.py
+	SIB_DEVICE=$(SIB_DEVICE) $(PYTHON) scripts/14_run_robustness_study.py --pinn
 
-studies: generalization low-data uncertainty robustness  ## All four study scripts
+bootstrap:  ## Paired cell-clustered bootstrap: NaPINN-Q vs classical (development OOF)
+	$(PYTHON) scripts/17_run_paired_bootstrap.py
+
+studies: generalization low-data uncertainty robustness bootstrap  ## All five study scripts
 
 aggregate:  ## Combine classical and PINN arms onto shared folds
 	$(PYTHON) scripts/09_combine_classical_pinn_results.py

@@ -29,6 +29,42 @@ from .models import NaPINNQ
 from .trainer import FoldPaths, TrainerConfig
 
 
+def prepare_anchor_frame(raw_rows: pd.DataFrame, dataset) -> pd.DataFrame:
+    """Join unified.parquet rows to the anchor dataset to get PINN-required columns.
+
+    ``raw_rows`` must have an ``anchor_id`` column (present in unified.parquet).
+    Returns a frame with the same row order as ``raw_rows``, enriched with
+    ``u_current``, ``stress_current``, ``stress_next``, ``stress_delta``,
+    ``initial_rpt_Q_Ah``, and all feature columns the scaler requires.
+
+    Raises ValueError if any anchor_id is absent from ``dataset.frame`` or if
+    ``anchor_id`` is duplicated in ``dataset.frame`` (would signal a data bug).
+    """
+    if "anchor_id" not in raw_rows.columns:
+        raise ValueError(
+            "raw_rows must contain 'anchor_id'; "
+            "unified.parquet rows always carry this column"
+        )
+    if "anchor_id" not in dataset.frame.columns:
+        raise ValueError("dataset.frame must contain 'anchor_id'")
+
+    merged = (
+        raw_rows[["anchor_id"]]
+        .reset_index(drop=True)
+        .merge(dataset.frame, on="anchor_id", how="left", validate="many_to_one")
+    )
+    missing_mask = merged["u_current"].isna()
+    if missing_mask.any():
+        bad = raw_rows.loc[missing_mask.to_numpy(), "anchor_id"].head(5).tolist()
+        raise ValueError(
+            f"{int(missing_mask.sum())} anchor_id(s) in raw_rows not found in "
+            f"dataset.frame: {bad}. "
+            "This usually means some rows in the study frame are not anchor rows "
+            "(is_prediction_anchor=False). Filter study frames to anchor rows first."
+        )
+    return merged.reset_index(drop=True)
+
+
 def _feature_matrix(frame: pd.DataFrame, scaler: FoldScaler) -> np.ndarray:
     """Reproduce trainer._build_feature_matrix without needing AnchorDataset."""
     scaled = scaler.transform_features(frame, [])
@@ -171,20 +207,28 @@ class PINNInferenceSession:
             u_next = self.model.solution(stress_next, features, u_current, stress_current)
         return u_next.cpu().numpy()
 
+    def predict_delta_q_ah(self, frame: pd.DataFrame) -> np.ndarray:
+        """Predict capacity change in Ah: (u_next - u_current) * initial_rpt_Q_Ah.
+
+        ``frame`` must be an anchor-dataset frame (from ``prepare_anchor_frame``
+        or ``dataset.frame`` directly). This is the authoritative method for
+        producing predictions on the same scale as ``delta_next_rpt_Q_Ah``.
+
+        Returns
+        -------
+        np.ndarray of shape (n_rows,) in Ah.
+        """
+        u_next = self.predict(frame)
+        u_current = frame["u_current"].to_numpy(dtype=float)
+        q0 = frame["initial_rpt_Q_Ah"].to_numpy(dtype=float)
+        return ((u_next - u_current) * q0).astype(float)
+
     def predict_delta(self, frame: pd.DataFrame) -> np.ndarray:
-        """Predict delta_next_rpt_Q in Ah (unnormalized).
+        """Predict normalised capacity change u_next - u_current (dimensionless).
 
-        Converts the raw u_next output to the capacity change target used
-        by the classical pipeline: (u_next - u_current) * u_scale, where
-        u_scale is approximated from the scaler's u_max and the u_current
-        of the first anchor. For a properly normalized dataset u_current
-        is already in [0, 1] relative to u_max, so the delta is:
-
-            delta_Ah ≈ (u_next - u_current) * u_max_Ah
-
-        The caller must know whether to multiply by the reference capacity.
-        This method is provided for convenience; use ``predict`` when you
-        need the raw normalized output.
+        Use ``predict_delta_q_ah`` to get predictions in Ah on the same scale
+        as ``delta_next_rpt_Q_Ah``. This method is kept for backward
+        compatibility; it returns the raw normalised delta, not Ah.
         """
         u_current_np = frame["u_current"].to_numpy(dtype=float)
         u_next_np = self.predict(frame)
