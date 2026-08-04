@@ -251,8 +251,8 @@ pinn:
     solution_activation: "tanh"
     rate_activation: "tanh"
     rate_output_activation: "softplus"
-    # Dropout is wired through TrainerConfig -> NaPINNQ and is active at runtime.
-    solution_dropout: 0.15
+    # Raised from 0.15 to counter memorization at 140 training rows.
+    solution_dropout: 0.30
     rate_dropout: 0.05
     # When true, the rate network receives u_hat as an input. Setting false
     # produces the constrained-rate variant used in ablation A6, which
@@ -306,14 +306,14 @@ pinn:
   training:
     optimizer: "adamw"
     learning_rate: 0.001
-    # Stage-3 fix #2: 100× stronger L2 regularization to counter the
-    # ~120-sample overfitting regime.
-    weight_decay: 0.001
-    # Budget sized so the curriculum reaches full physics (epoch 300 with
-    # ramp_end_fraction=0.30) before minimum_epochs. Early stopping can fire
-    # once the model has had time to settle after physics activates.
+    # 10× stronger L2 regularization to counter memorization (train_loss ~1e-8
+    # at 140 samples). Raised from 0.001 after outer-fold R² = -0.19 diagnosis.
+    weight_decay: 0.01
+    # Physics fully active at epoch 150 (ramp_end_fraction=0.15 × 1000).
+    # minimum_epochs=350 guarantees ≥200 fully-physics-active epochs before
+    # early stopping may fire, so the checkpoint is always a PINN, not a NN.
     maximum_epochs: 1000
-    minimum_epochs: 200
+    minimum_epochs: 350
     early_stopping_patience: 100
     scheduler: "reduce_on_plateau"
     scheduler_factor: 0.5
@@ -337,10 +337,9 @@ pinn:
     gradient_balance_ema: 0.95
     gradient_balance_min_multiplier: 0.1
     gradient_balance_max_multiplier: 5.0
-    # Checkpoint eligibility: allow selecting the best checkpoint at any epoch.
-    # Setting true would lock out the best model when physics hurts early
-    # training — the epoch gate is enforced by minimum_epochs instead.
-    checkpoint_after_physics_active: false
+    # Only select checkpoints after physics is fully active (curriculum_factor=1.0).
+    # Combined with minimum_epochs=350, this guarantees the saved model is a PINN.
+    checkpoint_after_physics_active: true
     # Candidate cross-cell pairs drawn per batch for the pairwise loss.
     pairwise_max_pairs: 256
     # Two-phase outer-training refit: after inner train/val chooses best_epoch,
@@ -396,16 +395,16 @@ pinn:
     tolerance_quantile: 0.95
 
   curriculum:
-    # With maximum_epochs=500: physics starts ramping at epoch 25 and is fully
-    # active from epoch 100. Checkpoint eligibility and early-stopping patience
-    # both begin at epoch 100, and minimum_epochs=180 guarantees at least 80
-    # fully-physics-active epochs before a fold may stop.
+    # With maximum_epochs=1000: physics starts ramping at epoch 50 and is fully
+    # active from epoch 150 (ceil(ramp_end_fraction × max_epochs)).
+    # minimum_epochs=350 guarantees ≥200 fully-physics-active epochs before any
+    # early stop. checkpoint_after_physics_active=true enforces epoch ≥ 150.
     #
     # The two-phase refit derives its OWN schedule from the actual refit length
     # (best_epoch + 1) rather than reusing maximum_epochs, so a short refit still
     # reaches curriculum factor 1.0.
-    warmup_fraction: 0.15
-    ramp_end_fraction: 0.30
+    warmup_fraction: 0.05
+    ramp_end_fraction: 0.15
 
   evaluation:
     bootstrap_replicates_development: 100

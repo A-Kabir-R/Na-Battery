@@ -42,7 +42,7 @@ def test_physics_full_epoch_gates_checkpoint_eligibility() -> None:
 
 
 def test_checkpoint_eligibility_with_configured_curriculum() -> None:
-    """Configured curriculum reaches full physics before minimum_epochs."""
+    """Configured curriculum: physics fully active before minimum_epochs so checkpoints are always PINNs."""
     pinn = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))["pinn"]
     schedule = CurriculumSchedule(
         max_epochs=int(pinn["training"]["maximum_epochs"]),

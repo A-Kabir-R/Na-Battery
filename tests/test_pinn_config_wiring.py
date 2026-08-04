@@ -281,7 +281,8 @@ def test_configured_curriculum_activates_before_minimum_epochs():
         warmup_fraction=float(pinn["curriculum"]["warmup_fraction"]),
         ramp_end_fraction=float(pinn["curriculum"]["ramp_end_fraction"]),
     )
-    # Guarantees fully-physics-active epochs before early stopping may fire.
+    # physics_full_epoch=150 < minimum_epochs=350: physics is fully active well
+    # before early stopping can fire, guaranteeing a PINN checkpoint.
     assert schedule.physics_full_epoch < int(pinn["training"]["minimum_epochs"])
 
 

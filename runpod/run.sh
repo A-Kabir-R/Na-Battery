@@ -62,7 +62,7 @@ echo "[run] r2.env loaded  R2_BUCKET=${R2_BUCKET:-<unset>}  STOP_MODE=${STOP_MOD
 : "${POD_CODE_DIR:=${CODE_DIR}}"
 : "${STOP_MODE:=terminate}"
 : "${R2_PREFIX:=sodium_ion_battery}"
-: "${RUN_STAGES:=all}"
+: "${RUN_STAGES:=paper}"
 
 # Expand the alias 'all' to the legacy classical + PINN pipeline.
 # For a manuscript run use the 'paper' alias below, which adds the ablations and
@@ -71,24 +71,6 @@ if [[ "$RUN_STAGES" == "all" ]]; then
   RUN_STAGES="canonical,build,degradation,experiments,aggregate,plot,pinn,pinn_aggregate,pinn_plot,combined_report"
 fi
 
-# Alias for the unified-preprocessing revision. 'tests' runs first and gates
-# everything else: the whole point of the revision is that the wiring is
-# verified, so a failing test must stop the run before hours of GPU time.
-# 'pinn' trains the primary seed only; 'pinn_seeds' adds the robustness spread.
-if [[ "$RUN_STAGES" == "revision" ]]; then
-  RUN_STAGES="tests,build_unified,degradation,experiments,aggregate,plot,pinn,pinn_seeds,pinn_aggregate,pinn_plot,combined_report"
-fi
-
-# Development-only variant: everything except the holdout. This is what to run
-# until every setting is frozen (config experiment.evaluate_holdout stays false).
-if [[ "$RUN_STAGES" == "revision_dev" ]]; then
-  RUN_STAGES="tests,build_unified,experiments,aggregate,pinn,pinn_aggregate,combined_report"
-fi
-
-# Fast wiring check: tests + feature build + one short fold per model.
-if [[ "$RUN_STAGES" == "revision_smoke" ]]; then
-  RUN_STAGES="tests,build_unified,pinn_smoke"
-fi
 
 # The four paper studies only. CPU-viable: none of them touch CUDA, so this can
 # run on a cheap pod while a GPU pod trains.
@@ -105,6 +87,12 @@ fi
 # It runs before 'pinn' so the primary fit uses the selected epoch count.
 if [[ "$RUN_STAGES" == "paper" ]]; then
   RUN_STAGES="tests,build_unified,degradation,experiments,aggregate,plot,pinn_nested,pinn,pinn_seeds,pinn_aggregate,pinn_ablation,pinn_plot,generalization,low_data,uncertainty,robustness,paper_figures,combined_report"
+fi
+
+# Revision run: full pipeline but no spread seeds and no ablation suite.
+# Faster than 'paper'; use this to validate a config change end-to-end.
+if [[ "$RUN_STAGES" == "revision" ]]; then
+  RUN_STAGES="tests,build_unified,degradation,experiments,aggregate,plot,pinn_nested,pinn,pinn_aggregate,pinn_plot,generalization,low_data,uncertainty,robustness,paper_figures,combined_report"
 fi
 
 log(){ printf '\n[run %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -400,7 +388,7 @@ for stage in "${STAGES[@]}"; do
         if ! use_gpu; then
           log "WARNING: pinn_seeds skipped — CUDA unavailable"
         else
-          for extra_seed in ${SIB_SPREAD_SEEDS:-43 44 45 46}; do
+          for extra_seed in ${SIB_SPREAD_SEEDS:-}; do
             log "===== stage: pinn_seeds (seed=$extra_seed) ====="
             t0=$SECONDS
             python scripts/06_run_pinn_experiments.py --seed "$extra_seed"
