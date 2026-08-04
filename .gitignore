@@ -10,6 +10,9 @@ runpod/pod.env
 .fuse_hidden*
 *.pt
 *.pth
+uv.lock
+*.egg-info/
+.claude/scheduled_tasks.lock
 
 # Derived study outputs. Results must be reproducible from a commit, not
 # carried in the tree; see `make paper`.
