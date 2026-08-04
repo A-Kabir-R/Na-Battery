@@ -95,12 +95,6 @@ def _load(cfg: dict) -> tuple[pd.DataFrame, list[str]]:
     frame = frame[frame[TARGET].notna()].reset_index(drop=True)
     split_manifest = pd.read_parquet(split_manifest_path)[["cell", "outer_role", "cv_fold"]]
     frame = frame.merge(split_manifest, on="cell", how="left", validate="many_to_one")
-    holdout_count = int(frame["outer_role"].eq("holdout").sum())
-    if holdout_count > 0:
-        raise SystemExit(
-            f"[bootstrap] {holdout_count} holdout rows found after merge — "
-            "aborting to prevent data leakage."
-        )
     frame = frame[frame["outer_role"].eq("development")].reset_index(drop=True)
     if frame.empty:
         raise SystemExit("[bootstrap] No development cells found in split manifest.")

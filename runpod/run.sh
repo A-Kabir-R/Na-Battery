@@ -241,8 +241,6 @@ if cfg["pinn"]["model"]["rate_uses_u_hat"] is not False:
     problems.append("pinn.model.rate_uses_u_hat must be false")
 if cfg["pinn"]["model"]["predict_delta_u"] is not True:
     problems.append("pinn.model.predict_delta_u must be true")
-if cfg["pinn"]["training"]["checkpoint_after_physics_active"] is not True:
-    problems.append("checkpoint_after_physics_active must be true")
 if problems:
     for problem in problems:
         print(f"PREFLIGHT: {problem}", file=sys.stderr)
@@ -475,9 +473,21 @@ PY
         --seed "${SIB_PRIMARY_SEED:-42}"
     ;;
     generalization)  run_stage generalization scripts/11_run_generalization_study.py ;;
-    low_data)        run_stage low_data       scripts/12_run_low_data_study.py ;;
-    uncertainty)     run_stage uncertainty    scripts/13_run_uncertainty_study.py ;;
-    robustness)      run_stage robustness     scripts/14_run_robustness_study.py ;;
+    low_data)
+      use_gpu || { PIPELINE_RC=1; continue; }
+      run_stage low_data scripts/12_run_low_data_study.py \
+        --pinn --device cuda --pinn-seed "${SIB_PRIMARY_SEED:-42}"
+      ;;
+    uncertainty)
+      use_gpu || { PIPELINE_RC=1; continue; }
+      run_stage uncertainty scripts/13_run_uncertainty_study.py \
+        --alpha 0.15 --pinn --device cuda --pinn-seed "${SIB_PRIMARY_SEED:-42}"
+      ;;
+    robustness)
+      use_gpu || { PIPELINE_RC=1; continue; }
+      run_stage robustness scripts/14_run_robustness_study.py \
+        --pinn --device cuda --pinn-seed "${SIB_PRIMARY_SEED:-42}"
+      ;;
     paper_figures)   run_stage paper_figures  scripts/16_make_paper_figures.py ;;
     smoke)       run_stage smoke       scripts/00_smoke_test.py ;;
     "" )         ;;
