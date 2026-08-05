@@ -298,7 +298,7 @@ def main() -> None:
     atomic_write_csv(manifest_df, results_dir / "experiment_manifest.csv")
     atomic_write_csv(pd.DataFrame(failed_rows), results_dir / "failed_runs.csv")
     atomic_write_json({"total_runs": len(plan),
-                       "completed": int((manifest_df["status"] == "completed").sum()) if not manifest_df.empty else 0,
+                       "completed": int(manifest_df["status"].isin(["completed", "reused"]).sum()) if not manifest_df.empty else 0,
                        "failed": len(failed_rows),
                        "elapsed_seconds": time.time() - total_start,
                        "git_commit": git_commit(HERE.parent)},
@@ -306,7 +306,7 @@ def main() -> None:
     print(f"[pinn] wrote experiment manifest: {len(manifest_df)} rows")
     print(f"[pinn] failed runs: {len(failed_rows)}")
     print(f"[pinn] elapsed: {time.time() - total_start:.1f}s")
-    completed_count = int((manifest_df["status"] == "completed").sum()) if not manifest_df.empty else 0
+    completed_count = int(manifest_df["status"].isin(["completed", "reused"]).sum()) if not manifest_df.empty else 0
     log_event(logger, logging.INFO, "script_complete",
               total_runs=len(plan),
               completed=completed_count,

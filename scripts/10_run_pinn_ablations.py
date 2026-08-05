@@ -159,7 +159,13 @@ def main() -> None:
     dataset = build_anchor_dataset(
         frame, preprocessing=preprocessing, stress_cfg=pinn_cfg["stress"],
         audit_cfg=pinn_cfg.get("audit"),
-        audit_path=results / f"temporal_feature_audit_{preprocessing}.csv",
+        # Fold-suffixed when run with --fold N (parallel invocations would
+        # otherwise all write this same path concurrently -- see the
+        # ablation_metrics suffix comment near the end of main() for why).
+        audit_path=results / (
+            f"temporal_feature_audit_{preprocessing}"
+            f"{'_fold' + str(args.fold) if args.fold is not None else ''}.csv"
+        ),
         features_dir=features_path.parent,
     )
     attached = apply_split_manifest(dataset.frame, split_manifest)
@@ -237,6 +243,9 @@ def main() -> None:
             hybrid_enable_cold_regime=bool(model_cfg.get("hybrid_enable_cold_regime", True)),
             hybrid_fit_c_rate_exponent=bool(model_cfg.get("hybrid_fit_c_rate_exponent", False)),
             hybrid_residual_share_limit=float(model_cfg.get("hybrid_residual_share_limit", 0.5)),
+            hybrid_residual_hidden_dims=tuple(
+                int(h) for h in model_cfg.get("hybrid_residual_hidden_dims", (8, 8))
+            ),
             log_every_epochs=int(pinn_cfg["logging"]["log_every_epochs"]),
             save_checkpoint_every_epochs=int(pinn_cfg["logging"]["save_checkpoint_every_epochs"]),
             log_gpu_memory=bool(pinn_cfg["logging"]["log_gpu_memory"]),
@@ -290,9 +299,15 @@ def main() -> None:
         rows["ablation"] = ablation
         metric_frames.append(rows)
     metrics = pd.concat(metric_frames, ignore_index=True) if metric_frames else pd.DataFrame()
-    atomic_write_csv(metrics, results / "ablation_metrics.csv")
-
-    atomic_write_csv(pd.DataFrame(failed_runs), results / "ablation_failed_runs.csv")
+    # Fold-partitioned invocations (--fold N, used to run folds concurrently on
+    # one GPU) each write their own suffixed files instead of the shared
+    # ablation_metrics.csv/ablation_failed_runs.csv -- concurrent processes
+    # writing the same path race (a rename can find the other process's tmp
+    # file already consumed). run.sh merges the per-fold files into the
+    # canonical names once every partition has finished.
+    suffix = f"_fold{args.fold}" if args.fold is not None else ""
+    atomic_write_csv(metrics, results / f"ablation_metrics{suffix}.csv")
+    atomic_write_csv(pd.DataFrame(failed_runs), results / f"ablation_failed_runs{suffix}.csv")
     print(f"[pinn.ablation] wrote {len(metrics)} metric rows; {len(failed_runs)} failed")
     log_event(logger, logging.INFO, "script_complete",
               metric_rows=len(metrics), predictions=len(prediction_paths),

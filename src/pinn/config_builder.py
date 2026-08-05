@@ -111,6 +111,9 @@ def build_trainer_config(pinn_cfg: dict[str, Any], *, architecture: str,
         hybrid_residual_share_limit=float(
             model.get("hybrid_residual_share_limit", 0.5)
         ),
+        hybrid_residual_hidden_dims=tuple(
+            int(h) for h in model.get("hybrid_residual_hidden_dims", (8, 8))
+        ),
     )
     for key, value in overrides.items():
         if not hasattr(config, key):

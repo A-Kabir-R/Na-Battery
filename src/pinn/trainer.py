@@ -179,6 +179,11 @@ class TrainerConfig:
     # Upper bound on the neural residual's share of the total rate. Only
     # applied when use_hybrid_rate=True and residual_share weight > 0.
     hybrid_residual_share_limit: float = 0.5
+    # Hidden dims of the small neural correction inside HybridRateModel (the
+    # r_residual term). Previously hardcoded in NaPINNQ's signature with no
+    # config.yaml entry or wiring here -- same default value, now visible and
+    # tunable like every other architecture setting.
+    hybrid_residual_hidden_dims: tuple[int, ...] = (8, 8)
 
 
 @dataclass
@@ -767,6 +772,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
         hybrid_c_rate_index=hybrid_crate_idx,
         hybrid_enable_cold_regime=config.hybrid_enable_cold_regime,
         hybrid_fit_c_rate_exponent=config.hybrid_fit_c_rate_exponent,
+        hybrid_residual_hidden_dims=config.hybrid_residual_hidden_dims,
     )
 
     trainable_parameters = count_parameters(model)
@@ -1840,6 +1846,7 @@ def _refit_full_outer_train(
         hybrid_c_rate_index=refit_hybrid_crate_idx,
         hybrid_enable_cold_regime=config.hybrid_enable_cold_regime,
         hybrid_fit_c_rate_exponent=config.hybrid_fit_c_rate_exponent,
+        hybrid_residual_hidden_dims=config.hybrid_residual_hidden_dims,
     )
     refit_model.to(device)
     optimizer = _init_optimizer(refit_model, config)

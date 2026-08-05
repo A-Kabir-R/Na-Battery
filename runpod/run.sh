@@ -457,8 +457,72 @@ PY
       # Left to its defaults the script would fan out over every seed.
       # This trains PINNs like every other pinn_* stage and must not run on CPU.
       use_gpu || { PIPELINE_RC=1; continue; }
-      run_stage pinn_ablation scripts/10_run_pinn_ablations.py \
-        --seed "${SIB_PRIMARY_SEED:-42}" --preprocessing unified
+      if [[ $PIPELINE_RC -ne 0 ]]; then
+        log "skipping stage 'pinn_ablation' — earlier stage failed"
+      else
+        # One process per outer fold, launched concurrently on the same GPU
+        # (2026-08-05: this workload's per-step compute is far too small to
+        # saturate a modern GPU running one fold at a time -- host-sync
+        # overhead from gradient-norm balancing dominates wall-clock, so
+        # overlapping several tiny fits fills the idle time between syncs).
+        # Each process writes fold-suffixed ablation_metrics/failed_runs/
+        # temporal-audit files (scripts/10_run_pinn_ablations.py) instead of
+        # the shared unsuffixed names, so concurrent writers can't race on
+        # the same path; merged back into the canonical filenames below once
+        # every fold has finished.
+        log "===== stage: pinn_ablation -> scripts/10_run_pinn_ablations.py (parallel, one process per fold) ====="
+        t0=$SECONDS
+        N_FOLDS=$(python -c "from src.io.loaders import load_config; print(load_config()['split']['n_splits'])")
+        ABLATION_RC=0
+        pids=()
+        for ((f=0; f<N_FOLDS; f++)); do
+          python scripts/10_run_pinn_ablations.py \
+            --seed "${SIB_PRIMARY_SEED:-42}" --preprocessing unified --fold "$f" &
+          pids+=($!)
+        done
+        for pid in "${pids[@]}"; do
+          wait "$pid" || ABLATION_RC=1
+        done
+        python - <<'PY'
+import glob
+import pandas as pd
+from pathlib import Path
+from src.io.loaders import load_config
+
+cfg = load_config()
+pinn_cfg = cfg["pinn"]
+results = Path(cfg["paths"]["artifacts"]) / "results" / str(
+    (pinn_cfg or {}).get("results_subdir", "pinn_preprocessing_study")
+)
+for base in ("ablation_metrics", "ablation_failed_runs"):
+    parts = sorted(results.glob(f"{base}_fold*.csv"))
+    frames = []
+    for p in parts:
+        # atomic_write_csv on an empty DataFrame (e.g. a fold with zero
+        # ablation failures) writes a 1-byte file (just the trailing
+        # newline) with no header/columns at all -- st_size>0 doesn't catch
+        # this, and pd.read_csv raises EmptyDataError on it, so try/except
+        # rather than a size check.
+        try:
+            frame = pd.read_csv(p)
+        except pd.errors.EmptyDataError:
+            continue
+        if not frame.empty:
+            frames.append(frame)
+    merged = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    merged.to_csv(results / f"{base}.csv", index=False)
+    for p in parts:
+        p.unlink()
+    print(f"[pinn_ablation merge] {base}.csv: {len(merged)} rows from {len(parts)} fold files")
+PY
+        merge_rc=$?
+        rc=$ABLATION_RC
+        if [[ $merge_rc -ne 0 ]]; then rc=1; fi
+        log "stage 'pinn_ablation' finished rc=$rc in $((SECONDS - t0))s"
+        if [[ $rc -ne 0 ]]; then
+          PIPELINE_RC=$rc
+        fi
+      fi
     ;;
     pinn_nested)
       # Nested selection of the refit epoch count. Trains k inner folds per

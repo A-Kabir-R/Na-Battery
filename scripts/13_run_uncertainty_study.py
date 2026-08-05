@@ -179,9 +179,12 @@ def _pinn_train_and_predict(
     if seed_status.exists():
         try:
             status = _json.loads(seed_status.read_text())
+            # "reused" is train_fold's fingerprint fast-path (see
+            # _try_reuse_completed_run in trainer.py) -- same valid status.json
+            # as a fresh "completed" run, just without retraining.
             if (status.get("refit_epoch_selection_source") == "nested_inner_folds"
                     and status.get("two_phase_refit_used")
-                    and status.get("status") == "completed"):
+                    and status.get("status") in ("completed", "reused")):
                 best_epoch = int(status["refit_selected_epoch"])
             else:
                 best_epoch = int(status.get("refit_selected_epoch",

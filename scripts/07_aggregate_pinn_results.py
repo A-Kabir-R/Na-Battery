@@ -131,7 +131,13 @@ def main() -> None:
     manifest_path = results / "experiment_manifest.csv"
     if manifest_path.exists():
         manifest_df = pd.read_csv(manifest_path)
-        expected_completed = int((manifest_df["status"] == "completed").sum()) \
+        # "reused" is train_fold's fast-path status when a prior completed run
+        # already satisfies the current fingerprint (see
+        # _try_reuse_completed_run in trainer.py) -- it has the same valid
+        # predictions.parquet a fresh "completed" run would, just without
+        # retraining. Excluding it here undercounts to 0 whenever a rerun
+        # reuses everything, and refuses to aggregate a fully-valid sweep.
+        expected_completed = int(manifest_df["status"].isin(["completed", "reused"]).sum()) \
             if "status" in manifest_df.columns else int(len(manifest_df))
         planned = int(len(manifest_df))
     else:
