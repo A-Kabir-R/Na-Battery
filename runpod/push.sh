@@ -54,8 +54,21 @@ mkdir -p '${POD_CODE_DIR}' '${POD_DATA_STATICS_DIR}/tables' '${POD_DATA_STATICS_
 if ! command -v rsync >/dev/null 2>&1; then
   echo "[push:remote] installing rsync"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y >/dev/null
-  apt-get install -y --no-install-recommends rsync >/dev/null
+  apt_retry() {
+    local n=0
+    until "\$@" >/dev/null 2>/tmp/apt_retry.err; do
+      n=\$((n+1))
+      if grep -qE "Could not get lock|Unable to lock directory" /tmp/apt_retry.err && [[ \$n -lt 30 ]]; then
+        [[ \$n -eq 1 ]] && echo "[push:remote] apt lock busy, waiting..."
+        sleep 5
+      else
+        cat /tmp/apt_retry.err >&2
+        return 1
+      fi
+    done
+  }
+  apt_retry apt-get update -y
+  apt_retry apt-get install -y --no-install-recommends rsync
 fi
 REMOTE
 

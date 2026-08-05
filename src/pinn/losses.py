@@ -92,19 +92,27 @@ def bounds_loss(u_hat: torch.Tensor, cell_index: torch.Tensor, *,
 def observed_degradation_rate(u_current: torch.Tensor, u_true_next: torch.Tensor,
                               stress_delta: torch.Tensor, *,
                               epsilon: float = 1.0e-6,
-                              regeneration_tolerance: float = 0.0
+                              regeneration_tolerance: float = 0.0,
+                              rate_floor: float = 0.0
                               ) -> tuple[torch.Tensor, torch.Tensor]:
     """Observed degradation rate and its validity mask.
 
-        observed_rate = max((u_current - u_true_next) / max(delta_s, eps), 0)
+        observed_rate = max((u_current - u_true_next) / max(delta_s, eps), -rate_floor)
 
     Small apparent capacity *regeneration* (u_next slightly above u_current, a
-    measurement artefact rather than physical capacity gain) would otherwise
-    produce a negative target for a Softplus-constrained rate head, so the rate
-    is clamped at zero. ``regeneration_tolerance`` is the fold-derived tolerance
+    measurement artefact rather than physical capacity gain) used to be clamped
+    to exactly zero -- but ``RateNet`` is Softplus-constrained to ``r_hat >= 0``,
+    so a rate head trained against an all-zero-or-positive target can never
+    express regeneration either, and ~31% of real RPT-to-RPT transitions in
+    this dataset are apparent-positive. ``rate_floor`` (matched to the
+    ``RateNet``/``NaPINNQ`` construction argument of the same name) lets the
+    target go slightly negative instead, so the rate head has somewhere to put
+    that signal rather than the whole population learning a uniform negative
+    bias. ``rate_floor=0.0`` reproduces the previous hard-clamp-at-zero
+    behaviour exactly. ``regeneration_tolerance`` is the fold-derived tolerance
     already used by the monotonicity loss; transitions whose apparent gain
-    exceeds it are masked out entirely instead of being clamped, because those
-    are not merely noisy.
+    exceeds it are masked out entirely instead of being clamped/floored,
+    because those are not merely noisy.
 
     Returns
     -------
@@ -112,7 +120,7 @@ def observed_degradation_rate(u_current: torch.Tensor, u_true_next: torch.Tensor
     """
     safe_delta = torch.clamp(stress_delta, min=epsilon)
     raw_rate = (u_current - u_true_next) / safe_delta
-    rate = torch.clamp(raw_rate, min=0.0)
+    rate = torch.clamp(raw_rate, min=-float(rate_floor))
     mask = (
         (stress_delta > epsilon)
         & torch.isfinite(raw_rate)
@@ -369,15 +377,29 @@ class GradientBalancer:
             else self.ema * previous + (1.0 - self.ema) * value
         )
 
-    def multiplier(self, component: str) -> float:
-        """Current multiplier for ``component`` (1.0 when unbalanceable)."""
+    def multiplier(self, component: str, n_active: int = 1) -> float:
+        """Current multiplier for ``component`` (1.0 when unbalanceable).
+
+        ``n_active`` is the count of balanced components active this step
+        (including ``component`` itself). Each is independently rescaled to
+        match the ``data`` gradient's norm, so summing ``k`` of them can give
+        the physics side up to ``k`` times ``data``'s gradient magnitude
+        (triangle inequality, worst case all co-directional) -- a config with
+        more simultaneously-active physics terms is then systematically
+        fighting the data term harder than one with fewer, independent of
+        each term's own nominal weight. Dividing the target ratio by
+        ``n_active`` bounds the worst-case summed physics norm at ``data``'s
+        norm regardless of how many terms are turned on, so e.g. the full
+        headline config isn't structurally disadvantaged relative to a
+        leave-one-out ablation purely by having one more active term.
+        """
         if component not in BALANCED_COMPONENTS:
             return 1.0
         reference = self._norms.get("data")
         own = self._norms.get(component)
         if not reference or not own or own <= 0.0:
             return self._multipliers.get(component, 1.0)
-        raw = reference / own
+        raw = reference / (own * max(int(n_active), 1))
         if not torch.isfinite(torch.tensor(raw)):
             return self._multipliers.get(component, 1.0)
         value = float(min(max(raw, self.min_multiplier), self.max_multiplier))

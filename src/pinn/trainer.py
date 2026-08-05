@@ -110,6 +110,15 @@ class TrainerConfig:
     rate_dropout: float = 0.2
     rate_uses_u_hat: bool = True
     predict_delta_u: bool = True
+    # Floor subtracted from the Softplus rate head: r_hat = softplus(.) - rate_floor,
+    # so r_hat (and therefore du/ds = -r_hat) can go slightly negative instead of
+    # being hard-clamped at exactly zero. 0.0 reproduces the original hard
+    # nonnegative-rate behaviour. Non-zero lets the model express the apparent
+    # capacity regeneration seen in ~31% of real RPT-to-RPT transitions, which a
+    # hard-nonnegative rate head can never fit -- that mismatch is what drives
+    # delta_next_rpt_* R2 negative even though the absolute next_rpt_* targets are
+    # fine. Only implemented for the plain RateNet (use_hybrid_rate=False).
+    rate_floor: float = 0.0
     # Cell-balanced mini-batching. batch_size <= 0 preserves the legacy
     # full-batch behaviour; batch_mode selects the sampler (see batching.py).
     batch_size: int = 32
@@ -140,6 +149,15 @@ class TrainerConfig:
     gradient_balance_ema: float = 0.95
     gradient_balance_min_multiplier: float = 0.1
     gradient_balance_max_multiplier: float = 10.0
+    # When True, each balanced component's target multiplier is divided by the
+    # number of balanced components active this step (see
+    # GradientBalancer.multiplier). Without this, a config with more
+    # simultaneously-active physics terms (e.g. the full headline model) sums
+    # to a larger worst-case physics-vs-data gradient ratio than a
+    # leave-one-out ablation, purely as an artefact of the balancing scheme --
+    # not because any individual term's weight changed. False reproduces the
+    # original per-component-independent behaviour exactly.
+    gradient_balance_normalize_active: bool = False
     # Checkpoint eligibility: when True, no checkpoint may be selected as the
     # fold's best model before the curriculum factor reaches 1.0. Prevents
     # reporting a partially-physics-active model as the full PINN.
@@ -742,6 +760,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
         rate_dropout=config.rate_dropout,
         rate_uses_u_hat=config.rate_uses_u_hat,
         predict_delta_u=config.predict_delta_u,
+        rate_floor=config.rate_floor,
         use_hybrid_rate=config.use_hybrid_rate,
         hybrid_temperature_index=hybrid_temp_idx,
         hybrid_dod_index=hybrid_dod_idx,
@@ -1062,6 +1081,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                         batch_u_current, batch_u_true, batch_delta,
                         epsilon=1.0e-6,
                         regeneration_tolerance=scaler.epsilon_rec,
+                        rate_floor=config.rate_floor,
                     )
                     rate_data_val, rate_data_row, rate_coverage = rate_data_loss(
                         r_anchor_hat, observed_rate, batch_cells, rate_mask,
@@ -1124,16 +1144,25 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                     ))
                     if physics_active and grad_pde > 0:
                         balancer.observe("pde", grad_pde)
+                    active_components = set()
                     for name in ("integral", "monotonicity", "bounds",
                                  "rate_data", "pairwise"):
                         weight = getattr(effective_weights, name)
                         if weight <= 0.0:
                             continue
+                        active_components.add(name)
                         balancer.observe(name, _pde_gradient_norm(
                             probes[name], parameters, logger=None,
                         ))
+                    if physics_active and grad_pde > 0:
+                        active_components.add("pde")
+                    n_active = (
+                        len(active_components)
+                        if config.gradient_balance_normalize_active
+                        else 1
+                    )
                     multipliers = {
-                        name: balancer.multiplier(name)
+                        name: balancer.multiplier(name, n_active=n_active)
                         for name in BALANCED_COMPONENTS
                     }
 
@@ -1308,6 +1337,7 @@ def train_fold(*, dataset: AnchorDataset, frame: pd.DataFrame,
                     delta_full[val_selector],
                     epsilon=1.0e-6,
                     regeneration_tolerance=scaler.epsilon_rec,
+                    rate_floor=config.rate_floor,
                 )
                 if val_rate_mask.any():
                     _rp = val_r_sel[val_rate_mask].cpu().numpy()
@@ -1803,6 +1833,7 @@ def _refit_full_outer_train(
         rate_dropout=config.rate_dropout,
         rate_uses_u_hat=config.rate_uses_u_hat,
         predict_delta_u=config.predict_delta_u,
+        rate_floor=config.rate_floor,
         use_hybrid_rate=config.use_hybrid_rate,
         hybrid_temperature_index=refit_hybrid_temp_idx,
         hybrid_dod_index=refit_hybrid_dod_idx,
@@ -1969,6 +2000,7 @@ def _refit_full_outer_train(
                     batch_u_current, batch_u_true, batch_delta,
                     epsilon=1.0e-6,
                     regeneration_tolerance=refit_scaler.epsilon_rec,
+                    rate_floor=config.rate_floor,
                 )
                 rate_data_l, _, _ = rate_data_loss(
                     r_anchor_hat, observed_rate, batch_cells, rate_mask,
@@ -2009,15 +2041,22 @@ def _refit_full_outer_train(
                 balancer.observe("data", _pde_gradient_norm(
                     probes["data"], parameters, logger=None,
                 ))
+                active_components = set()
                 for name in ("pde", "integral", "monotonicity", "bounds",
                              "rate_data", "pairwise"):
                     if getattr(effective_weights, name) <= 0.0:
                         continue
+                    active_components.add(name)
                     balancer.observe(name, _pde_gradient_norm(
                         probes[name], parameters, logger=None,
                     ))
+                n_active = (
+                    len(active_components)
+                    if config.gradient_balance_normalize_active
+                    else 1
+                )
                 multipliers = {
-                    name: balancer.multiplier(name)
+                    name: balancer.multiplier(name, n_active=n_active)
                     for name in BALANCED_COMPONENTS
                 }
 

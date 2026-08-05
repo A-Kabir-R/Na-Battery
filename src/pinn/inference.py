@@ -98,6 +98,7 @@ def _rebuild_model(cfg: TrainerConfig, scaler: FoldScaler, device: str) -> NaPIN
         rate_dropout=cfg.rate_dropout,
         rate_uses_u_hat=cfg.rate_uses_u_hat,
         predict_delta_u=cfg.predict_delta_u,
+        rate_floor=cfg.rate_floor,
         use_hybrid_rate=cfg.use_hybrid_rate,
         hybrid_temperature_index=hybrid_temp_idx,
         hybrid_dod_index=hybrid_dod_idx,

@@ -78,6 +78,13 @@ if [[ "$RUN_STAGES" == "studies" ]]; then
   RUN_STAGES="generalization,low_data,uncertainty,robustness,paper_figures"
 fi
 
+# PINN-only debug run: no classical experiments, no ablations, no studies.
+# Just build the unified features (if missing), train the primary-seed PINN,
+# and aggregate/plot its metrics so you can inspect training behavior fast.
+if [[ "$RUN_STAGES" == "pinn_debug" ]]; then
+  RUN_STAGES="tests,build_unified,pinn,pinn_aggregate,pinn_plot"
+fi
+
 # Everything the manuscript needs: the revision pipeline plus nested epoch
 # selection, the ablation suite and the four studies.
 #

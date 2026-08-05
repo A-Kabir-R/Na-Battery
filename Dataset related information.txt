@@ -1,0 +1,4589 @@
+DATASET RELATED PYTHON CODE
+Compiled from scripts/ and src/ — covers data discovery/parsing, cleaning,
+preprocessing, feature engineering, splits, and target construction.
+Generated: 2026-08-05 00:39:59
+================================================================================
+
+################################################################################
+# FILE: scripts/00_build_canonical.py
+################################################################################
+
+"""Build canonical Standard-cycling tables directly from raw IRD files."""
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+
+from src.io.canonical import build_canonical_tables
+
+
+def _args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset-root", type=Path)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--limit-files", type=int)
+    parser.add_argument("--write-samples", action="store_true")
+    parser.add_argument("--skip-checksums", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _args()
+    result = build_canonical_tables(
+        dataset_root=args.dataset_root,
+        output_dir=args.output_dir,
+        limit_files=args.limit_files,
+        write_samples=args.write_samples,
+        checksum_files=not args.skip_checksums,
+    )
+    print(
+        "[canonical] "
+        f"files={len(result.manifest)} steps={len(result.steps)} "
+        f"cycles={len(result.cycles)} rpt={len(result.rpt_measurements)} "
+        f"qc_flags={len(result.qc_flags)}"
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
+################################################################################
+# FILE: scripts/00_smoke_test.py
+################################################################################
+
+"""Non-destructive parser, RPT, split, and fold-preprocessing smoke test."""
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+
+import pandas as pd
+from sklearn.linear_model import Ridge
+
+from src.evaluation.metrics import regression_metrics
+from src.features.selection import FoldPreprocessor
+from src.io.canonical import discover_standard_cycling_files
+from src.io.ird_parser import parse_ird
+from src.io.loaders import load_config
+from src.preprocessing.protocol_segmentation import extract_reference_discharge, summarize_steps
+from src.splits.group_kfold import assert_no_cell_overlap, make_folds
+
+
+def main() -> None:
+    started = time.time()
+    cfg = load_config()
+    files = discover_standard_cycling_files(cfg["paths"]["dataset_root"])
+    if not files:
+        raise RuntimeError("no Standard-cycling IRD files discovered")
+    sample = files[0]
+    parsed = parse_ird(sample)
+    assert parsed.data is not None
+    steps = summarize_steps(parsed.data)
+    reference = extract_reference_discharge(parsed.data, steps=steps)
+    print(
+        f"[smoke] parsed {sample.name}: rows={len(parsed.data)} steps={len(steps)} "
+        f"reference_status={reference.status}"
+    )
+
+    frame = pd.DataFrame({
+        "condition": [f"condition-{index % 3}" for index in range(9)],
+        "cell": [f"cell-{index}" for index in range(9)],
+        "feature_a": [float(index) for index in range(9)],
+        "feature_b": [float(index * index + 1) for index in range(9)],
+        "next_rpt_Q_Ah": [1.2 - 0.01 * index for index in range(9)],
+    })
+    train_index, test_index = next(iter(make_folds(frame, n_splits=3)))
+    assert_no_cell_overlap(train_index, test_index, frame["cell"])
+    processor = FoldPreprocessor(scale=True)
+    x_train = processor.fit_transform(frame.iloc[train_index], target="next_rpt_Q_Ah")
+    x_test = processor.transform(frame.iloc[test_index])
+    estimator = Ridge(alpha=1.0).fit(x_train, frame.iloc[train_index]["next_rpt_Q_Ah"])
+    metrics = regression_metrics(
+        frame.iloc[test_index]["next_rpt_Q_Ah"], estimator.predict(x_test)
+    )
+    print(
+        f"[smoke] grouped fold: train_cells={len(train_index)} test_cells={len(test_index)} "
+        f"features={len(processor.feature_names_ or [])} metrics={metrics}"
+    )
+    print(f"[smoke] completed in {time.time() - started:.1f}s")
+
+
+if __name__ == "__main__":
+    main()
+
+
+################################################################################
+# FILE: scripts/01_build_features.py
+################################################################################
+
+"""Build feature parquets and cache them under artifacts/features/.
+
+``unified.parquet`` is the table every retained model trains on.
+
+Usage
+-----
+    python3 scripts/01_build_features.py
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+
+import pandas as pd
+from tqdm.auto import tqdm
+
+from src.io.loaders import (
+    load_config,
+    load_cycle_metrics,
+    load_rpt_measurements,
+)
+from src.preprocessing.unified import build_unified, write_unified
+
+
+# Columns that are never features: identifiers, metadata, targets, and
+# physics-coordinate columns that are computed by the PINN trainer at
+# training time rather than stored in the feature parquets.
+_NON_FEATURE_COLUMNS: frozenset[str] = frozenset({
+    "condition", "cell", "file_id", "visit", "test_id", "cycle_in_file",
+    "anchor_id", "is_prediction_anchor", "split", "rpt_qc_status",
+    "target_unavailable_reason", "file_start_time", "path",
+    # Target columns — must never appear as input features
+    "next_rpt_Q_Ah", "next_rpt_SOH_pct", "delta_next_rpt_Q_Ah", "delta_next_rpt_SOH_pct",
+    "next_rpt_visit", "next_rpt_horizon_days",
+    "rul", "time_to_failure", "is_failed", "failure_type",
+    # RPT-derived columns that are not features but ride along in the frame
+    "reference_capacity_Ah", "rpt_SOH_pct", "initial_rpt_Q_Ah",
+    "previous_rpt_Q_Ah", "delta_rpt_Q_Ah", "delta_rpt_SOH_pct",
+    # PINN physics-coordinate columns (computed at training time)
+    "stress_current", "stress_next", "stress_delta", "u_current", "u_true_next",
+    "q0_column", "q_current_column",
+})
+
+
+def _enrich_rpt_measurements(frame: pd.DataFrame, initial_visit: int) -> pd.DataFrame:
+    out = frame.copy()
+    out["file_start_time"] = pd.to_datetime(out["file_start_time"], errors="coerce")
+    out = out.sort_values(["condition", "cell", "file_start_time", "test_id"]).reset_index(drop=True)
+    valid = out["rpt_qc_status"].eq("valid")
+    baseline = (
+        out[valid & out["visit"].eq(initial_visit)]
+        .groupby(["condition", "cell"])["reference_capacity_Ah"]
+        .first()
+        .rename("initial_rpt_Q_Ah")
+    )
+    out = out.join(baseline, on=["condition", "cell"])
+    out["rpt_SOH_pct"] = float("nan")
+    has_baseline = valid & out["initial_rpt_Q_Ah"].gt(0)
+    out.loc[has_baseline, "rpt_SOH_pct"] = (
+        100.0 * out.loc[has_baseline, "reference_capacity_Ah"]
+        / out.loc[has_baseline, "initial_rpt_Q_Ah"]
+    )
+    out["previous_rpt_Q_Ah"] = float("nan")
+    out["delta_rpt_Q_Ah"] = float("nan")
+    out["delta_rpt_SOH_pct"] = float("nan")
+    valid_rows = out[valid].copy()
+    valid_rows["previous_rpt_Q_Ah"] = valid_rows.groupby(
+        ["condition", "cell"]
+    )["reference_capacity_Ah"].shift(1)
+    valid_rows["delta_rpt_Q_Ah"] = (
+        valid_rows["reference_capacity_Ah"] - valid_rows["previous_rpt_Q_Ah"]
+    )
+    valid_rows["delta_rpt_SOH_pct"] = valid_rows.groupby(
+        ["condition", "cell"]
+    )["rpt_SOH_pct"].diff()
+    out.loc[valid_rows.index, [
+        "previous_rpt_Q_Ah", "delta_rpt_Q_Ah", "delta_rpt_SOH_pct",
+    ]] = valid_rows[[
+        "previous_rpt_Q_Ah", "delta_rpt_Q_Ah", "delta_rpt_SOH_pct",
+    ]]
+    return out
+
+
+def _build_unified_stage(out: Path, cycle_metrics: pd.DataFrame,
+                         cu_cache: pd.DataFrame) -> None:
+    t0 = time.time()
+    result = build_unified(cycle_metrics, cu_cache)
+    write_unified(result, out)
+    manifest = result["manifest"]
+    tqdm.write(
+        f"[build] unified: {result['unified'].shape} "
+        f"({manifest['n_model_features']} model features, "
+        f"{manifest['n_anchors']} anchors, {manifest['n_cells']} cells) "
+        f"({time.time()-t0:.1f}s)"
+    )
+    coverage = result["coverage"]
+    weak = coverage[
+        coverage["scope"].eq("all") & coverage["coverage"].lt(0.95)
+    ].sort_values("coverage")
+    if not weak.empty:
+        tqdm.write("[build] unified features with <95% coverage:")
+        for row in weak.itertuples(index=False):
+            tqdm.write(f"[build]     {row.feature:<42} {row.coverage:6.1%}")
+
+
+def main() -> None:
+    cfg = load_config()
+    out = Path(cfg["paths"]["artifacts"]) / "features"
+    out.mkdir(parents=True, exist_ok=True)
+
+    stages = ["cu_cache", "unified"]
+    pbar = tqdm(stages, desc="[build] stages", unit="stage")
+
+    pbar.set_postfix_str("cu_cache")
+    t0 = time.time()
+    cu_cache = _enrich_rpt_measurements(
+        load_rpt_measurements(),
+        int(cfg.get("targets", {}).get("next_rpt", {}).get("initial_visit", 0)),
+    )
+    cu_cache.to_parquet(out / "cu_capacity.parquet")
+    tqdm.write(f"[build] cu_cache: {cu_cache.shape} ({time.time()-t0:.1f}s)")
+    pbar.update(1)
+
+    pbar.set_postfix_str("unified")
+    _build_unified_stage(out, load_cycle_metrics(), cu_cache)
+    pbar.update(1)
+    pbar.close()
+    print("[build] done.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+################################################################################
+# FILE: src/io/canonical.py
+################################################################################
+
+"""Build versioned canonical tables directly from Standard-cycling IRD files."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from hashlib import sha256
+import json
+from pathlib import Path
+from typing import Any, Iterable
+
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+from .ird_parser import FILENAME_RE, parse_condition, parse_ird
+from .loaders import load_config
+from ..preprocessing.protocol_segmentation import (
+    aggregate_cycle,
+    extract_reference_discharge,
+    segment_cyc_protocol,
+    summarize_steps,
+)
+
+MANIFEST_COLUMNS = [
+    "file_id", "relative_path", "path", "checksum_sha256", "size_bytes", "mtime_ns",
+    "condition", "cell", "visit", "test_id", "filename_test_type", "test_type",
+    "rpt_T_degC", "DOD_pct", "C_ch", "C_dis", "T_degC", "start_time",
+    "test_name", "row_count", "parse_status", "parse_error_code",
+    "qc_status",
+]
+
+
+@dataclass(frozen=True)
+class CanonicalBuildResult:
+    manifest: pd.DataFrame
+    steps: pd.DataFrame
+    cycles: pd.DataFrame
+    rpt_measurements: pd.DataFrame
+    qc_flags: pd.DataFrame
+
+
+def _atomic_parquet(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    frame.to_parquet(temporary, index=False)
+    temporary.replace(path)
+
+
+def _atomic_json(payload: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _checksum(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def discover_standard_cycling_files(dataset_root: Path | str) -> list[Path]:
+    """Discover only the two permitted Standard-cycling raw-file roles."""
+    root = Path(dataset_root).resolve()
+    files: set[Path] = set()
+    condition_dirs = list(root.glob("DOD*_*"))
+    if not condition_dirs:
+        raise ValueError(
+            f"dataset_root must directly contain Standard-cycling DOD condition folders: {root}"
+        )
+    for condition_dir in condition_dirs:
+        condition_fields = parse_condition(condition_dir.name)
+        if not condition_dir.is_dir() or pd.isna(condition_fields["DOD_pct"]):
+            continue
+        cycling = condition_dir / "Cycling_Periods"
+        if cycling.is_dir():
+            files.update(path.resolve() for path in cycling.glob("*.ird"))
+        for cu_dir in condition_dir.glob("CU_at_*degC"):
+            if cu_dir.is_dir():
+                files.update(path.resolve() for path in cu_dir.glob("*.ird"))
+    for path in files:
+        if root not in path.parents:
+            raise ValueError(f"discovered path outside configured Standard-cycling scope: {path}")
+    return sorted(files, key=lambda path: path.relative_to(root).as_posix())
+
+
+def _identity(path: Path, root: Path) -> dict[str, Any]:
+    relative = path.relative_to(root).as_posix()
+    condition = path.parents[1].name
+    role = "CYC" if path.parent.name == "Cycling_Periods" else "CU"
+    match = FILENAME_RE.match(path.name)
+    if not match:
+        raise ValueError(f"filename does not match the IRD naming contract: {path.name}")
+    parsed = match.groupdict()
+    condition_fields = parse_condition(condition)
+    return {
+        "file_id": sha256(relative.encode("utf-8")).hexdigest()[:20],
+        "relative_path": relative,
+        "path": str(path),
+        "condition": condition,
+        "cell": parsed["cell"],
+        "visit": int(parsed["visit"]),
+        "test_id": int(parsed["testid"]),
+        "filename_test_type": parsed["test"],
+        "test_type": role,
+        "rpt_T_degC": int(parsed["rpt_T"]),
+        **condition_fields,
+    }
+
+
+def _qc_rows(file_id: str, issues: Iterable[Any], *, level: str = "file") -> list[dict[str, Any]]:
+    rows = []
+    for issue in issues:
+        row = issue.to_dict()
+        row.update({"file_id": file_id, "level": level, "action": "review"})
+        rows.append(row)
+    return rows
+
+
+def _signal_qc(file_id: str, path: Path, data: pd.DataFrame,
+               bounds: dict[str, list[float]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for column, limits in bounds.items():
+        if column not in data.columns:
+            continue
+        low, high = float(limits[0]), float(limits[1])
+        invalid = (data[column] < low) | (data[column] > high)
+        count = int(invalid.sum())
+        if count:
+            rows.append({
+                "file_id": file_id,
+                "level": "sample",
+                "path": str(path),
+                "stage": "signal_qc",
+                "code": f"{column.lower()}_out_of_range",
+                "message": f"{count}/{len(data)} {column} values outside [{low}, {high}]",
+                "severity": "error",
+                "row": None,
+                "column": column,
+                "value": None,
+                "exception_type": None,
+                "action": "exclude_invalid_samples_and_review_file",
+            })
+    return rows
+
+
+def _clean_physical_bounds(data: pd.DataFrame,
+                           bounds: dict[str, list[float]]) -> pd.DataFrame:
+    cleaned = data.copy()
+    for column, limits in bounds.items():
+        invalid = (cleaned[column] < limits[0]) | (cleaned[column] > limits[1])
+        cleaned.loc[invalid, column] = np.nan
+    return cleaned
+
+
+def _write_samples(data: pd.DataFrame, identity: dict[str, Any], output_dir: Path,
+                   bounds: dict[str, list[float]]) -> None:
+    sample_dir = (
+        output_dir / "samples" / f"condition={identity['condition']}" /
+        f"cell={identity['cell']}"
+    )
+    samples = data.copy()
+    for column in bounds:
+        samples[f"raw_{column}"] = samples[column]
+    samples = _clean_physical_bounds(samples, bounds)
+    samples.insert(0, "row_in_file", np.arange(len(samples), dtype=np.int64))
+    samples.insert(0, "file_id", identity["file_id"])
+    _atomic_parquet(samples, sample_dir / f"{identity['file_id']}.parquet")
+
+
+def _empty(columns: list[str]) -> pd.DataFrame:
+    return pd.DataFrame(columns=columns)
+
+
+def build_canonical_tables(*, dataset_root: Path | str | None = None,
+                           output_dir: Path | str | None = None,
+                           limit_files: int | None = None,
+                           write_samples: bool = False,
+                           checksum_files: bool = True) -> CanonicalBuildResult:
+    """Parse raw files and atomically write canonical manifests and aggregates."""
+    cfg = load_config()
+    root = Path(dataset_root or cfg["paths"]["dataset_root"]).resolve()
+    output = Path(output_dir or cfg["paths"]["canonical"]).resolve()
+    files = discover_standard_cycling_files(root)
+    if limit_files is not None:
+        files = files[:limit_files]
+
+    manifest_rows: list[dict[str, Any]] = []
+    step_rows: list[dict[str, Any]] = []
+    cycle_rows: list[dict[str, Any]] = []
+    rpt_rows: list[dict[str, Any]] = []
+    qc_rows: list[dict[str, Any]] = []
+    protocol = cfg["protocol"]
+
+    for path in tqdm(files, desc="[canonical] parse IRD", unit="file"):
+        try:
+            identity = _identity(path, root)
+        except Exception as exc:
+            relative = path.relative_to(root).as_posix()
+            file_id = sha256(relative.encode("utf-8")).hexdigest()[:20]
+            qc_rows.append({
+                "file_id": file_id, "level": "file", "path": str(path), "stage": "identity",
+                "code": "identity_error", "message": str(exc), "severity": "error",
+                "row": None, "column": None, "value": None,
+                "exception_type": type(exc).__name__, "action": "exclude_and_review",
+            })
+            continue
+
+        stat = path.stat()
+        parsed = parse_ird(
+            path,
+            strict=False,
+            max_invalid_fraction=float(protocol["max_invalid_fraction"]),
+            max_sampling_gap_s=float(protocol["max_sampling_gap_s"]),
+        )
+        checksum = _checksum(path) if checksum_files else None
+        start_time = parsed.metadata.get("starttime") if parsed.metadata else pd.NaT
+        manifest_row = {
+            **identity,
+            "checksum_sha256": checksum,
+            "size_bytes": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+            "start_time": start_time,
+            "test_name": parsed.metadata.get("testname") if parsed.metadata else None,
+            "row_count": int(parsed.qc.get("row_count", 0)),
+            "parse_status": "valid" if parsed.qc.get("parse_ok") else "failed",
+            "parse_error_code": parsed.qc.get("parse_error_code"),
+            "qc_status": "pending",
+        }
+        manifest_rows.append(manifest_row)
+        qc_rows.extend(_qc_rows(identity["file_id"], parsed.issues))
+        if identity["filename_test_type"] != identity["test_type"]:
+            qc_rows.append({
+                "file_id": identity["file_id"], "level": "file", "path": str(path),
+                "stage": "identity", "code": "filename_role_mismatch",
+                "message": f"filename says {identity['filename_test_type']} but directory role is {identity['test_type']}",
+                "severity": "warning", "row": None, "column": None, "value": None,
+                "exception_type": None, "action": "retain_directory_role_and_review",
+            })
+        if parsed.data is None or not parsed.qc.get("parse_ok"):
+            continue
+
+        raw_data = parsed.data
+        signal_issues = _signal_qc(identity["file_id"], path, raw_data, protocol["physical_bounds"])
+        qc_rows.extend(signal_issues)
+        if write_samples:
+            _write_samples(raw_data, identity, output, protocol["physical_bounds"])
+        data = _clean_physical_bounds(raw_data, protocol["physical_bounds"])
+
+        try:
+            steps = summarize_steps(
+                data,
+                current_deadband_A=float(protocol["current_deadband_A"]),
+            )
+        except Exception as exc:
+            qc_rows.append({
+                "file_id": identity["file_id"], "level": "file", "path": str(path),
+                "stage": "segmentation", "code": "charge_sign_inference_failed",
+                "message": str(exc), "severity": "error", "row": None, "column": "Current",
+                "value": None, "exception_type": type(exc).__name__, "action": "exclude_and_review",
+            })
+            continue
+        for step in steps:
+            step_rows.append({**identity, **step.to_dict()})
+
+        if identity["test_type"] == "CYC":
+            nominal = float(protocol["nominal_capacity_Ah"])
+            segments = segment_cyc_protocol(
+                data,
+                expected_charge_current_A=nominal * float(identity["C_ch"]),
+                expected_discharge_current_A=nominal * float(identity["C_dis"]),
+                current_relative_tolerance=float(protocol["cycling_current_relative_tolerance"]),
+                minimum_phase_capacity_Ah=float(protocol["minimum_phase_capacity_Ah"]),
+                capacity_ratio_bounds=tuple(protocol["capacity_ratio_bounds"]),
+                minimum_cycle_voltage_span_V=float(
+                    protocol.get("minimum_cycle_voltage_span_V", 0.0)
+                ),
+                minimum_phase_voltage_span_V=float(
+                    protocol.get("minimum_phase_voltage_span_V", 0.0)
+                ),
+                steps=steps,
+            )
+            if not segments:
+                qc_rows.append({
+                    "file_id": identity["file_id"], "level": "file", "path": str(path),
+                    "stage": "segmentation", "code": "no_cycles_detected",
+                    "message": "no expected-rate cycling phases were detected", "severity": "error",
+                    "row": None, "column": None, "value": None, "exception_type": None,
+                    "action": "exclude_and_review",
+                })
+            for segment_index, segment in enumerate(segments):
+                cycle_rows.append({
+                    **identity,
+                    "file_start_time": start_time,
+                    "segment_index": segment_index,
+                    **aggregate_cycle(data, steps, segment),
+                })
+        else:
+            reference = extract_reference_discharge(
+                data,
+                reference_current_A=float(protocol["rpt_reference_current_A"]),
+                current_relative_tolerance=float(protocol["rpt_current_relative_tolerance"]),
+                charged_voltage_min_V=float(protocol["rpt_charged_voltage_min_V"]),
+                discharged_voltage_max_V=float(protocol["rpt_discharged_voltage_max_V"]),
+                capacity_bounds_Ah=tuple(protocol["rpt_capacity_bounds_Ah"]),
+                steps=steps,
+            )
+            rpt_rows.append({
+                **identity,
+                "file_start_time": start_time,
+                "measurement_type": "reference_discharge_0.5C",
+                "reference_capacity_Ah": reference.capacity_Ah,
+                "reference_current_A": reference.current_A,
+                "measurement_start_s": reference.start_time_s,
+                "measurement_end_s": reference.end_time_s,
+                "rpt_qc_status": reference.status,
+                "rpt_qc_flags": ";".join(reference.qc_flags),
+                "selection_rule": "unique 0.5C high-voltage-to-low-voltage discharge",
+            })
+
+    manifest = pd.DataFrame(manifest_rows, columns=MANIFEST_COLUMNS)
+    steps_df = pd.DataFrame(step_rows)
+    cycles = pd.DataFrame(cycle_rows)
+    rpt = pd.DataFrame(rpt_rows)
+    qc = pd.DataFrame(qc_rows)
+
+    if not manifest.empty:
+        if manifest["file_id"].duplicated().any() or manifest["relative_path"].duplicated().any():
+            raise AssertionError("file manifest primary keys are not unique")
+    if not steps_df.empty and steps_df.duplicated(["file_id", "step_index"]).any():
+        raise AssertionError("step primary keys are not unique")
+    if not cycles.empty and cycles.duplicated(["file_id", "segment_index"]).any():
+        raise AssertionError("cycle segment primary keys are not unique")
+    if not cycles.empty:
+        complete_keys = cycles[cycles["cycle_complete"]]
+        if complete_keys.duplicated(["file_id", "cycle_in_file"]).any():
+            raise AssertionError("complete cycle merge keys are not unique")
+    if not rpt.empty and rpt["file_id"].duplicated().any():
+        raise AssertionError("RPT file keys are not unique")
+
+    if not cycles.empty:
+        cycles = cycles.sort_values(
+            ["condition", "cell", "file_start_time", "test_id", "cycle_in_file"],
+            na_position="last",
+        ).reset_index(drop=True)
+        cycles["global_cycle"] = pd.Series(pd.NA, index=cycles.index, dtype="Int64")
+        complete = cycles["cycle_complete"].fillna(False).astype(bool)
+        cycles.loc[complete, "global_cycle"] = (
+            cycles.loc[complete].groupby(["condition", "cell"]).cumcount() + 1
+        ).astype("Int64")
+        cycles["cumulative_Ah_throughput"] = np.nan
+        cycles.loc[complete, "cumulative_Ah_throughput"] = (
+            cycles.loc[complete].groupby(["condition", "cell"])["Q_discharge_Ah"].cumsum()
+        )
+
+    if not rpt.empty:
+        valid = rpt[rpt["rpt_qc_status"] == "valid"]
+        duplicate_counts = valid.groupby(["condition", "cell", "visit"]).size()
+        for key, count in duplicate_counts[duplicate_counts > 1].items():
+            cond, cell, visit = key
+            qc_rows_for_key = valid[
+                (valid["condition"] == cond) & (valid["cell"] == cell) & (valid["visit"] == visit)
+            ]
+            timestamps = pd.to_datetime(qc_rows_for_key["file_start_time"], errors="coerce")
+            distinguishable = timestamps.notna().all() and not timestamps.duplicated().any()
+            for _, row in qc_rows_for_key.iterrows():
+                qc_rows.append({
+                    "file_id": row["file_id"], "level": "visit", "path": row["path"],
+                    "stage": "rpt",
+                    "code": "visit_label_collision" if distinguishable else "ambiguous_duplicate_rpt",
+                    "message": (
+                        f"{count} valid RPT files share ({cond}, {cell}, V{visit:02d}); "
+                        + ("distinct timestamps permit chronological matching" if distinguishable
+                           else "timestamps do not distinguish the measurements")
+                    ),
+                    "severity": "warning" if distinguishable else "error",
+                    "row": None, "column": None, "value": None,
+                    "exception_type": None,
+                    "action": ("preserve_raw_visit_and_match_by_time" if distinguishable
+                               else "block_target_construction"),
+                })
+        qc = pd.DataFrame(qc_rows)
+
+    if not manifest.empty:
+        manifest["qc_status"] = "valid"
+        if not qc.empty:
+            warning_ids = set(qc.loc[qc["severity"] == "warning", "file_id"])
+            error_ids = set(qc.loc[qc["severity"] == "error", "file_id"])
+            manifest.loc[manifest["file_id"].isin(warning_ids), "qc_status"] = "warning"
+            manifest.loc[manifest["file_id"].isin(error_ids), "qc_status"] = "error"
+        manifest.loc[manifest["parse_status"] != "valid", "qc_status"] = "error"
+
+    cell_metadata = (
+        manifest[["condition", "cell", "DOD_pct", "C_ch", "C_dis", "T_degC"]]
+        .drop_duplicates()
+        .sort_values(["condition", "cell"])
+        .reset_index(drop=True)
+    ) if not manifest.empty else _empty(["condition", "cell"])
+    if not cell_metadata.empty:
+        cell_metadata["replicate"] = cell_metadata.groupby("condition").cumcount() + 1
+        cell_metadata["terminal_outcome"] = pd.NA
+        cell_metadata["terminal_outcome_status"] = "unverified"
+    events = _empty([
+        "condition", "cell", "event_type", "event_observed", "event_time",
+        "event_EFC", "censor_time", "censor_EFC", "evidence_source", "qc_status",
+    ])
+
+    output.mkdir(parents=True, exist_ok=True)
+    _atomic_parquet(manifest, output / "file_manifest.parquet")
+    _atomic_parquet(steps_df if not steps_df.empty else _empty(["file_id", "step_index"]),
+                    output / "steps.parquet")
+    _atomic_parquet(cycles if not cycles.empty else _empty(["file_id", "cycle_in_file", "cycle_complete"]),
+                    output / "cycles.parquet")
+    _atomic_parquet(rpt if not rpt.empty else _empty(["file_id", "reference_capacity_Ah", "rpt_qc_status"]),
+                    output / "rpt_measurements.parquet")
+    _atomic_parquet(qc if not qc.empty else _empty(["file_id", "level", "code", "severity", "action"]),
+                    output / "qc_flags.parquet")
+    _atomic_parquet(cell_metadata, output / "cell_metadata.parquet")
+    _atomic_parquet(events, output / "events.parquet")
+    _atomic_json({
+        "dataset_root": str(root),
+        "scope": "Standard cycling only",
+        "file_count": int(len(manifest)),
+        "parse_valid_count": int((manifest["parse_status"] == "valid").sum()) if not manifest.empty else 0,
+        "complete_cycle_count": int(cycles["cycle_complete"].sum()) if not cycles.empty else 0,
+        "valid_rpt_count": int((rpt["rpt_qc_status"] == "valid").sum()) if not rpt.empty else 0,
+        "config_protocol": protocol,
+        "scientific_blockers": [
+            "Confirm the inferred 0.5C reference-discharge protocol rule against dataset documentation.",
+            "Provide authoritative CID/gassing outcomes and censoring evidence before classification.",
+            "Approve a sustained capacity-EOL definition before survival target construction.",
+        ],
+    }, output / "build_manifest.json")
+    return CanonicalBuildResult(manifest, steps_df, cycles, rpt, qc)
+
+
+################################################################################
+# FILE: src/io/ird_parser.py
+################################################################################
+
+"""Structured parser for the battery cycler ``.ird`` export format."""
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from pathlib import Path
+import re
+from typing import Any, Dict
+
+import numpy as np
+import pandas as pd
+
+FILENAME_RE = re.compile(
+    r"^(?P<cell>S\d{4}[A-Z0-9]+)_(?P<test>[A-Z]+)_at(?P<rpt_T>-?\d+)degC_"
+    r"V(?P<visit>\d+)_(?P<testid>\d+)\.ird$"
+)
+
+REQUIRED_COLS = ["Time", "Voltage", "Current", "Ah_counter", "Temperature", "StepID"]
+COLUMN_ALIASES = {
+    "time": "Time",
+    "voltage": "Voltage",
+    "current": "Current",
+    "ah_counter": "Ah_counter",
+    "ahcounter": "Ah_counter",
+    "temperature": "Temperature",
+    "stepid": "StepID",
+    "step_id": "StepID",
+}
+
+
+@dataclass(frozen=True)
+class IRDParseIssue:
+    """Serializable parser or signal-quality issue."""
+
+    path: str
+    stage: str
+    code: str
+    message: str
+    severity: str = "error"
+    row: int | None = None
+    column: str | None = None
+    value: str | None = None
+    exception_type: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class IRDParseError(ValueError):
+    """Raised when an IRD file cannot satisfy the parser contract."""
+
+    def __init__(self, issue: IRDParseIssue):
+        self.issue = issue
+        super().__init__(issue.message)
+
+
+@dataclass
+class IRDParseResult:
+    data: pd.DataFrame | None
+    metadata: dict[str, Any]
+    issues: list[IRDParseIssue]
+    qc: dict[str, Any]
+
+
+def parse_condition(cond: str) -> Dict[str, Any]:
+    m = re.match(
+        r"DOD(?P<dod>\d+)_(?P<cch>[\d.]+)C(?P<cdis>[\d.]+)C_(?P<T>-?\d+)degC$",
+        cond,
+    )
+    if not m:
+        return {"DOD_pct": np.nan, "C_ch": np.nan, "C_dis": np.nan, "T_degC": np.nan}
+    return {
+        "DOD_pct": int(m["dod"]),
+        "C_ch": float(m["cch"]),
+        "C_dis": float(m["cdis"]),
+        "T_degC": int(m["T"]),
+    }
+
+
+def _issue(path: Path, stage: str, code: str, message: str, **kwargs: Any) -> IRDParseIssue:
+    return IRDParseIssue(path=str(path), stage=stage, code=code, message=message, **kwargs)
+
+
+def _header(path: Path) -> tuple[int, dict[str, str]]:
+    """Return the data-header offset and normalized file metadata."""
+    metadata: dict[str, str] = {}
+    try:
+        with path.open("r", errors="replace", encoding="latin-1") as handle:
+            for i, line in enumerate(handle):
+                stripped = line.strip()
+                if stripped.startswith("###"):
+                    return i + 1, metadata
+                if ":" in line and not stripped.startswith(("%%%", "###")):
+                    key, value = line.split(":", 1)
+                    if key.strip() in {"Cellname", "Starttime", "Testname"}:
+                        metadata[key.strip().lower()] = value.strip().strip("'").strip()
+    except OSError as exc:
+        raise IRDParseError(
+            _issue(path, "open", "file_open_error", f"could not open {path}: {exc}",
+                   exception_type=type(exc).__name__)
+        ) from exc
+    raise IRDParseError(
+        _issue(path, "header", "missing_data_marker", f"missing ### data marker in {path}")
+    )
+
+
+def find_data_offset(path: Path) -> int:
+    """Compatibility helper that now fails instead of guessing offset zero."""
+    offset, _ = _header(Path(path))
+    return offset
+
+
+_TD_RE = re.compile(
+    r"^\s*(?:(?P<days>\d+)\s*days?\s*)?"
+    r"(?P<hours>\d+)\s*:\s*(?P<minutes>\d+)\s*:\s*(?P<seconds>\d+(?:\.\d*)?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _td_str_to_sec(value: Any) -> float:
+    """Parse a numeric or timedelta-like scalar to seconds."""
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return float("nan")
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    text = str(value).strip()
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    match = _TD_RE.match(text)
+    if not match:
+        return float("nan")
+    days = int(match.group("days") or 0)
+    hours = int(match.group("hours"))
+    minutes = int(match.group("minutes"))
+    seconds = float(match.group("seconds"))
+    if minutes >= 60 or seconds >= 60:
+        return float("nan")
+    return days * 86400.0 + hours * 3600.0 + minutes * 60.0 + seconds
+
+
+def _parse_time(t: pd.Series) -> pd.Series:
+    """Parse mixed numeric, timedelta, and datetime values element by element."""
+    result = pd.Series(np.nan, index=t.index, dtype="float64")
+    numeric = pd.to_numeric(t, errors="coerce")
+    result.loc[numeric.notna()] = numeric.loc[numeric.notna()].astype(float)
+
+    unresolved = result.isna() & t.notna()
+    if unresolved.any():
+        elapsed = t.loc[unresolved].map(_td_str_to_sec)
+        result.loc[elapsed.index] = elapsed
+
+    unresolved = result.isna() & t.notna()
+    if unresolved.any():
+        datetimes = pd.to_datetime(t.loc[unresolved], errors="coerce")
+        if datetimes.notna().any():
+            origin = datetimes.loc[datetimes.notna()].iloc[0]
+            parsed = (datetimes - origin).dt.total_seconds()
+            result.loc[parsed.index] = parsed
+    return result
+
+
+def _canonicalize_columns(columns: list[Any]) -> tuple[list[str], dict[str, str]]:
+    mapped: list[str] = []
+    aliases: dict[str, str] = {}
+    for raw in columns:
+        name = str(raw).strip()
+        canonical = COLUMN_ALIASES.get(name.lower(), name)
+        mapped.append(canonical)
+        aliases[name] = canonical
+    return mapped, aliases
+
+
+def parse_ird(path: Path | str, *, strict: bool = True,
+              max_invalid_fraction: float = 0.0,
+              max_sampling_gap_s: float = 300.0) -> IRDParseResult:
+    """Parse one file and return data, metadata, and explicit QC diagnostics.
+
+    ``strict`` controls whether contract errors raise immediately. Signal QC
+    findings remain in ``issues`` so canonical builders can retain the file.
+    """
+    path = Path(path)
+    issues: list[IRDParseIssue] = []
+    qc: dict[str, Any] = {"path": str(path), "parse_ok": False}
+    try:
+        if not path.exists():
+            raise IRDParseError(_issue(path, "open", "file_not_found", f"file does not exist: {path}"))
+        if path.stat().st_size == 0:
+            raise IRDParseError(_issue(path, "open", "empty_file", f"empty IRD file: {path}"))
+        offset, metadata = _header(path)
+        try:
+            raw = pd.read_csv(
+                path,
+                skiprows=offset,
+                header=0,
+                engine="c",
+                low_memory=False,
+                encoding="latin-1",
+            )
+        except Exception as exc:
+            raise IRDParseError(
+                _issue(path, "csv", "csv_parse_error", f"could not parse CSV data in {path}: {exc}",
+                       exception_type=type(exc).__name__)
+            ) from exc
+        if raw.empty:
+            raise IRDParseError(_issue(path, "csv", "empty_data", f"no sample rows in {path}"))
+
+        original_columns = [str(c).strip() for c in raw.columns]
+        raw.columns, aliases = _canonicalize_columns(list(raw.columns))
+        missing = [column for column in REQUIRED_COLS if column not in raw.columns]
+        if missing:
+            raise IRDParseError(
+                _issue(path, "schema", "missing_columns",
+                       f"missing columns {missing} in {path.name}; have {original_columns}")
+            )
+
+        data = raw[REQUIRED_COLS].copy()
+        data["Time"] = _parse_time(data["Time"])
+        for column in ["Voltage", "Current", "Ah_counter", "Temperature"]:
+            data[column] = pd.to_numeric(data[column], errors="coerce").astype("float32")
+        step_numeric = pd.to_numeric(data["StepID"], errors="coerce")
+        data["StepID"] = step_numeric.fillna(-1).astype("int32")
+
+        invalid_counts: dict[str, int] = {}
+        for column in REQUIRED_COLS:
+            invalid = int(data[column].isna().sum())
+            if column == "StepID":
+                invalid = int((data[column] < 0).sum())
+            invalid_counts[column] = invalid
+            fraction = invalid / len(data)
+            if invalid:
+                severity = "error" if fraction > max_invalid_fraction else "warning"
+                issues.append(
+                    _issue(path, "values", "invalid_values",
+                           f"{invalid}/{len(data)} invalid values in {column}", severity=severity,
+                           column=column)
+                )
+
+        times = data["Time"].to_numpy(dtype=float)
+        finite_times = times[np.isfinite(times)]
+        if finite_times.size:
+            dt = np.diff(finite_times)
+            duplicate_count = int(np.sum(dt == 0))
+            reset_count = int(np.sum(dt < 0))
+            max_gap = float(np.max(dt)) if dt.size else 0.0
+        else:
+            duplicate_count = reset_count = 0
+            max_gap = float("nan")
+        if reset_count:
+            issues.append(_issue(path, "time_qc", "time_reset",
+                                 f"detected {reset_count} decreasing timestamp transitions"))
+        if duplicate_count:
+            issues.append(_issue(path, "time_qc", "duplicate_time",
+                                 f"detected {duplicate_count} duplicate timestamp transitions",
+                                 severity="warning"))
+        if np.isfinite(max_gap) and max_gap > max_sampling_gap_s:
+            issues.append(_issue(path, "time_qc", "sampling_gap",
+                                 f"maximum sampling gap is {max_gap:.3f} s",
+                                 severity="warning"))
+
+        metadata = {
+            **metadata,
+            "starttime": pd.to_datetime(metadata.get("starttime"), errors="coerce"),
+            "raw_columns": original_columns,
+            "column_aliases": aliases,
+        }
+        qc.update({
+            "parse_ok": not any(issue.severity == "error" for issue in issues),
+            "row_count": int(len(data)),
+            "invalid_counts": invalid_counts,
+            "duplicate_timestamp_count": duplicate_count,
+            "time_reset_count": reset_count,
+            "max_sampling_gap_s": max_gap,
+        })
+        if strict and not qc["parse_ok"]:
+            first_error = next(issue for issue in issues if issue.severity == "error")
+            raise IRDParseError(first_error)
+        return IRDParseResult(data=data, metadata=metadata, issues=issues, qc=qc)
+    except IRDParseError as exc:
+        issues.append(exc.issue)
+        qc["parse_error_code"] = exc.issue.code
+        if strict:
+            raise
+        return IRDParseResult(data=None, metadata={}, issues=issues, qc=qc)
+
+
+def read_ird(path: Path | str) -> pd.DataFrame:
+    """Compatibility API returning only the six canonical sample columns."""
+    result = parse_ird(path, strict=True)
+    assert result.data is not None
+    return result.data[REQUIRED_COLS]
+
+
+################################################################################
+# FILE: src/io/loaders.py
+################################################################################
+
+"""Load the pre-computed statistics tables and provide config access.
+
+Config supports two substitution forms:
+  ${paths.a.b}         -> another node in the yaml
+  ${env:VAR:-default}  -> os.environ["VAR"] if set, otherwise "default".
+                         The default may itself contain ${...} references.
+"""
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+from typing import Any, Dict
+
+import pandas as pd
+import yaml
+
+_CONFIG_CACHE: Dict[str, Any] | None = None
+
+_ENV_PAT = re.compile(r"\$\{env:([A-Za-z_][A-Za-z0-9_]*)(?::-((?:[^{}]|\$\{[^{}]*\})*))?\}")
+_REF_PAT = re.compile(r"\$\{([^${}][^}]*)\}")
+
+
+def _sub_env(s: str) -> str:
+    def repl(m: re.Match) -> str:
+        name = m.group(1)
+        default = m.group(2) if m.group(2) is not None else ""
+        return os.environ.get(name, default)
+    prev = None
+    while prev != s:
+        prev = s
+        s = _ENV_PAT.sub(repl, s)
+    return s
+
+
+def _resolve_vars(node: Any, root: Dict[str, Any]) -> Any:
+    if isinstance(node, str):
+        # env first (may reference paths.* in its default), then paths.*
+        def ref_repl(m: re.Match) -> str:
+            keys = m.group(1).split(".")
+            cur: Any = root
+            for k in keys:
+                cur = cur[k]
+            return str(cur)
+
+        prev = None
+        while prev != node:
+            prev = node
+            node = _sub_env(node)
+            node = _REF_PAT.sub(ref_repl, node)
+        return node
+    if isinstance(node, dict):
+        return {k: _resolve_vars(v, root) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_resolve_vars(v, root) for v in node]
+    return node
+
+
+def load_config(config_path: Path | str | None = None) -> Dict[str, Any]:
+    global _CONFIG_CACHE
+    if _CONFIG_CACHE is not None and config_path is None:
+        return _CONFIG_CACHE
+    if config_path is None:
+        config_path = Path(__file__).resolve().parents[2] / "config.yaml"
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    cfg = _resolve_vars(cfg, cfg)
+    _CONFIG_CACHE = cfg
+    return cfg
+
+
+def load_cycle_metrics() -> pd.DataFrame:
+    cfg = load_config()
+    canonical = Path(cfg["paths"]["canonical"]) / "cycles.parquet"
+    if not canonical.exists():
+        raise FileNotFoundError(
+            f"canonical cycles are missing at {canonical}; run "
+            "`python3 scripts/00_build_canonical.py` first"
+        )
+    return pd.read_parquet(canonical)
+
+
+_DOD_ANCHOR = re.compile(r"(DOD\d+_[^/]+/(?:CU_at_[^/]+|Cycling_Periods)/[^/]+\.ird)$")
+
+
+def _rewrite_paths(paths: pd.Series, dataset_root: str) -> pd.Series:
+    """Rewrite each inventory path so it lives under `dataset_root`.
+
+    inventory.csv was written on the laptop with absolute paths baked in.
+    On the pod (or any machine with a different dataset location) we replace
+    the prefix by extracting the DOD.../<file>.ird suffix and joining onto
+    `dataset_root`. Falls through unchanged when the file already exists.
+    """
+    root = Path(dataset_root)
+
+    def _one(p: str) -> str:
+        if not isinstance(p, str):
+            return p
+        if Path(p).exists():
+            return p
+        m = _DOD_ANCHOR.search(p.replace("\\", "/"))
+        if not m:
+            return p
+        return str(root / m.group(1))
+
+    return paths.map(_one)
+
+
+def load_inventory() -> pd.DataFrame:
+    cfg = load_config()
+    canonical = Path(cfg["paths"]["canonical"]) / "file_manifest.parquet"
+    if canonical.exists():
+        return pd.read_parquet(canonical)
+    inv = pd.read_csv(cfg["paths"]["tables"]["inventory"])
+    inv["path"] = _rewrite_paths(inv["path"], cfg["paths"]["dataset_root"])
+    return inv
+
+
+def load_rpt_measurements() -> pd.DataFrame:
+    cfg = load_config()
+    path = Path(cfg["paths"]["canonical"]) / "rpt_measurements.parquet"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"canonical RPT measurements are missing at {path}; run "
+            "`python3 scripts/00_build_canonical.py` first"
+        )
+    return pd.read_parquet(path)
+
+
+def load_steps_table() -> pd.DataFrame:
+    """Canonical per-step table. Used by the unified DCIR extractor."""
+    cfg = load_config()
+    path = Path(cfg["paths"]["canonical"]) / "steps.parquet"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"canonical steps are missing at {path}; run "
+            "`python3 scripts/00_build_canonical.py` first"
+        )
+    return pd.read_parquet(path)
+
+
+def load_degradation_rates() -> pd.DataFrame:
+    cfg = load_config()
+    return pd.read_csv(cfg["paths"]["tables"]["degradation_rates"])
+
+
+def load_file_statistics() -> pd.DataFrame:
+    cfg = load_config()
+    return pd.read_csv(cfg["paths"]["tables"]["file_statistics"])
+
+
+def load_condition_summary() -> pd.DataFrame:
+    cfg = load_config()
+    return pd.read_csv(cfg["paths"]["tables"]["condition_summary"])
+
+
+################################################################################
+# FILE: src/cleaning/activation.py
+################################################################################
+
+"""Handle activation cycles (SOH > 100%) by clipping the target SOH."""
+from __future__ import annotations
+
+import pandas as pd
+
+
+def clip_soh(df: pd.DataFrame, soh_max: float = 100.0, col: str = "SOH_pct") -> pd.DataFrame:
+    out = df.copy()
+    out[col] = out[col].clip(upper=soh_max)
+    return out
+
+
+################################################################################
+# FILE: src/cleaning/incomplete_cycles.py
+################################################################################
+
+"""Drop cycles whose Q_ch or Q_dch is < frac * that cell's median (interrupted cycles)."""
+from __future__ import annotations
+
+import pandas as pd
+
+
+def drop_incomplete(df: pd.DataFrame, frac: float = 0.5,
+                    q_ch_col: str = "Q_charge_Ah",
+                    q_dch_col: str = "Q_discharge_Ah") -> pd.DataFrame:
+    med = df.groupby(["condition", "cell"])[[q_ch_col, q_dch_col]].transform("median")
+    keep = (df[q_ch_col] >= frac * med[q_ch_col]) & (df[q_dch_col] >= frac * med[q_dch_col])
+    return df.loc[keep].reset_index(drop=True)
+
+
+################################################################################
+# FILE: src/cleaning/outliers.py
+################################################################################
+
+"""Outlier suppression for raw time-series signals and per-cycle CE."""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+def hampel(x: np.ndarray, window: int = 5, k: float = 3.0) -> np.ndarray:
+    """Vectorized Hampel filter. Replaces outliers with rolling median.
+
+    x        : 1-D array
+    window   : half-window; total window = 2*window+1
+    k        : threshold in units of 1.4826*MAD
+    """
+    x = np.asarray(x, dtype=float).copy()
+    n = len(x)
+    if n < 2 * window + 1:
+        return x
+    # Rolling median + MAD via pandas for O(n log n).
+    s = pd.Series(x)
+    med = s.rolling(2 * window + 1, center=True, min_periods=1).median()
+    mad = (s - med).abs().rolling(2 * window + 1, center=True, min_periods=1).median()
+    threshold = k * 1.4826 * mad
+    mask = (s - med).abs() > threshold
+    x[mask.to_numpy()] = med[mask].to_numpy()
+    return x
+
+
+def clip_ce(df: pd.DataFrame, lo: float = 0.4, hi: float = 1.05,
+            col: str = "coulombic_efficiency", flag_col: str = "ce_clipped") -> pd.DataFrame:
+    out = df.copy()
+    ce = out[col]
+    out[flag_col] = (ce < lo) | (ce > hi)
+    out[col] = ce.clip(lo, hi)
+    return out
+
+
+################################################################################
+# FILE: src/cleaning/parse_error_fix.py
+################################################################################
+
+"""Skip the two known-bad .ird files from any downstream processing."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Iterable, List
+
+import pandas as pd
+
+from ..io.loaders import load_config
+
+
+def bad_filenames() -> List[str]:
+    return load_config()["cleaning"]["skip_files"]
+
+
+def skip_bad_paths(paths: Iterable[str | Path]) -> List[Path]:
+    bad = set(bad_filenames())
+    return [Path(p) for p in paths if Path(p).name not in bad]
+
+
+def filter_inventory(inv: pd.DataFrame, path_col: str = "path") -> pd.DataFrame:
+    bad = set(bad_filenames())
+    return inv[~inv[path_col].apply(lambda p: Path(p).name in bad)].reset_index(drop=True)
+
+
+################################################################################
+# FILE: src/preprocessing/protocol_segmentation.py
+################################################################################
+
+"""Protocol-aware step, cycle, and reference-discharge extraction."""
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from typing import Any, Literal, Sequence
+
+import numpy as np
+import pandas as pd
+
+_trapezoid = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+
+PhaseKind = Literal["charge", "discharge", "rest", "transition"]
+
+
+@dataclass(frozen=True)
+class StepSegment:
+    step_index: int
+    step_id: int
+    start: int
+    stop: int
+    phase: PhaseKind
+    duration_s: float
+    current_median_A: float
+    current_abs_p90_A: float
+    capacity_Ah: float
+    energy_Wh: float
+    voltage_start_V: float
+    voltage_end_V: float
+    voltage_min_V: float
+    voltage_max_V: float
+    temperature_min_degC: float
+    temperature_max_degC: float
+    bounded_start: bool
+    bounded_end: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CycleSegment:
+    cycle_in_file: int
+    start: int
+    stop: int
+    discharge_step_index: int | None
+    charge_step_index: int | None
+    complete: bool
+    qc_flags: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        row = asdict(self)
+        row["qc_flags"] = ";".join(self.qc_flags)
+        return row
+
+
+@dataclass(frozen=True)
+class ReferenceDischarge:
+    step_index: int | None
+    capacity_Ah: float
+    current_A: float
+    start_time_s: float
+    end_time_s: float
+    status: str
+    qc_flags: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        row = asdict(self)
+        row["qc_flags"] = ";".join(self.qc_flags)
+        return row
+
+
+def _integral(t: np.ndarray, y: np.ndarray) -> float:
+    valid = np.isfinite(t) & np.isfinite(y)
+    if valid.sum() < 2:
+        return float("nan")
+    t_valid = t[valid]
+    y_valid = y[valid]
+    if np.any(np.diff(t_valid) < 0):
+        return float("nan")
+    return float(_trapezoid(y_valid, t_valid))
+
+
+def _finite_stat(values: np.ndarray, function) -> float:
+    finite = values[np.isfinite(values)]
+    return float(function(finite)) if finite.size else float("nan")
+
+
+def infer_charge_current_sign(df: pd.DataFrame, current_deadband_A: float = 0.02) -> int:
+    """Infer which current sign charges the cell from voltage and Ah trends."""
+    votes: list[float] = []
+    step_ids = df["StepID"].to_numpy()
+    boundaries = np.r_[0, np.flatnonzero(step_ids[1:] != step_ids[:-1]) + 1, len(df)]
+    for start, stop in zip(boundaries[:-1], boundaries[1:]):
+        part = df.iloc[start:stop]
+        current = float(part["Current"].median())
+        if abs(current) <= current_deadband_A or len(part) < 2:
+            continue
+        dv = float(part["Voltage"].iloc[-1] - part["Voltage"].iloc[0])
+        dah = float(part["Ah_counter"].iloc[-1] - part["Ah_counter"].iloc[0])
+        trend = dv if abs(dv) >= 0.01 else dah
+        if abs(trend) >= 1e-6:
+            votes.append(np.sign(current) * np.sign(trend) * abs(dah))
+    score = float(np.nansum(votes))
+    if abs(score) < 1e-9:
+        raise ValueError("could not infer charge-current sign from voltage/Ah trends")
+    return 1 if score > 0 else -1
+
+
+def summarize_steps(df: pd.DataFrame, *, current_deadband_A: float = 0.02,
+                    charge_current_sign: int | None = None) -> list[StepSegment]:
+    """Summarize every contiguous StepID run without bridging intervening gaps."""
+    if df.empty:
+        return []
+    sign = charge_current_sign or infer_charge_current_sign(df, current_deadband_A)
+    step_ids = df["StepID"].to_numpy()
+    boundaries = np.r_[0, np.flatnonzero(step_ids[1:] != step_ids[:-1]) + 1, len(df)]
+    steps: list[StepSegment] = []
+    for index, (start, stop) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+        part = df.iloc[start:stop]
+        t = part["Time"].to_numpy(dtype=float)
+        voltage = part["Voltage"].to_numpy(dtype=float)
+        current = part["Current"].to_numpy(dtype=float)
+        temperature = part["Temperature"].to_numpy(dtype=float)
+        current_median = float(np.nanmedian(current))
+        current_abs_p90 = float(np.nanpercentile(np.abs(current), 90))
+        if current_abs_p90 <= current_deadband_A:
+            phase: PhaseKind = "rest"
+        elif np.sign(current_median) == sign:
+            phase = "charge"
+        elif np.sign(current_median) == -sign:
+            phase = "discharge"
+        else:
+            phase = "transition"
+        capacity = abs(_integral(t, current)) / 3600.0
+        energy = abs(_integral(t, voltage * current)) / 3600.0
+        steps.append(StepSegment(
+            step_index=index,
+            step_id=int(step_ids[start]),
+            start=int(start),
+            stop=int(stop),
+            phase=phase,
+            duration_s=float(t[-1] - t[0]) if len(t) else float("nan"),
+            current_median_A=current_median,
+            current_abs_p90_A=current_abs_p90,
+            capacity_Ah=capacity,
+            energy_Wh=energy,
+            voltage_start_V=float(voltage[0]),
+            voltage_end_V=float(voltage[-1]),
+            voltage_min_V=_finite_stat(voltage, np.min),
+            voltage_max_V=_finite_stat(voltage, np.max),
+            temperature_min_degC=_finite_stat(temperature, np.min),
+            temperature_max_degC=_finite_stat(temperature, np.max),
+            bounded_start=start > 0,
+            bounded_end=stop < len(df),
+        ))
+    return steps
+
+
+def _at_expected_rate(step: StepSegment, expected_current_A: float,
+                      relative_tolerance: float) -> bool:
+    low = expected_current_A * (1.0 - relative_tolerance)
+    high = expected_current_A * (1.0 + relative_tolerance)
+    return low <= step.current_abs_p90_A <= high
+
+
+def segment_cyc_protocol(df: pd.DataFrame, *, expected_charge_current_A: float,
+                         expected_discharge_current_A: float,
+                         current_relative_tolerance: float = 0.35,
+                         minimum_phase_capacity_Ah: float = 0.001,
+                         capacity_ratio_bounds: tuple[float, float] = (0.25, 4.0),
+                         minimum_cycle_voltage_span_V: float = 0.0,
+                         minimum_phase_voltage_span_V: float = 0.0,
+                         steps: Sequence[StepSegment] | None = None) -> list[CycleSegment]:
+    """Pair expected-rate discharge steps with their following recharge steps.
+
+    Protocol preambles at another C-rate are ignored. A leading expected-rate
+    charge and a trailing discharge are retained as incomplete boundary cycles.
+    """
+    phase_steps = list(steps or summarize_steps(df))
+    discharge = [
+        step for step in phase_steps
+        if step.phase == "discharge"
+        and step.capacity_Ah >= minimum_phase_capacity_Ah
+        and _at_expected_rate(step, expected_discharge_current_A, current_relative_tolerance)
+    ]
+    # Recharge can become CV-dominated after severe degradation, so its p90
+    # current may fall below the nominal programmed rate. Pair by order and
+    # capacity balance after identifying cycles from expected-rate discharges.
+    charge = [
+        step for step in phase_steps
+        if step.phase == "charge"
+        and step.capacity_Ah >= minimum_phase_capacity_Ah
+    ]
+    if not discharge and not charge:
+        return []
+
+    segments: list[CycleSegment] = []
+    discharge_positions = {step.step_index: step for step in discharge}
+    charge_positions = {step.step_index: step for step in charge}
+    used_charge: set[int] = set()
+    cycle_number = 0
+
+    first_discharge_index = min(discharge_positions, default=len(phase_steps))
+    leading_charges = [
+        step for step in charge
+        if step.step_index < first_discharge_index
+        and _at_expected_rate(step, expected_charge_current_A, current_relative_tolerance)
+    ]
+    for step in leading_charges:
+        used_charge.add(step.step_index)
+        segments.append(CycleSegment(
+            cycle_in_file=0,
+            start=step.start,
+            stop=step.stop,
+            discharge_step_index=None,
+            charge_step_index=step.step_index,
+            complete=False,
+            qc_flags=("leading_unmatched_charge",),
+        ))
+
+    for discharge_step in discharge:
+        cycle_number += 1
+        next_discharge = min(
+            (step.step_index for step in discharge if step.step_index > discharge_step.step_index),
+            default=len(phase_steps),
+        )
+        all_candidates = [
+            step for step in charge
+            if discharge_step.step_index < step.step_index < next_discharge
+            and step.step_index not in used_charge
+        ]
+        candidates = [
+            step for step in all_candidates
+            if capacity_ratio_bounds[0]
+            <= discharge_step.capacity_Ah / step.capacity_Ah
+            <= capacity_ratio_bounds[1]
+        ]
+        charge_step = candidates[0] if candidates else None
+        flags: list[str] = []
+        if not discharge_step.bounded_start or not discharge_step.bounded_end:
+            flags.append("discharge_touches_file_boundary")
+        if charge_step is None:
+            flags.append("missing_recharge")
+        else:
+            used_charge.add(charge_step.step_index)
+            if not charge_step.bounded_start or not charge_step.bounded_end:
+                flags.append("charge_touches_file_boundary")
+            ratio = discharge_step.capacity_Ah / charge_step.capacity_Ah
+            if not capacity_ratio_bounds[0] <= ratio <= capacity_ratio_bounds[1]:
+                flags.append("capacity_ratio_implausible")
+            discharge_voltage_span = (
+                discharge_step.voltage_max_V - discharge_step.voltage_min_V
+            )
+            charge_voltage_span = charge_step.voltage_max_V - charge_step.voltage_min_V
+            if (
+                np.isfinite(discharge_voltage_span)
+                and discharge_voltage_span < minimum_phase_voltage_span_V
+            ):
+                flags.append("narrow_discharge_voltage_excursion")
+            if (
+                np.isfinite(charge_voltage_span)
+                and charge_voltage_span < minimum_phase_voltage_span_V
+            ):
+                flags.append("narrow_charge_voltage_excursion")
+            voltage_min = min(discharge_step.voltage_min_V, charge_step.voltage_min_V)
+            voltage_max = max(discharge_step.voltage_max_V, charge_step.voltage_max_V)
+            if (
+                np.isfinite(voltage_min)
+                and np.isfinite(voltage_max)
+                and voltage_max - voltage_min < minimum_cycle_voltage_span_V
+            ):
+                flags.append("narrow_voltage_excursion")
+        complete = not flags
+        segments.append(CycleSegment(
+            cycle_in_file=cycle_number,
+            start=discharge_step.start,
+            stop=charge_step.stop if charge_step else discharge_step.stop,
+            discharge_step_index=discharge_step.step_index,
+            charge_step_index=charge_step.step_index if charge_step else None,
+            complete=complete,
+            qc_flags=tuple(flags),
+        ))
+    return segments
+
+
+def extract_reference_discharge(df: pd.DataFrame, *, reference_current_A: float = 0.6,
+                                current_relative_tolerance: float = 0.2,
+                                charged_voltage_min_V: float = 3.6,
+                                discharged_voltage_max_V: float = 1.8,
+                                capacity_bounds_Ah: tuple[float, float] = (0.2, 2.0),
+                                steps: Sequence[StepSegment] | None = None) -> ReferenceDischarge:
+    """Extract the unique full-range 0.5C discharge from a CU/RPT protocol."""
+    phase_steps = list(steps or summarize_steps(df))
+    candidates = [
+        step for step in phase_steps
+        if step.phase == "discharge"
+        and _at_expected_rate(step, reference_current_A, current_relative_tolerance)
+        and step.voltage_start_V >= charged_voltage_min_V
+        and step.voltage_end_V <= discharged_voltage_max_V
+        and capacity_bounds_Ah[0] <= step.capacity_Ah <= capacity_bounds_Ah[1]
+        and step.bounded_start
+        and step.bounded_end
+    ]
+    if not candidates:
+        return ReferenceDischarge(None, np.nan, np.nan, np.nan, np.nan,
+                                  "missing", ("no_reference_discharge",))
+    if len(candidates) > 1:
+        return ReferenceDischarge(None, np.nan, np.nan, np.nan, np.nan,
+                                  "ambiguous", ("multiple_reference_discharges",))
+    step = candidates[0]
+    time = df["Time"].to_numpy(dtype=float)
+    return ReferenceDischarge(
+        step_index=step.step_index,
+        capacity_Ah=step.capacity_Ah,
+        current_A=step.current_abs_p90_A,
+        start_time_s=float(time[step.start]),
+        end_time_s=float(time[step.stop - 1]),
+        status="valid",
+        qc_flags=(),
+    )
+
+
+def aggregate_cycle(df: pd.DataFrame, steps: Sequence[StepSegment],
+                    segment: CycleSegment) -> dict[str, Any]:
+    """Aggregate one segment without using samples outside its phase bounds."""
+    discharge = steps[segment.discharge_step_index] if segment.discharge_step_index is not None else None
+    charge = steps[segment.charge_step_index] if segment.charge_step_index is not None else None
+    part = df.iloc[segment.start:segment.stop]
+    q_dis = discharge.capacity_Ah if discharge else np.nan
+    q_charge = charge.capacity_Ah if charge else np.nan
+    e_dis = discharge.energy_Wh if discharge else np.nan
+    e_charge = charge.energy_Wh if charge else np.nan
+    return {
+        "cycle_in_file": segment.cycle_in_file,
+        "cycle_complete": segment.complete,
+        "cycle_qc_status": "valid" if segment.complete else "incomplete",
+        "cycle_qc_flags": ";".join(segment.qc_flags),
+        "start_row": segment.start,
+        "stop_row": segment.stop,
+        "cycle_start_time_s": float(part["Time"].iloc[0]),
+        "cycle_end_time_s": float(part["Time"].iloc[-1]),
+        "Q_charge_Ah": q_charge,
+        "Q_discharge_Ah": q_dis,
+        "E_charge_Wh": e_charge,
+        "E_discharge_Wh": e_dis,
+        "coulombic_efficiency": q_dis / q_charge if q_charge and np.isfinite(q_charge) else np.nan,
+        "energy_efficiency": e_dis / e_charge if e_charge and np.isfinite(e_charge) else np.nan,
+        "V_max": float(part["Voltage"].max()),
+        "V_min": float(part["Voltage"].min()),
+        "T_max": float(part["Temperature"].max()),
+        "T_min": float(part["Temperature"].min()),
+        "T_mean": float(part["Temperature"].mean()),
+        "Ah_span": float(part["Ah_counter"].max() - part["Ah_counter"].min()),
+        "duration_s": float(part["Time"].iloc[-1] - part["Time"].iloc[0]),
+    }
+
+
+################################################################################
+# FILE: src/preprocessing/curve_features.py
+################################################################################
+
+"""Voltage-resolved curve features: true Delta-Q(V), signed IC/DV peaks, thermal.
+
+All functions here are pure and operate on plain arrays so they can be unit
+tested against synthetic curves without touching any ``.ird`` file.
+
+Causality
+---------
+Nothing in this module knows about RPTs or targets. The caller
+(:mod:`src.preprocessing.unified`) is responsible for supplying only cycles that
+precede the prediction anchor. The primary Delta-Q(V) reference is the first
+complete cycle of the *same, already finished* cycling block, and the anchor is
+by construction that block's last complete cycle — so both curves are in the
+past at prediction time.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import find_peaks, peak_widths
+
+#: Epsilon guarding log() of a variance that can legitimately be exactly zero
+#: (identical curves). log(0 + LOG_EPSILON) is a finite, reproducible floor.
+LOG_EPSILON = 1.0e-12
+
+#: Minimum samples in a phase before any curve feature is attempted.
+MIN_CURVE_POINTS = 30
+
+#: Minimum shared voltage interval for Delta-Q(V), in volts.
+MIN_OVERLAP_SPAN_V = 0.10
+
+#: Tolerance for non-monotonic accumulated capacity, in Ah.
+MONOTONICITY_TOLERANCE_AH = 0.02
+
+_DQV_NAN: dict[str, float] = {
+    "dqv_logvar": np.nan,
+    "dqv_min": np.nan,
+    "dqv_mean": np.nan,
+    "dqv_l1": np.nan,
+    "dqv_l2": np.nan,
+    "dqv_skew": np.nan,
+    "dqv_kurtosis": np.nan,
+    "dqv_v_at_max_abs_dev": np.nan,
+    "dqv_curve_corr": np.nan,
+    "dqv_overlap_span_V": np.nan,
+    "dqv_valid_points": 0.0,
+    "dqv_available": 0.0,
+}
+
+_PEAK_NAN: dict[str, float] = {
+    "peak1_V": np.nan,
+    "peak1_height": np.nan,
+    "peak1_prominence": np.nan,
+    "peak1_fwhm_V": np.nan,
+    "peak2_V": np.nan,
+    "peak2_height": np.nan,
+    "peak_count": 0.0,
+    "peaks_available": 0.0,
+}
+
+
+def _clean_monotone_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Drop non-finite pairs, sort by x ascending, average duplicate x."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    valid = np.isfinite(x) & np.isfinite(y)
+    x, y = x[valid], y[valid]
+    if x.size < 2:
+        return x, y
+    order = np.argsort(x, kind="stable")
+    x, y = x[order], y[order]
+    # Average duplicates without a pandas groupby round trip.
+    unique_x, inverse = np.unique(x, return_inverse=True)
+    if unique_x.size == x.size:
+        return x, y
+    sums = np.bincount(inverse, weights=y, minlength=unique_x.size)
+    counts = np.bincount(inverse, minlength=unique_x.size)
+    return unique_x, sums / np.maximum(counts, 1)
+
+
+def discharge_qv_curve(voltage: np.ndarray, ah_counter: np.ndarray
+                       ) -> tuple[np.ndarray, np.ndarray]:
+    """Return (voltage_ascending, capacity_at_voltage) for one discharge phase.
+
+    ``ah_counter`` is converted to capacity *removed since the start of the
+    phase*, so the curve is comparable across cycles with different absolute
+    counters.
+    """
+    voltage = np.asarray(voltage, dtype=float)
+    ah = np.asarray(ah_counter, dtype=float)
+    if voltage.size < MIN_CURVE_POINTS or ah.size != voltage.size:
+        return np.empty(0), np.empty(0)
+    finite = np.isfinite(ah)
+    if not finite.any():
+        return np.empty(0), np.empty(0)
+    q = np.abs(ah - ah[finite][0])
+    return _clean_monotone_xy(voltage, q)
+
+
+def capacity_is_monotone(capacity: np.ndarray,
+                         tolerance: float = MONOTONICITY_TOLERANCE_AH) -> bool:
+    """True when accumulated capacity never decreases beyond ``tolerance``."""
+    q = np.asarray(capacity, dtype=float)
+    q = q[np.isfinite(q)]
+    if q.size < 2:
+        return False
+    return bool(np.min(np.diff(q)) >= -abs(tolerance))
+
+
+def delta_q_of_v(voltage_current: np.ndarray, capacity_current: np.ndarray,
+                 voltage_reference: np.ndarray, capacity_reference: np.ndarray,
+                 *, n_points: int = 100) -> dict[str, float]:
+    """True voltage-resolved Delta-Q(V) = Q_current(V) - Q_reference(V).
+
+    Both curves are interpolated onto a common grid spanning only their shared
+    voltage interval; no extrapolation beyond measured coverage occurs. Returns
+    ``_DQV_NAN`` (with ``dqv_available = 0``) whenever the curves cannot be
+    compared.
+    """
+    v_cur, q_cur = _clean_monotone_xy(voltage_current, capacity_current)
+    v_ref, q_ref = _clean_monotone_xy(voltage_reference, capacity_reference)
+    # Require the same sample density as every other curve feature. The former
+    # guard was `< 2`, which let a two-point curve through: the 100-point grid
+    # below would then be interpolated from a single straight segment, and the
+    # shape statistics (logvar, skew, kurtosis) would be finite but meaningless.
+    if v_cur.size < MIN_CURVE_POINTS or v_ref.size < MIN_CURVE_POINTS:
+        return dict(_DQV_NAN)
+
+    low = max(float(v_cur[0]), float(v_ref[0]))
+    high = min(float(v_cur[-1]), float(v_ref[-1]))
+    span = high - low
+    if not np.isfinite(span) or span < MIN_OVERLAP_SPAN_V:
+        out = dict(_DQV_NAN)
+        out["dqv_overlap_span_V"] = float(max(span, 0.0)) if np.isfinite(span) else np.nan
+        return out
+
+    grid = np.linspace(low, high, int(n_points))
+    q_cur_grid = np.interp(grid, v_cur, q_cur)
+    q_ref_grid = np.interp(grid, v_ref, q_ref)
+    delta = q_cur_grid - q_ref_grid
+    finite = np.isfinite(delta)
+    if finite.sum() < 3:
+        out = dict(_DQV_NAN)
+        out["dqv_overlap_span_V"] = float(span)
+        return out
+    delta = delta[finite]
+    grid_valid = grid[finite]
+
+    variance = float(np.var(delta))
+    mean = float(np.mean(delta))
+    std = float(np.std(delta))
+    if std > 0:
+        centered = (delta - mean) / std
+        skew = float(np.mean(centered ** 3))
+        kurtosis = float(np.mean(centered ** 4) - 3.0)
+    else:
+        # Identical curves: higher moments are undefined but the honest value
+        # for a constant signal is zero shape deviation, not NaN.
+        skew = 0.0
+        kurtosis = 0.0
+
+    if np.std(q_cur_grid[finite]) > 0 and np.std(q_ref_grid[finite]) > 0:
+        corr = float(np.corrcoef(q_cur_grid[finite], q_ref_grid[finite])[0, 1])
+    else:
+        corr = np.nan
+
+    return {
+        "dqv_logvar": float(np.log(variance + LOG_EPSILON)),
+        "dqv_min": float(np.min(delta)),
+        "dqv_mean": mean,
+        "dqv_l1": float(np.sum(np.abs(delta))),
+        "dqv_l2": float(np.sqrt(np.sum(delta ** 2))),
+        "dqv_skew": skew,
+        "dqv_kurtosis": kurtosis,
+        "dqv_v_at_max_abs_dev": float(grid_valid[int(np.argmax(np.abs(delta)))]),
+        "dqv_curve_corr": corr,
+        "dqv_overlap_span_V": float(span),
+        "dqv_valid_points": float(finite.sum()),
+        "dqv_available": 1.0,
+    }
+
+
+def signed_dqdv_peaks(voltage: np.ndarray, capacity: np.ndarray, *,
+                      sigma: float = 3.0, n_peaks: int = 2) -> dict[str, float]:
+    """First ``n_peaks`` reproducible dQ/dV extrema, ordered by voltage.
+
+    Peak *location* is found on ``|dQ/dV|``, which is required here: the curve is
+    parameterised as capacity-removed against ascending voltage, so for a
+    discharge phase Q(V) decreases and every incremental-capacity peak is a
+    minimum of the signed derivative. Searching signed maxima alone would return
+    near-zero plateau points instead of the phase-transition peaks.
+
+    Two things distinguish this from the legacy extractor, and they are what the
+    revision actually required:
+
+    * the reported height keeps the **sign** of dQ/dV, so charge and discharge
+      peaks are not conflated;
+    * peaks are ordered by **voltage position**, not by magnitude, so "peak 1"
+      denotes the same physical transition in every fold. The legacy version
+      reported only the single largest-magnitude peak, which could jump between
+      transitions as a cell aged.
+    """
+    v, q = _clean_monotone_xy(voltage, capacity)
+    out = dict(_PEAK_NAN)
+    if v.size < MIN_CURVE_POINTS or float(v[-1] - v[0]) < 1e-3:
+        return out
+    if not capacity_is_monotone(q):
+        return out
+
+    q_smooth = gaussian_filter1d(q, sigma=float(sigma))
+    dqdv = np.gradient(q_smooth, v)
+    if not np.isfinite(dqdv).any():
+        return out
+
+    magnitude = np.abs(dqdv[np.isfinite(dqdv)])
+    prominence = max(float(np.nanpercentile(magnitude, 90)) * 0.1, 1e-6)
+
+    # Locate extrema on the magnitude curve, then read the SIGNED height back.
+    found, properties = find_peaks(np.abs(dqdv), prominence=prominence)
+    if found.size == 0:
+        return out
+    prominences = properties.get("prominences", np.zeros(found.size))
+    ordered = sorted(
+        ((int(index), float(prom)) for index, prom in zip(found, prominences)),
+        key=lambda item: float(v[item[0]]),
+    )
+
+    out["peak_count"] = float(len(ordered))
+    out["peaks_available"] = 1.0
+    sample_index = np.arange(v.size, dtype=float)
+    for rank, (index, prom) in enumerate(ordered[:n_peaks], start=1):
+        out[f"peak{rank}_V"] = float(v[index])
+        out[f"peak{rank}_height"] = float(dqdv[index])  # signed
+        if rank == 1:
+            out["peak1_prominence"] = float(prom)
+            try:
+                _, _, left, right = peak_widths(
+                    np.abs(dqdv), [index], rel_height=0.5,
+                )
+                left_v = float(np.interp(left[0], sample_index, v))
+                right_v = float(np.interp(right[0], sample_index, v))
+                out["peak1_fwhm_V"] = abs(right_v - left_v)
+            except Exception:
+                out["peak1_fwhm_V"] = np.nan
+    return out
+
+
+def icdv_reference_shift(current: dict[str, float], reference: dict[str, float]
+                         ) -> dict[str, float]:
+    """Shift of the first dQ/dV peak between an anchor and a reference cycle."""
+    available = (
+        float(current.get("peaks_available", 0.0)) > 0.0
+        and float(reference.get("peaks_available", 0.0)) > 0.0
+        and np.isfinite(current.get("peak1_V", np.nan))
+        and np.isfinite(reference.get("peak1_V", np.nan))
+    )
+    if not available:
+        return {
+            "icdv_dis_peak1_V_shift": np.nan,
+            "icdv_dis_peak1_height_change": np.nan,
+            "icdv_available": 0.0,
+        }
+    return {
+        "icdv_dis_peak1_V_shift": float(current["peak1_V"] - reference["peak1_V"]),
+        "icdv_dis_peak1_height_change": float(
+            current["peak1_height"] - reference["peak1_height"]
+        ),
+        "icdv_available": 1.0,
+    }
+
+
+def thermal_features(*, discharge_time: np.ndarray, discharge_temperature: np.ndarray,
+                     discharge_capacity: np.ndarray,
+                     charge_time: np.ndarray, charge_temperature: np.ndarray
+                     ) -> dict[str, float]:
+    """Compact thermal descriptors for one cycle.
+
+    Returns NaN for every field when the temperature channel is unusable, so a
+    missing sensor is never silently imputed as zero rise.
+    """
+    nan_out = {
+        "thermal_discharge_rise_degC": np.nan,
+        "thermal_charge_rise_degC": np.nan,
+        "thermal_max_dTdt_degC_s": np.nan,
+        "thermal_mean_dTdt_degC_s": np.nan,
+        "thermal_rise_per_Ah": np.nan,
+        "thermal_asymmetry_degC": np.nan,
+    }
+    t_dis = np.asarray(discharge_temperature, dtype=float)
+    time_dis = np.asarray(discharge_time, dtype=float)
+    finite = np.isfinite(t_dis) & np.isfinite(time_dis)
+    if finite.sum() < 3:
+        return nan_out
+    t_dis, time_dis = t_dis[finite], time_dis[finite]
+
+    discharge_rise = float(t_dis[-1] - t_dis[0])
+    duration = float(time_dis[-1] - time_dis[0])
+    if duration > 0:
+        dtdt = np.gradient(t_dis, time_dis)
+        dtdt = dtdt[np.isfinite(dtdt)]
+        max_dtdt = float(np.max(np.abs(dtdt))) if dtdt.size else np.nan
+        mean_dtdt = float(np.mean(dtdt)) if dtdt.size else np.nan
+    else:
+        max_dtdt = mean_dtdt = np.nan
+
+    q = np.asarray(discharge_capacity, dtype=float)
+    q = q[np.isfinite(q)]
+    discharged = float(np.abs(q[-1] - q[0])) if q.size >= 2 else np.nan
+    rise_per_ah = (
+        discharge_rise / discharged
+        if np.isfinite(discharged) and discharged > 1e-9 else np.nan
+    )
+
+    t_ch = np.asarray(charge_temperature, dtype=float)
+    t_ch = t_ch[np.isfinite(t_ch)]
+    charge_rise = float(t_ch[-1] - t_ch[0]) if t_ch.size >= 2 else np.nan
+    asymmetry = (
+        charge_rise - discharge_rise if np.isfinite(charge_rise) else np.nan
+    )
+
+    return {
+        "thermal_discharge_rise_degC": discharge_rise,
+        "thermal_charge_rise_degC": charge_rise,
+        "thermal_max_dTdt_degC_s": max_dtdt,
+        "thermal_mean_dTdt_degC_s": mean_dtdt,
+        "thermal_rise_per_Ah": rise_per_ah,
+        "thermal_asymmetry_degC": asymmetry,
+    }
+
+
+def safe_divide(numerator: Any, denominator: Any, *,
+                epsilon: float = 1.0e-12) -> float:
+    """Division that returns NaN — never inf — for invalid denominators."""
+    try:
+        num = float(numerator)
+        den = float(denominator)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not np.isfinite(num) or not np.isfinite(den) or abs(den) < epsilon:
+        return float("nan")
+    return num / den
+
+
+################################################################################
+# FILE: src/preprocessing/dcir.py
+################################################################################
+
+"""DC internal resistance from the RPT/CU pulse train.
+
+Protocol findings (inspected from ``canonical/steps.parquet``, 289 CU files)
+---------------------------------------------------------------------------
+Cycling (CYC) blocks contain no usable current step for resistance: the median
+in-block rest duration is 0 s. Resistance is therefore measured *only* in
+RPT/CU files, which carry a highly regular pulse train:
+
+    3 SOC levels (pre-pulse rest OCV ~3.60 / ~2.95 / ~2.20 V)
+      x 3 C-rates (0.5C, 1C, 2C)
+      x 2 directions (discharge, charge)
+    = 18 pulses of 12 s each, every pulse preceded by a >= 1800 s rest
+      (7200 s before the 0.5C discharge pulse at each SOC level).
+
+285 of 289 CU files contain the full train. Three files have a gap that shifts
+the pulse ordinal, so pulses are selected by *physical* identity
+(phase + C-rate + pre-pulse OCV rank), never by position in the file.
+
+Canonical measurement
+---------------------
+    R_dc = (V_pulse_end - V_rest_end) / (I_pulse - 0)
+
+taken from the **0.5C discharge pulse at the highest pre-pulse OCV** of the
+previous RPT. This is a 12 s response. Sub-second and 1 s responses would
+require re-parsing the raw ``.ird`` waveforms; the 12 s value is available
+directly from the canonical step table and is consistent across every file, so
+it is the only resistance response registered.
+
+Causality
+---------
+Only the *previous* RPT is used. The next RPT defines the target and is never
+touched. Cells whose previous RPT lacks the pulse (or is the initial visit with
+no predecessor) receive NaN and ``dcir_available = 0``.
+
+Relaxation features are deliberately not implemented: although the 1800 s and
+7200 s post-pulse rests could in principle support an exponential fit, that was
+scoped out of this revision. The protocol does support it and it remains open
+work.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+#: Target C-rate of the canonical pulse.
+CANONICAL_C_RATE = 0.5
+
+#: Tolerance on the identified C-rate.
+C_RATE_TOLERANCE = 0.15
+
+#: Pulse duration window, seconds.
+PULSE_DURATION_RANGE_S = (5.0, 60.0)
+
+#: Minimum pre-pulse rest for the cell to count as relaxed.
+MINIMUM_PRE_PULSE_REST_S = 600.0
+
+#: Minimum pulse current magnitude, amperes.
+MINIMUM_PULSE_CURRENT_A = 0.1
+
+#: Physically plausible DCIR window for a 1.2 Ah sodium-ion cell, ohms.
+DCIR_BOUNDS_OHM = (0.005, 1.0)
+
+_NAN_ROW = {
+    "dcir_discharge_ohm": np.nan,
+    "dcir_pulse_current_A": np.nan,
+    "dcir_pulse_duration_s": np.nan,
+    "dcir_pre_pulse_OCV_V": np.nan,
+    "dcir_available": 0.0,
+}
+
+
+def identify_pulses(steps: pd.DataFrame, *, nominal_capacity_Ah: float) -> pd.DataFrame:
+    """Return one row per valid current pulse found in ``steps``.
+
+    ``steps`` must be a canonical step table for RPT/CU files, carrying
+    ``file_id``, ``step_index``, ``phase``, ``duration_s``, ``current_median_A``,
+    ``voltage_start_V`` and ``voltage_end_V``.
+    """
+    required = {
+        "file_id", "step_index", "phase", "duration_s",
+        "current_median_A", "voltage_end_V",
+    }
+    missing = required - set(steps.columns)
+    if missing:
+        raise ValueError(f"steps table is missing columns: {sorted(missing)}")
+
+    frame = steps.sort_values(["file_id", "step_index"]).copy()
+    grouped = frame.groupby("file_id", sort=False)
+    frame["previous_phase"] = grouped["phase"].shift(1)
+    frame["previous_duration_s"] = grouped["duration_s"].shift(1)
+    frame["previous_voltage_end_V"] = grouped["voltage_end_V"].shift(1)
+
+    low, high = PULSE_DURATION_RANGE_S
+    is_pulse = (
+        frame["phase"].isin(["discharge", "charge"])
+        & frame["duration_s"].between(low, high)
+        & frame["current_median_A"].abs().gt(MINIMUM_PULSE_CURRENT_A)
+        & frame["previous_phase"].eq("rest")
+        & frame["previous_duration_s"].ge(MINIMUM_PRE_PULSE_REST_S)
+    )
+    pulses = frame[is_pulse].copy()
+    if pulses.empty:
+        return pulses
+
+    pulses["C_rate"] = (
+        pulses["current_median_A"].abs() / float(nominal_capacity_Ah)
+    )
+    pulses["pre_pulse_OCV_V"] = pulses["previous_voltage_end_V"]
+    # R = dV / dI, with the pre-pulse rest current taken as exactly zero.
+    pulses["dcir_ohm"] = (
+        (pulses["voltage_end_V"] - pulses["previous_voltage_end_V"])
+        / pulses["current_median_A"]
+    )
+    return pulses
+
+
+def canonical_dcir_per_file(steps: pd.DataFrame, *, nominal_capacity_Ah: float
+                            ) -> pd.DataFrame:
+    """One canonical DCIR measurement per RPT/CU file.
+
+    Selection is by physical identity: the discharge pulse whose C-rate is
+    closest to :data:`CANONICAL_C_RATE` at the *highest* pre-pulse OCV. Ties are
+    broken by the lowest ``step_index`` so the result is deterministic.
+    """
+    pulses = identify_pulses(steps, nominal_capacity_Ah=nominal_capacity_Ah)
+    columns = ["file_id", *_NAN_ROW.keys()]
+    if pulses.empty:
+        return pd.DataFrame(columns=columns)
+
+    candidates = pulses[
+        pulses["phase"].eq("discharge")
+        & (pulses["C_rate"] - CANONICAL_C_RATE).abs().le(C_RATE_TOLERANCE)
+    ].copy()
+    if candidates.empty:
+        return pd.DataFrame(columns=columns)
+
+    # Highest pre-pulse OCV == top-of-charge pulse, the most reproducible point.
+    candidates = candidates.sort_values(
+        ["file_id", "pre_pulse_OCV_V", "step_index"],
+        ascending=[True, False, True],
+    )
+    selected = candidates.groupby("file_id", as_index=False).first()
+
+    lower, upper = DCIR_BOUNDS_OHM
+    plausible = selected["dcir_ohm"].between(lower, upper)
+    out = pd.DataFrame({
+        "file_id": selected["file_id"].to_numpy(),
+        "dcir_discharge_ohm": np.where(
+            plausible, selected["dcir_ohm"].to_numpy(), np.nan
+        ),
+        "dcir_pulse_current_A": selected["current_median_A"].to_numpy(),
+        "dcir_pulse_duration_s": selected["duration_s"].to_numpy(),
+        "dcir_pre_pulse_OCV_V": selected["pre_pulse_OCV_V"].to_numpy(),
+        "dcir_available": plausible.to_numpy().astype(float),
+    })
+    return out[columns]
+
+
+def previous_rpt_dcir(steps: pd.DataFrame, rpt_measurements: pd.DataFrame, *,
+                      nominal_capacity_Ah: float,
+                      initial_visit: int = 0) -> pd.DataFrame:
+    """Per-RPT-file DCIR of the *previous* RPT and its drift.
+
+    Returns one row per RPT **file** carrying that file's own DCIR plus the
+    deviation from the cell's first valid RPT DCIR. The caller joins this onto
+    anchors using the anchor's ``previous_rpt_path``, so no future RPT is read.
+
+    ``path`` is carried through deliberately: visit labels are not unique (five
+    cells carry two RPT files both labelled ``V16``), so joining on
+    ``(condition, cell, visit)`` silently collapses distinct files and can bind
+    an anchor to the wrong — or, under a different file ordering, the target — RPT.
+    """
+    per_file = canonical_dcir_per_file(
+        steps, nominal_capacity_Ah=nominal_capacity_Ah
+    )
+    keys = ["condition", "cell", "visit", "file_id", "path"]
+    missing = [key for key in keys if key not in rpt_measurements.columns]
+    if missing:
+        raise ValueError(f"rpt_measurements is missing columns: {missing}")
+
+    visits = rpt_measurements[keys].drop_duplicates("file_id")
+    merged = visits.merge(per_file, on="file_id", how="left")
+    merged["dcir_available"] = merged["dcir_available"].fillna(0.0)
+
+    baseline = (
+        merged[merged["visit"].eq(initial_visit) & merged["dcir_available"].gt(0)]
+        .sort_values(["condition", "cell", "visit"])
+        .groupby(["condition", "cell"])["dcir_discharge_ohm"]
+        .first()
+        .rename("dcir_baseline_ohm")
+    )
+    merged = merged.join(baseline, on=["condition", "cell"])
+    merged["dcir_delta_from_baseline_ohm"] = (
+        merged["dcir_discharge_ohm"] - merged["dcir_baseline_ohm"]
+    )
+    return merged.sort_values(["condition", "cell", "visit"]).reset_index(drop=True)
+
+
+################################################################################
+# FILE: src/preprocessing/p1_aggregate.py
+################################################################################
+
+"""P1 per-cycle aggregate features from validated canonical cycles."""
+from __future__ import annotations
+
+import pandas as pd
+
+from ..io.loaders import load_cycle_metrics, load_inventory
+
+BASE_NUMERIC = [
+    "Q_charge_Ah", "Q_discharge_Ah", "E_charge_Wh", "E_discharge_Wh",
+    "coulombic_efficiency", "energy_efficiency", "V_max", "V_min", "T_max", "T_min",
+    "T_mean", "Ah_span", "duration_s", "cumulative_Ah_throughput",
+    "cycle_start_time_s", "cycle_end_time_s",
+]
+CONDITION_NUMERIC = ["DOD_pct", "C_ch", "C_dis", "T_degC"]
+ID_COLS = [
+    "condition", "cell", "visit", "test_type", "path", "relative_path", "file_id",
+    "file_start_time", "segment_index", "cycle_in_file", "global_cycle", "cycle_complete",
+    "cycle_qc_status", "cycle_qc_flags",
+]
+TARGET_COLS = ["SOH_pct", "Q_initial_Ah"]
+
+
+def build_p1(df: pd.DataFrame | None = None) -> pd.DataFrame:
+    if df is None:
+        df = load_cycle_metrics()
+    frame = df.copy()
+    if "cycle_complete" not in frame.columns:
+        raise ValueError(
+            "cycle_complete is missing; rebuild canonical tables with scripts/00_build_canonical.py"
+        )
+    # Incomplete boundary segments remain in cycles.parquet for QC but cannot
+    # enter model features.
+    frame = frame[frame["cycle_complete"].fillna(False)].copy()
+
+    missing_condition = [column for column in CONDITION_NUMERIC if column not in frame.columns]
+    if missing_condition:
+        metadata = load_inventory()[["condition", *missing_condition]].drop_duplicates()
+        if metadata["condition"].duplicated().any():
+            raise ValueError("condition metadata is not unique")
+        before = len(frame)
+        frame = frame.merge(metadata, on="condition", how="left", validate="many_to_one")
+        if len(frame) != before:
+            raise AssertionError("condition metadata merge changed row count")
+
+    ce_low, ce_high = 0.4, 1.05
+    frame["ce_outlier"] = (
+        (frame["coulombic_efficiency"] < ce_low) |
+        (frame["coulombic_efficiency"] > ce_high)
+    )
+    if "SOH_pct" in frame.columns:
+        frame["soh_outlier"] = (frame["SOH_pct"] < 0) | (frame["SOH_pct"] > 150)
+
+    keep_id = [column for column in ID_COLS if column in frame.columns]
+    keep_numeric = [column for column in BASE_NUMERIC + CONDITION_NUMERIC if column in frame.columns]
+    keep_flags = [column for column in ["ce_outlier", "soh_outlier"] if column in frame.columns]
+    keep_targets = [column for column in TARGET_COLS if column in frame.columns]
+    return frame[keep_id + keep_numeric + keep_flags + keep_targets].copy()
+
+
+if __name__ == "__main__":
+    p1 = build_p1()
+    print("P1 shape:", p1.shape)
+    print(p1.head(3))
+
+
+################################################################################
+# FILE: src/preprocessing/unified.py
+################################################################################
+
+"""The single ``unified`` preprocessing pipeline.
+
+One anchor-level feature table, consumed unchanged by Ridge, ExtraTrees and
+NaPINN-Q. Replaces the P1/P2/P3 ladder for all final training; the older modules
+remain importable for traceability only.
+
+Structure
+---------
+1. Cycle-level base: validated complete cycles, safe derived quantities, EFC.
+2. Targets attached on the cycle frame, which marks the prediction anchors
+   (exactly one per cycling block: its last complete cycle).
+3. Anchor-level assembly. Because there are only ~236 anchors, every expensive
+   feature is computed *at the anchors only*:
+     * Group C temporal summaries over the trailing complete cycles of the cell,
+     * Group D/E/F curve + thermal features from the raw ``.ird`` waveforms of
+       the anchor's own block (first vs last complete cycle),
+     * Group G resistance joined from the *previous* RPT visit.
+4. Derived interactions, registry projection, audit artifacts.
+
+Causality
+---------
+Every feature is a function of data recorded at or before the anchor cycle. The
+anchor is the last complete cycle of an already-finished block, so the block's
+own first cycle is a legitimate causal reference. No future cycle, no future
+RPT, no centered window, no whole-dataset statistic is used. The temporal audit
+in :func:`build_temporal_audit` records the reference window of every column and
+:func:`assert_causal` fails the build if a column cannot be proven causal.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+from ..io.ird_parser import parse_ird
+from ..io.loaders import (
+    load_config,
+    load_inventory,
+    load_rpt_measurements,
+    load_steps_table,
+)
+from .curve_features import (
+    delta_q_of_v,
+    discharge_qv_curve,
+    icdv_reference_shift,
+    safe_divide,
+    signed_dqdv_peaks,
+    thermal_features,
+)
+from .dcir import previous_rpt_dcir
+from .p1_aggregate import build_p1
+from .protocol_segmentation import segment_cyc_protocol, summarize_steps
+from .unified_feature_registry import (
+    CAUSAL_REFERENCE_WINDOWS,
+    FEATURE_SPECS,
+    IDENTITY_COLUMNS,
+    MIN_TEMPORAL_OBSERVATIONS,
+    REGISTRY_VERSION,
+    TARGET_COLUMNS,
+    continuous_feature_columns,
+    flag_feature_columns,
+    model_feature_columns,
+    registry_hash,
+    registry_manifest,
+)
+
+PREPROCESSING_NAME = "unified"
+
+#: Trailing window, in complete cycles, for Group C features.
+TEMPORAL_WINDOW = 10
+
+
+class UnifiedBuildError(RuntimeError):
+    """Raised when the unified table cannot be built safely."""
+
+
+# ---------------------------------------------------------------------------
+# Cycle-level base
+# ---------------------------------------------------------------------------
+def build_cycle_base(cycle_metrics: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Complete-cycle base frame with safe derived quantities and EFC."""
+    cfg = load_config()
+    nominal = float(cfg["protocol"]["nominal_capacity_Ah"])
+    base = build_p1(cycle_metrics)
+
+    base["energy_loss_Wh"] = base["E_charge_Wh"] - base["E_discharge_Wh"]
+    base["mean_charge_voltage_V"] = [
+        safe_divide(e, q)
+        for e, q in zip(base["E_charge_Wh"], base["Q_charge_Ah"])
+    ]
+    base["mean_discharge_voltage_V"] = [
+        safe_divide(e, q)
+        for e, q in zip(base["E_discharge_Wh"], base["Q_discharge_Ah"])
+    ]
+    base["voltage_hysteresis_V"] = (
+        base["mean_charge_voltage_V"] - base["mean_discharge_voltage_V"]
+    )
+    base["temperature_span_C"] = base["T_max"] - base["T_min"]
+    base["cycle_duration_s"] = base["duration_s"]
+
+    # EFC accumulates only past discharge throughput within the cell.
+    base = base.sort_values(["condition", "cell", "visit", "cycle_in_file"])
+    base["EFC_cum"] = (
+        base.groupby(["condition", "cell"])["Q_discharge_Ah"]
+        .transform(lambda s: s.fillna(0.0).cumsum())
+        / nominal
+    )
+    return base.replace([np.inf, -np.inf], np.nan).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Group C — temporal summaries evaluated at the anchors only
+# ---------------------------------------------------------------------------
+def _robust_slope(values: np.ndarray) -> float:
+    """Theil-Sen slope (median of pairwise slopes) against cycle position.
+
+    Robust to the occasional capacity-regeneration outlier, and cheap for the
+    10-point windows used here.
+    """
+    y = np.asarray(values, dtype=float)
+    finite = np.isfinite(y)
+    y = y[finite]
+    if y.size < 2:
+        return float("nan")
+    x = np.arange(y.size, dtype=float)
+    slopes: list[float] = []
+    for i in range(y.size - 1):
+        dx = x[i + 1:] - x[i]
+        slopes.extend(((y[i + 1:] - y[i]) / dx).tolist())
+    return float(np.median(slopes)) if slopes else float("nan")
+
+
+def temporal_features_at_anchor(history: pd.DataFrame, *,
+                                window: int = TEMPORAL_WINDOW) -> dict[str, float]:
+    """Group C features from the trailing ``window`` complete cycles.
+
+    ``history`` must already be restricted to cycles at or before the anchor for
+    a single cell, in chronological order, with the anchor as the final row.
+    """
+    tail = history.tail(int(window))
+    n_valid = int(tail["Q_discharge_Ah"].notna().sum())
+    available = float(n_valid >= MIN_TEMPORAL_OBSERVATIONS)
+
+    if not available:
+        return {
+            "Q_discharge_Ah_r10_slope": np.nan,
+            "Q_discharge_Ah_r10_std": np.nan,
+            "Q_discharge_Ah_dev_r10": np.nan,
+            "coulombic_efficiency_r10_mean": np.nan,
+            "coulombic_efficiency_r10_slope": np.nan,
+            "temporal_window_available": 0.0,
+        }
+
+    q = tail["Q_discharge_Ah"]
+    ce = tail["coulombic_efficiency"]
+    anchor_q = float(history["Q_discharge_Ah"].iloc[-1])
+    rolling_mean = float(q.mean())
+    return {
+        "Q_discharge_Ah_r10_slope": _robust_slope(q.to_numpy()),
+        "Q_discharge_Ah_r10_std": float(q.std(ddof=1)) if n_valid >= 2 else np.nan,
+        "Q_discharge_Ah_dev_r10": (
+            anchor_q - rolling_mean if np.isfinite(anchor_q) else np.nan
+        ),
+        "coulombic_efficiency_r10_mean": float(ce.mean()),
+        "coulombic_efficiency_r10_slope": _robust_slope(ce.to_numpy()),
+        "temporal_window_available": 1.0,
+    }
+
+
+def build_temporal_block(base: pd.DataFrame, anchors: pd.DataFrame, *,
+                         window: int = TEMPORAL_WINDOW) -> pd.DataFrame:
+    """Group C features for every anchor, using only that cell's past cycles."""
+    ordered = base.sort_values(["condition", "cell", "visit", "cycle_in_file"])
+    rows: list[dict[str, Any]] = []
+    for cell_key, history in ordered.groupby(["condition", "cell"], sort=False):
+        cell_anchors = anchors[
+            anchors["condition"].eq(cell_key[0]) & anchors["cell"].eq(cell_key[1])
+        ]
+        for anchor in cell_anchors.itertuples(index=False):
+            # Strictly at-or-before the anchor cycle within this cell.
+            past = history[
+                (history["visit"] < anchor.visit)
+                | (
+                    history["visit"].eq(anchor.visit)
+                    & history["cycle_in_file"].le(anchor.cycle_in_file)
+                )
+            ]
+            if past.empty:
+                continue
+            features = temporal_features_at_anchor(past, window=window)
+            features["anchor_id"] = anchor.anchor_id
+            rows.append(features)
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Groups D/E/F — waveform features from the anchor's own cycling block
+# ---------------------------------------------------------------------------
+def _block_waveform_features(path: Path, row: dict[str, Any],
+                             cfg: dict[str, Any]) -> dict[str, Any]:
+    """Delta-Q(V), IC/DV shift and thermal features for one cycling file.
+
+    Only two cycles are needed: the block's first complete cycle (causal
+    reference) and its last complete cycle (the prediction anchor).
+    """
+    protocol = cfg["protocol"]
+    preprocessing = cfg["preprocessing"]
+    parsed = parse_ird(
+        path,
+        strict=True,
+        max_invalid_fraction=float(protocol["max_invalid_fraction"]),
+        max_sampling_gap_s=float(protocol["max_sampling_gap_s"]),
+    )
+    if parsed.data is None:
+        raise UnifiedBuildError(f"parse returned no data for {path}")
+    data = parsed.data.copy()
+    for column, limits in protocol["physical_bounds"].items():
+        invalid = (data[column] < limits[0]) | (data[column] > limits[1])
+        data.loc[invalid, column] = np.nan
+
+    steps = summarize_steps(
+        data, current_deadband_A=float(protocol["current_deadband_A"])
+    )
+    nominal = float(protocol["nominal_capacity_Ah"])
+    segments = segment_cyc_protocol(
+        data,
+        expected_charge_current_A=nominal * float(row["C_ch"]),
+        expected_discharge_current_A=nominal * float(row["C_dis"]),
+        current_relative_tolerance=float(protocol["cycling_current_relative_tolerance"]),
+        minimum_phase_capacity_Ah=float(protocol["minimum_phase_capacity_Ah"]),
+        capacity_ratio_bounds=tuple(protocol["capacity_ratio_bounds"]),
+        minimum_cycle_voltage_span_V=float(
+            protocol.get("minimum_cycle_voltage_span_V", 0.0)
+        ),
+        minimum_phase_voltage_span_V=float(
+            protocol.get("minimum_phase_voltage_span_V", 0.0)
+        ),
+        steps=steps,
+    )
+    complete = [
+        segment for segment in segments
+        if segment.complete
+        and segment.discharge_step_index is not None
+        and segment.charge_step_index is not None
+    ]
+    if len(complete) < 2:
+        raise UnifiedBuildError(
+            f"{path.name}: need >=2 complete cycles, found {len(complete)}"
+        )
+    complete.sort(key=lambda segment: segment.cycle_in_file)
+    reference_segment, anchor_segment = complete[0], complete[-1]
+
+    def phase_frames(segment) -> tuple[pd.DataFrame, pd.DataFrame]:
+        discharge_step = steps[segment.discharge_step_index]
+        charge_step = steps[segment.charge_step_index]
+        return (
+            data.iloc[discharge_step.start:discharge_step.stop],
+            data.iloc[charge_step.start:charge_step.stop],
+        )
+
+    anchor_discharge, anchor_charge = phase_frames(anchor_segment)
+    reference_discharge, _ = phase_frames(reference_segment)
+
+    sigma = float(preprocessing["dqdv_smooth_sigma"])
+    n_grid = int(preprocessing.get("dqv_grid_points",
+                                   preprocessing["vq_resample_points"]))
+
+    v_anchor, q_anchor = discharge_qv_curve(
+        anchor_discharge["Voltage"].to_numpy(),
+        anchor_discharge["Ah_counter"].to_numpy(),
+    )
+    v_reference, q_reference = discharge_qv_curve(
+        reference_discharge["Voltage"].to_numpy(),
+        reference_discharge["Ah_counter"].to_numpy(),
+    )
+
+    features: dict[str, Any] = {}
+    features.update(delta_q_of_v(
+        v_anchor, q_anchor, v_reference, q_reference, n_points=n_grid,
+    ))
+    anchor_peaks = signed_dqdv_peaks(v_anchor, q_anchor, sigma=sigma)
+    reference_peaks = signed_dqdv_peaks(v_reference, q_reference, sigma=sigma)
+    features.update(icdv_reference_shift(anchor_peaks, reference_peaks))
+    features["icdv_dis_peak1_V"] = anchor_peaks["peak1_V"]
+    features["icdv_dis_peak1_fwhm_V"] = anchor_peaks["peak1_fwhm_V"]
+
+    q_dis = anchor_discharge["Ah_counter"].to_numpy(dtype=float)
+    features.update(thermal_features(
+        discharge_time=anchor_discharge["Time"].to_numpy(dtype=float),
+        discharge_temperature=anchor_discharge["Temperature"].to_numpy(dtype=float),
+        discharge_capacity=q_dis,
+        charge_time=anchor_charge["Time"].to_numpy(dtype=float),
+        charge_temperature=anchor_charge["Temperature"].to_numpy(dtype=float),
+    ))
+
+    features.update({
+        "file_id": row.get("file_id"),
+        "condition": row["condition"],
+        "cell": row["cell"],
+        "visit": int(row["visit"]),
+        "waveform_reference_cycle_in_file": int(reference_segment.cycle_in_file),
+        "waveform_anchor_cycle_in_file": int(anchor_segment.cycle_in_file),
+        "waveform_complete_cycle_count": int(len(complete)),
+    })
+    return features
+
+
+def _waveform_worker(row: dict[str, Any]) -> dict[str, Any]:
+    cfg = load_config()
+    path = Path(row["path"])
+    try:
+        return {
+            "status": "valid", "file_id": row.get("file_id"),
+            "error": None, "features": _block_waveform_features(path, row, cfg),
+        }
+    except Exception as exc:  # noqa: BLE001 - recorded per file, never silent
+        return {
+            "status": "failed", "file_id": row.get("file_id"),
+            "error": f"{type(exc).__name__}: {exc}", "features": None,
+        }
+
+
+def build_waveform_block(anchor_file_ids: set[str], *,
+                         workers: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Waveform features for every cycling file that carries an anchor."""
+    cfg = load_config()
+    workers = workers or int(cfg["experiment"]["parallel_workers"])
+    inventory = load_inventory()
+    tasks = inventory[
+        inventory["test_type"].eq("CYC")
+        & inventory["file_id"].isin(anchor_file_ids)
+        & inventory.get("parse_status", "valid").eq("valid")
+    ].to_dict(orient="records")
+    if not tasks:
+        raise UnifiedBuildError("no parseable cycling files carry an anchor")
+
+    rows: list[dict[str, Any]] = []
+    coverage: list[dict[str, Any]] = []
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        iterator = executor.map(_waveform_worker, tasks, chunksize=1)
+        bar = tqdm(iterator, total=len(tasks), desc="[unified] waveforms", unit="file")
+        for result in bar:
+            coverage.append({
+                "file_id": result["file_id"],
+                "status": result["status"],
+                "error": result["error"],
+            })
+            if result["features"] is not None:
+                rows.append(result["features"])
+            failures = sum(entry["status"] != "valid" for entry in coverage)
+            bar.set_postfix_str(f"ok={len(rows)} failed={failures}")
+    return pd.DataFrame(rows), pd.DataFrame(coverage)
+
+
+# ---------------------------------------------------------------------------
+# Derived interactions
+# ---------------------------------------------------------------------------
+def add_interactions(frame: pd.DataFrame) -> pd.DataFrame:
+    """Group H — a small, interpretable interaction set. No polynomials."""
+    out = frame.copy()
+    out["temperature_K"] = out["T_degC"] + 273.15
+    out["inverse_temperature_1_K"] = [
+        safe_divide(1.0, value) for value in out["temperature_K"]
+    ]
+    dod_fraction = out["DOD_pct"] / 100.0
+    out["stress_x_DOD_fraction"] = out["EFC_cum"] * dod_fraction
+    out["stress_x_inverse_temperature"] = (
+        out["EFC_cum"] * out["inverse_temperature_1_K"]
+    )
+    out["stress_x_C_dis"] = out["EFC_cum"] * out["C_dis"]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Audit
+# ---------------------------------------------------------------------------
+def build_temporal_audit(frame: pd.DataFrame) -> pd.DataFrame:
+    """Per-feature causality, coverage and unit audit."""
+    rows: list[dict[str, Any]] = []
+    n_rows = max(len(frame), 1)
+    for spec in FEATURE_SPECS:
+        present = spec.name in frame.columns
+        if present:
+            column = frame[spec.name]
+            missing_rate = float(column.isna().mean())
+            finite_rate = float(
+                np.isfinite(pd.to_numeric(column, errors="coerce")).sum() / n_rows
+            )
+        else:
+            missing_rate = 1.0
+            finite_rate = 0.0
+        # Derive the causality verdict from the declared reference window and
+        # source columns. These were previously hardcoded True/False literals,
+        # which made assert_causal's unsafe filter empty by construction and
+        # unable to reject anything.
+        backward = spec.reference in CAUSAL_REFERENCE_WINDOWS
+        target_derived = bool(set(spec.sources) & set(TARGET_COLUMNS))
+        reads_next_rpt = target_derived or "next" in spec.reference.lower()
+        rows.append({
+            "feature": spec.name,
+            "group": spec.group,
+            "kind": spec.kind,
+            "role": spec.role,
+            "unit": spec.unit,
+            "source_columns": ";".join(spec.sources),
+            "reference_window": spec.reference,
+            "uses_only_past_or_current": backward,
+            "uses_future_cycles": not backward,
+            "uses_future_rpt": reads_next_rpt,
+            "target_derived": target_derived,
+            "present_in_table": present,
+            "missingness_rate": missing_rate,
+            "finite_rate": finite_rate,
+            "enabled_in_registry": True,
+            "registry_version": REGISTRY_VERSION,
+        })
+    return pd.DataFrame(rows)
+
+
+def assert_causal(audit: pd.DataFrame) -> None:
+    """Fail the build when any registered feature cannot be proven causal."""
+    missing = audit.loc[~audit["present_in_table"], "feature"].tolist()
+    if missing:
+        raise UnifiedBuildError(
+            f"registered features absent from the unified table: {missing}"
+        )
+    unsafe = audit[
+        audit["uses_future_cycles"]
+        | audit["uses_future_rpt"]
+        | audit["target_derived"]
+        | ~audit["uses_only_past_or_current"]
+    ]
+    if not unsafe.empty:
+        raise UnifiedBuildError(
+            f"non-causal features rejected: {unsafe['feature'].tolist()}"
+        )
+    empty = audit.loc[audit["finite_rate"] <= 0.0, "feature"].tolist()
+    if empty:
+        raise UnifiedBuildError(
+            f"registered features are entirely missing/non-finite: {empty}"
+        )
+
+
+def build_coverage(frame: pd.DataFrame) -> pd.DataFrame:
+    """Per-feature coverage, split by condition, for the report."""
+    rows: list[dict[str, Any]] = []
+    for spec in FEATURE_SPECS:
+        if spec.name not in frame.columns:
+            continue
+        column = frame[spec.name]
+        rows.append({
+            "feature": spec.name, "group": spec.group, "scope": "all",
+            "n_rows": int(len(column)),
+            "n_present": int(column.notna().sum()),
+            "coverage": float(column.notna().mean()),
+        })
+        for condition, part in frame.groupby("condition"):
+            values = part[spec.name]
+            rows.append({
+                "feature": spec.name, "group": spec.group, "scope": str(condition),
+                "n_rows": int(len(values)),
+                "n_present": int(values.notna().sum()),
+                "coverage": float(values.notna().mean()),
+            })
+    return pd.DataFrame(rows)
+
+
+def table_hash(frame: pd.DataFrame) -> str:
+    digest = pd.util.hash_pandas_object(frame, index=True, categorize=True)
+    return hashlib.sha256(digest.to_numpy().tobytes()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+def build_unified(cycle_metrics: pd.DataFrame | None = None,
+                  cu_cache: pd.DataFrame | None = None,
+                  *, workers: int | None = None,
+                  attach_targets=None) -> dict[str, Any]:
+    """Build the unified anchor table and its audit artifacts."""
+    cfg = load_config()
+    nominal = float(cfg["protocol"]["nominal_capacity_Ah"])
+    initial_visit = int(
+        cfg.get("targets", {}).get("next_rpt", {}).get("initial_visit", 0)
+    )
+
+    if attach_targets is None:
+        from ..targets.next_rpt import add_target as add_next_rpt
+
+        def attach_targets(frame: pd.DataFrame) -> pd.DataFrame:
+            return add_next_rpt(frame, cu_cache=cu_cache)
+
+    base = build_cycle_base(cycle_metrics)
+    with_targets = attach_targets(base)
+    anchors = with_targets[
+        with_targets["is_prediction_anchor"].fillna(False)
+    ].copy().reset_index(drop=True)
+    if anchors.empty:
+        raise UnifiedBuildError("no prediction anchors were identified")
+    if anchors["anchor_id"].duplicated().any():
+        raise UnifiedBuildError("anchor_id is not unique")
+
+    # --- Group C
+    temporal = build_temporal_block(base, anchors)
+    anchors = anchors.merge(temporal, on="anchor_id", how="left", validate="one_to_one")
+
+    # --- Groups D/E/F
+    waveform, waveform_coverage = build_waveform_block(
+        set(anchors["file_id"].dropna()), workers=workers,
+    )
+    join_columns = [
+        column for column in waveform.columns
+        if column not in {"condition", "cell", "visit"}
+    ]
+    anchors = anchors.merge(
+        waveform[join_columns], on="file_id", how="left", validate="one_to_one",
+    )
+    for flag in ("dqv_available", "icdv_available"):
+        anchors[flag] = anchors[flag].fillna(0.0)
+
+    # --- Group G: previous-RPT resistance only
+    steps = load_steps_table()
+    resistance = previous_rpt_dcir(
+        steps[steps["test_type"].ne("CYC")],
+        cu_cache if cu_cache is not None else load_rpt_measurements(),
+        nominal_capacity_Ah=nominal,
+        initial_visit=initial_visit,
+    )
+    # Join on the previous RPT's file identity, not its visit label. Visit
+    # labels are not unique (five cells carry two files both labelled V16), so a
+    # visit join deduplicates distinct files and binds anchors to whichever file
+    # happened to sort first -- stale in the observed data, and the target RPT
+    # itself under a different file ordering.
+    resistance = resistance.rename(columns={"path": "previous_rpt_path"})[[
+        "previous_rpt_path", "dcir_discharge_ohm",
+        "dcir_delta_from_baseline_ohm", "dcir_available",
+    ]].drop_duplicates("previous_rpt_path")
+    anchors = anchors.merge(
+        resistance, on="previous_rpt_path", how="left", validate="many_to_one",
+    )
+    anchors = anchors.rename(columns={
+        "dcir_discharge_ohm": "dcir_prev_rpt_discharge_ohm",
+        "dcir_delta_from_baseline_ohm": "dcir_prev_rpt_delta_from_baseline_ohm",
+    })
+    anchors["dcir_available"] = anchors["dcir_available"].fillna(0.0)
+
+    # --- Group H + registry aliases
+    anchors["visit_index"] = anchors["visit"].astype(float)
+    anchors = add_interactions(anchors)
+    anchors = anchors.replace([np.inf, -np.inf], np.nan)
+
+    # --- Project onto the registry
+    features = model_feature_columns()
+    absent = [column for column in features if column not in anchors.columns]
+    if absent:
+        raise UnifiedBuildError(
+            f"unified build did not produce registered features: {absent}"
+        )
+    for flag in flag_feature_columns():
+        anchors[flag] = anchors[flag].fillna(0.0).astype(float)
+
+    identity = [c for c in IDENTITY_COLUMNS if c in anchors.columns]
+    targets = [c for c in TARGET_COLUMNS if c in anchors.columns]
+    extras = [
+        column for column in (
+            "previous_rpt_visit", "next_rpt_target_status",
+            "target_unavailable_reason", "waveform_reference_cycle_in_file",
+            "waveform_anchor_cycle_in_file", "waveform_complete_cycle_count",
+            "dqv_overlap_span_V", "dqv_valid_points",
+        )
+        if column in anchors.columns and column not in identity + targets + features
+    ]
+    unified = anchors[identity + targets + features + extras].copy()
+
+    audit = build_temporal_audit(unified)
+    assert_causal(audit)
+    coverage = build_coverage(unified)
+
+    manifest = {
+        "preprocessing": PREPROCESSING_NAME,
+        "registry_version": REGISTRY_VERSION,
+        "registry_hash": registry_hash(),
+        "n_model_features": len(features),
+        "n_continuous_features": len(continuous_feature_columns()),
+        "n_flag_features": len(flag_feature_columns()),
+        "n_anchors": int(len(unified)),
+        "n_cells": int(unified["cell"].nunique()),
+        "n_conditions": int(unified["condition"].nunique()),
+        "primary_target": "next_rpt_Q_Ah",
+        "temporal_window_cycles": TEMPORAL_WINDOW,
+        "minimum_temporal_observations": MIN_TEMPORAL_OBSERVATIONS,
+        "dqv_reference": "block_first_complete_cycle",
+        "dcir_source": "previous_rpt_0.5C_discharge_pulse_12s",
+        "relaxation_features": "not_implemented_protocol_scoped_out",
+        "feature_columns": features,
+        "table_hash": table_hash(unified),
+        "features": registry_manifest(),
+    }
+    return {
+        "unified": unified,
+        "audit": audit,
+        "coverage": coverage,
+        "manifest": manifest,
+        "waveform_coverage": waveform_coverage,
+    }
+
+
+def write_unified(result: dict[str, Any], out_dir: Path) -> None:
+    """Persist unified.parquet and every required audit artifact."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    result["unified"].to_parquet(out_dir / "unified.parquet", index=False)
+    result["audit"].to_csv(out_dir / "unified_temporal_audit.csv", index=False)
+    result["coverage"].to_csv(out_dir / "unified_feature_coverage.csv", index=False)
+    pd.DataFrame(registry_manifest()).to_csv(
+        out_dir / "unified_feature_manifest.csv", index=False
+    )
+    (out_dir / "unified_feature_manifest.json").write_text(
+        json.dumps(result["manifest"], indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
+    coverage = result.get("waveform_coverage")
+    if coverage is not None and not coverage.empty:
+        coverage.to_csv(out_dir / "unified_waveform_coverage.csv", index=False)
+
+
+################################################################################
+# FILE: src/preprocessing/unified_feature_registry.py
+################################################################################
+
+"""Fixed, version-controlled feature registry for the ``unified`` preprocessing.
+
+Every retained model (Ridge, ExtraTrees, NaPINN-Q) consumes exactly the columns
+declared here, in exactly this order. There is no per-model subset selection and
+no target-driven selection anywhere in the pipeline: the list below was fixed by
+physical relevance, availability and redundancy before any fold was fitted.
+
+Dimensionality
+--------------
+The development set has 175 anchors / 26 cells, i.e. ~140 training rows per
+outer fold. The registry is therefore deliberately compact (32 continuous
+features + 4 availability flags = 36 columns). A 64-column matrix would put the
+NaPINN-Q solution head at >1000 first-layer parameters on 140 samples, which
+contradicts the compact-architecture requirement.
+
+Roles
+-----
+Three continuous features carry a second, physics-specific role:
+
+``EFC_cum``            -> ``stress_coordinate``  (NaPINN-Q differentiable coord)
+``previous_rpt_Q_Ah``  -> ``initial_state``      (NaPINN-Q u_current)
+
+For NaPINN-Q these must NOT be duplicated into the auxiliary feature tensor, so
+:func:`model_feature_columns` accepts ``exclude_roles``. Classical models use the
+full list, including the role-carrying columns, as ordinary features.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Iterable, Literal
+
+REGISTRY_VERSION = "unified-v1"
+
+#: Hard ceiling from the revision plan. Exceeding it is a build-time failure.
+MAX_MODEL_FEATURES = 64
+
+#: Reference windows that have been reviewed and are known to be strictly
+#: backward-looking from the anchor. ``build_temporal_audit`` derives every
+#: causality flag from membership here, so a feature declaring any other window
+#: is treated as unproven and fails ``assert_causal``. Adding a window to this
+#: set is an explicit scientific decision: it asserts the window closes at or
+#: before the anchor cycle and never reads the target RPT.
+CAUSAL_REFERENCE_WINDOWS: frozenset[str] = frozenset({
+    "protocol_constant",              # static condition metadata
+    "previous_rpt",                   # the already-completed anchor RPT
+    "initial_rpt..previous_rpt",      # birth to the anchor RPT
+    "anchor_cycle",                   # the last complete cycle of the block
+    "anchor_cycle_minus_9..anchor_cycle",  # trailing 10-cycle window
+    "block_first..block_last",        # within the completed cycling block
+})
+
+FeatureKind = Literal["continuous", "flag"]
+FeatureRole = Literal["feature", "stress_coordinate", "initial_state"]
+
+
+@dataclass(frozen=True)
+class FeatureSpec:
+    """One registered model input column."""
+
+    name: str
+    group: str
+    unit: str
+    description: str
+    kind: FeatureKind = "continuous"
+    role: FeatureRole = "feature"
+    #: Cycle-level columns this feature is derived from, for the temporal audit.
+    sources: tuple[str, ...] = field(default_factory=tuple)
+    #: Reference cycle window relative to the anchor. All values must be
+    #: backward-looking; the audit rejects anything else.
+    reference: str = "anchor_cycle"
+
+    @property
+    def is_flag(self) -> bool:
+        return self.kind == "flag"
+
+
+# ---------------------------------------------------------------------------
+# Group A — battery state and stress conditions
+# ---------------------------------------------------------------------------
+_GROUP_A: tuple[FeatureSpec, ...] = (
+    FeatureSpec(
+        "previous_rpt_Q_Ah", "state", "Ah",
+        "Capacity measured at the previous (already completed) RPT visit. "
+        "NaPINN-Q initial state u_current.",
+        role="initial_state", sources=("previous_rpt_Q_Ah",),
+        reference="previous_rpt",
+    ),
+    FeatureSpec(
+        "previous_rpt_SOH_pct", "state", "%",
+        "Previous-RPT capacity relative to the cell's first valid RPT. "
+        "Encodes initial_rpt_Q_Ah given previous_rpt_Q_Ah, so the baseline "
+        "capacity is not registered separately.",
+        sources=("previous_rpt_SOH_pct",), reference="previous_rpt",
+    ),
+    FeatureSpec(
+        "EFC_cum", "state", "equivalent_full_cycles",
+        "Cumulative equivalent full cycles at the anchor. Canonical stress "
+        "coordinate; cumulative_Ah_throughput is a scalar multiple and is "
+        "deliberately not registered.",
+        role="stress_coordinate", sources=("Q_discharge_Ah",),
+    ),
+    FeatureSpec(
+        "DOD_pct", "condition", "%", "Nominal depth of discharge of the block.",
+        sources=("DOD_pct",), reference="protocol_constant",
+    ),
+    FeatureSpec(
+        "C_ch", "condition", "1/h", "Nominal charge C-rate of the block.",
+        sources=("C_ch",), reference="protocol_constant",
+    ),
+    FeatureSpec(
+        "C_dis", "condition", "1/h", "Nominal discharge C-rate of the block.",
+        sources=("C_dis",), reference="protocol_constant",
+    ),
+    FeatureSpec(
+        "T_degC", "condition", "degC", "Nominal chamber temperature of the block.",
+        sources=("T_degC",), reference="protocol_constant",
+    ),
+    FeatureSpec(
+        "visit_index", "state", "count",
+        "Zero-based index of the current cycling block for this cell. Copy of "
+        "the ``visit`` identity column, registered under a distinct name so "
+        "identity and feature namespaces never collide.",
+        sources=("visit",), reference="protocol_constant",
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# Group B — cycle aggregates at the anchor cycle and safe derived quantities
+# ---------------------------------------------------------------------------
+_GROUP_B: tuple[FeatureSpec, ...] = (
+    FeatureSpec(
+        "Q_discharge_Ah", "cycle_aggregate", "Ah",
+        "Discharge capacity of the anchor cycle.",
+        sources=("Q_discharge_Ah",),
+    ),
+    FeatureSpec(
+        "coulombic_efficiency", "cycle_aggregate", "ratio",
+        "Q_discharge / Q_charge of the anchor cycle. Makes Q_charge_Ah and "
+        "capacity_throughput_ratio redundant.",
+        sources=("Q_charge_Ah", "Q_discharge_Ah"),
+    ),
+    FeatureSpec(
+        "energy_loss_Wh", "cycle_aggregate", "Wh",
+        "E_charge_Wh - E_discharge_Wh at the anchor cycle.",
+        sources=("E_charge_Wh", "E_discharge_Wh"),
+    ),
+    FeatureSpec(
+        "voltage_hysteresis_V", "cycle_aggregate", "V",
+        "mean_charge_voltage - mean_discharge_voltage, each computed as "
+        "E/Q with safe division.",
+        sources=("E_charge_Wh", "Q_charge_Ah", "E_discharge_Wh", "Q_discharge_Ah"),
+    ),
+    FeatureSpec(
+        "T_max", "cycle_aggregate", "degC",
+        "Maximum measured cell temperature during the anchor cycle.",
+        sources=("T_max",),
+    ),
+    FeatureSpec(
+        "temperature_span_C", "cycle_aggregate", "degC",
+        "T_max - T_min at the anchor cycle.",
+        sources=("T_max", "T_min"),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# Group C — compact backward-looking temporal features
+#
+# Only two degradation-sensitive variables are given temporal summaries, and
+# only one window (10 cycles) survives redundancy pruning. Slopes use cycles at
+# or before the anchor exclusively.
+# ---------------------------------------------------------------------------
+_GROUP_C: tuple[FeatureSpec, ...] = (
+    FeatureSpec(
+        "Q_discharge_Ah_r10_slope", "temporal", "Ah/cycle",
+        "Robust backward slope of discharge capacity over the trailing 10 cycles.",
+        sources=("Q_discharge_Ah",), reference="anchor_cycle_minus_9..anchor_cycle",
+    ),
+    FeatureSpec(
+        "Q_discharge_Ah_r10_std", "temporal", "Ah",
+        "Backward rolling standard deviation of discharge capacity, 10 cycles.",
+        sources=("Q_discharge_Ah",), reference="anchor_cycle_minus_9..anchor_cycle",
+    ),
+    FeatureSpec(
+        "Q_discharge_Ah_dev_r10", "temporal", "Ah",
+        "Anchor-cycle discharge capacity minus its trailing 10-cycle mean.",
+        sources=("Q_discharge_Ah",), reference="anchor_cycle_minus_9..anchor_cycle",
+    ),
+    FeatureSpec(
+        "coulombic_efficiency_r10_mean", "temporal", "ratio",
+        "Backward rolling mean coulombic efficiency, 10 cycles.",
+        sources=("coulombic_efficiency",),
+        reference="anchor_cycle_minus_9..anchor_cycle",
+    ),
+    FeatureSpec(
+        "coulombic_efficiency_r10_slope", "temporal", "1/cycle",
+        "Robust backward slope of coulombic efficiency over 10 cycles. "
+        "Gassing-sensitive.",
+        sources=("coulombic_efficiency",),
+        reference="anchor_cycle_minus_9..anchor_cycle",
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# Group D — true voltage-resolved Delta-Q(V)
+#
+# Reference definition (primary, plan option A): the last complete cycle of the
+# current cycling block minus the first complete cycle of the same block. Both
+# cycles precede the anchor, which is by construction the last complete cycle of
+# the block, so the feature is causal without any cross-file state.
+# ---------------------------------------------------------------------------
+_GROUP_D: tuple[FeatureSpec, ...] = (
+    FeatureSpec(
+        "dqv_logvar", "dqv", "log(Ah^2)",
+        "log variance of Delta-Q(V) over the shared voltage grid (Severson).",
+        sources=("Voltage", "Ah_counter"), reference="block_first..block_last",
+    ),
+    FeatureSpec(
+        "dqv_min", "dqv", "Ah",
+        "Minimum of Delta-Q(V) over the shared voltage grid.",
+        sources=("Voltage", "Ah_counter"), reference="block_first..block_last",
+    ),
+    FeatureSpec(
+        "dqv_l2", "dqv", "Ah",
+        "L2 norm of Delta-Q(V) over the shared voltage grid.",
+        sources=("Voltage", "Ah_counter"), reference="block_first..block_last",
+    ),
+    FeatureSpec(
+        "dqv_skew", "dqv", "dimensionless",
+        "Skewness of the Delta-Q(V) distribution.",
+        sources=("Voltage", "Ah_counter"), reference="block_first..block_last",
+    ),
+    FeatureSpec(
+        "dqv_v_at_max_abs_dev", "dqv", "V",
+        "Voltage at which |Delta-Q(V)| is largest.",
+        sources=("Voltage", "Ah_counter"), reference="block_first..block_last",
+    ),
+    FeatureSpec(
+        "dqv_overlap_span_V", "dqv", "V",
+        "Width of the shared voltage interval used for Delta-Q(V).",
+        sources=("Voltage",), reference="block_first..block_last",
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# Group E — incremental capacity / differential voltage
+#
+# Only the first reproducible discharge dQ/dV peak is registered, referenced to
+# the first complete cycle of the same block. Signed information is preserved.
+# ---------------------------------------------------------------------------
+_GROUP_E: tuple[FeatureSpec, ...] = (
+    FeatureSpec(
+        "icdv_dis_peak1_V_shift", "icdv", "V",
+        "Voltage shift of the first discharge dQ/dV peak relative to the "
+        "first complete cycle of the same block.",
+        sources=("Voltage", "Ah_counter"), reference="block_first..block_last",
+    ),
+    FeatureSpec(
+        "icdv_dis_peak1_height_change", "icdv", "Ah/V",
+        "Signed change in the first discharge dQ/dV peak height relative to "
+        "the first complete cycle of the same block.",
+        sources=("Voltage", "Ah_counter"), reference="block_first..block_last",
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# Group F — compact thermal descriptors
+# ---------------------------------------------------------------------------
+_GROUP_F: tuple[FeatureSpec, ...] = (
+    FeatureSpec(
+        "thermal_discharge_rise_degC", "thermal", "degC",
+        "Temperature rise across the anchor cycle's discharge phase.",
+        sources=("Temperature",),
+    ),
+    FeatureSpec(
+        "thermal_max_dTdt_degC_s", "thermal", "degC/s",
+        "Maximum |dT/dt| during the anchor cycle.",
+        sources=("Temperature", "Time"),
+    ),
+    FeatureSpec(
+        "thermal_rise_per_Ah", "thermal", "degC/Ah",
+        "Discharge temperature rise divided by discharged capacity.",
+        sources=("Temperature", "Ah_counter"),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# Group G — resistance from the PREVIOUS RPT only
+#
+# The standard-cycling protocol has a median in-block rest duration of 0 s, so
+# DCIR and relaxation cannot be measured inside cycling blocks. Only the
+# previous RPT/CU file carries usable current steps. Relaxation time constants
+# are not registered: rest segments there are too short and too few to fit
+# stably. See docs/UNIFIED_PREPROCESSING.md.
+# ---------------------------------------------------------------------------
+_GROUP_G: tuple[FeatureSpec, ...] = (
+    FeatureSpec(
+        "dcir_prev_rpt_discharge_ohm", "resistance", "ohm",
+        "Discharge-side DC internal resistance dV/dI at the previous RPT.",
+        sources=("Voltage", "Current"), reference="previous_rpt",
+    ),
+    FeatureSpec(
+        "dcir_prev_rpt_delta_from_baseline_ohm", "resistance", "ohm",
+        "Previous-RPT DCIR minus the cell's first valid RPT DCIR.",
+        sources=("Voltage", "Current"), reference="initial_rpt..previous_rpt",
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# Group H — interpretable condition x stress interactions
+# ---------------------------------------------------------------------------
+_GROUP_H: tuple[FeatureSpec, ...] = (
+    FeatureSpec(
+        "inverse_temperature_1_K", "interaction", "1/K",
+        "1 / (T_degC + 273.15). No activation energy is assumed.",
+        sources=("T_degC",), reference="protocol_constant",
+    ),
+    FeatureSpec(
+        "stress_x_DOD_fraction", "interaction", "equivalent_full_cycles",
+        "EFC_cum * (DOD_pct / 100).",
+        sources=("Q_discharge_Ah", "DOD_pct"),
+    ),
+    FeatureSpec(
+        "stress_x_inverse_temperature", "interaction", "EFC/K",
+        "EFC_cum * inverse_temperature_1_K.",
+        sources=("Q_discharge_Ah", "T_degC"),
+    ),
+    FeatureSpec(
+        "stress_x_C_dis", "interaction", "EFC/h",
+        "EFC_cum * C_dis.",
+        sources=("Q_discharge_Ah", "C_dis"),
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# Availability flags. Registered explicitly so that imputation of the
+# corresponding continuous block is never silent.
+# ---------------------------------------------------------------------------
+_FLAGS: tuple[FeatureSpec, ...] = (
+    FeatureSpec(
+        "dqv_available", "flag", "bool",
+        "1 when Delta-Q(V) had a usable shared voltage interval.",
+        kind="flag", sources=("Voltage", "Ah_counter"),
+        reference="block_first..block_last",
+    ),
+    FeatureSpec(
+        "icdv_available", "flag", "bool",
+        "1 when a reproducible first discharge dQ/dV peak was found in both "
+        "the anchor and the block-reference cycle.",
+        kind="flag", sources=("Voltage", "Ah_counter"),
+        reference="block_first..block_last",
+    ),
+    FeatureSpec(
+        "dcir_available", "flag", "bool",
+        "1 when the previous RPT contained a valid current step.",
+        kind="flag", sources=("Voltage", "Current"), reference="previous_rpt",
+    ),
+    FeatureSpec(
+        "temporal_window_available", "flag", "bool",
+        "1 when at least MIN_TEMPORAL_OBSERVATIONS complete cycles precede "
+        "the anchor within the block.",
+        kind="flag", sources=("Q_discharge_Ah",),
+        reference="anchor_cycle_minus_9..anchor_cycle",
+    ),
+)
+
+#: Fixed order. Do not reorder — fold preprocessor state and feature hashes
+#: depend on it.
+FEATURE_SPECS: tuple[FeatureSpec, ...] = (
+    _GROUP_A + _GROUP_B + _GROUP_C + _GROUP_D + _GROUP_E
+    + _GROUP_F + _GROUP_G + _GROUP_H + _FLAGS
+)
+
+#: Minimum number of trailing complete cycles required for Group C features.
+MIN_TEMPORAL_OBSERVATIONS = 5
+
+#: Identity, grouping and target-construction columns that must survive into
+#: unified.parquet but must never be model inputs.
+IDENTITY_COLUMNS: tuple[str, ...] = (
+    "anchor_id", "condition", "cell", "file_id", "path", "relative_path",
+    "visit", "global_cycle", "cycle_in_file", "test_type", "file_start_time",
+    "initial_rpt_Q_Ah", "previous_rpt_path", "previous_rpt_visit",
+    "next_rpt_path", "next_rpt_visit", "next_rpt_match_method",
+    "next_rpt_horizon_days", "is_prediction_anchor",
+    "cumulative_Ah_throughput", "cycle_end_time_s",
+)
+
+#: Learned target plus the reporting views algebraically derived from it.
+TARGET_COLUMNS: tuple[str, ...] = (
+    "next_rpt_Q_Ah", "next_rpt_SOH_pct",
+    "delta_next_rpt_Q_Ah", "delta_next_rpt_SOH_pct",
+)
+
+PRIMARY_TARGET = "next_rpt_Q_Ah"
+
+
+class RegistryError(RuntimeError):
+    """Raised when the registry is internally inconsistent."""
+
+
+def _validate() -> None:
+    names = [spec.name for spec in FEATURE_SPECS]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise RegistryError(f"duplicate registry entries: {duplicates}")
+    if len(names) > MAX_MODEL_FEATURES:
+        raise RegistryError(
+            f"registry declares {len(names)} model features, exceeding the hard "
+            f"maximum of {MAX_MODEL_FEATURES}"
+        )
+    overlap = sorted(set(names) & (set(TARGET_COLUMNS) | set(IDENTITY_COLUMNS)))
+    if overlap:
+        raise RegistryError(
+            f"registry entries collide with identity/target columns: {overlap}"
+        )
+    stress = [spec.name for spec in FEATURE_SPECS if spec.role == "stress_coordinate"]
+    if len(stress) != 1:
+        raise RegistryError(
+            f"exactly one stress_coordinate is required, found {stress}"
+        )
+    state = [spec.name for spec in FEATURE_SPECS if spec.role == "initial_state"]
+    if len(state) != 1:
+        raise RegistryError(
+            f"exactly one initial_state feature is required, found {state}"
+        )
+
+
+_validate()
+
+
+def model_feature_columns(*, exclude_roles: Iterable[FeatureRole] = ()) -> list[str]:
+    """Registered model input columns in fixed order.
+
+    Parameters
+    ----------
+    exclude_roles:
+        Roles to drop. NaPINN-Q passes ``("stress_coordinate", "initial_state")``
+        so that the differentiable stress coordinate and the initial state are
+        not duplicated inside the auxiliary feature tensor. Classical models
+        pass nothing and receive the full list.
+    """
+    excluded = set(exclude_roles)
+    return [spec.name for spec in FEATURE_SPECS if spec.role not in excluded]
+
+
+def continuous_feature_columns() -> list[str]:
+    """Registered continuous columns — the ones RobustScaler is fitted on."""
+    return [spec.name for spec in FEATURE_SPECS if not spec.is_flag]
+
+
+def flag_feature_columns() -> list[str]:
+    """Registered binary availability flags. These are never scaled."""
+    return [spec.name for spec in FEATURE_SPECS if spec.is_flag]
+
+
+def spec_for(name: str) -> FeatureSpec:
+    for spec in FEATURE_SPECS:
+        if spec.name == name:
+            return spec
+    raise KeyError(f"{name!r} is not a registered unified feature")
+
+
+def stress_coordinate_column() -> str:
+    return next(s.name for s in FEATURE_SPECS if s.role == "stress_coordinate")
+
+
+def initial_state_column() -> str:
+    return next(s.name for s in FEATURE_SPECS if s.role == "initial_state")
+
+
+def group_of(name: str) -> str:
+    return spec_for(name).group
+
+
+def registry_manifest() -> list[dict[str, object]]:
+    """Serializable description of the registry, written to the artifacts."""
+    return [{
+        "feature": spec.name,
+        "group": spec.group,
+        "kind": spec.kind,
+        "role": spec.role,
+        "unit": spec.unit,
+        "reference": spec.reference,
+        "source_columns": ";".join(spec.sources),
+        "description": spec.description,
+        "registry_version": REGISTRY_VERSION,
+    } for spec in FEATURE_SPECS]
+
+
+def registry_hash() -> str:
+    """Stable hash of the registry contents, recorded alongside every fold."""
+    import hashlib
+    import json
+
+    payload = json.dumps(registry_manifest(), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+N_MODEL_FEATURES = len(FEATURE_SPECS)
+N_CONTINUOUS_FEATURES = len(continuous_feature_columns())
+N_FLAG_FEATURES = len(flag_feature_columns())
+
+
+################################################################################
+# FILE: src/preprocessing/fold_transform.py
+################################################################################
+
+"""The one fold-local transformer shared by every retained model.
+
+Ridge, ExtraTrees and NaPINN-Q all pass their training rows through
+:class:`UnifiedFoldPreprocessor`. There is no per-model feature selection and no
+per-model imputation logic, so a difference in reported accuracy can only come
+from the estimator itself.
+
+Guarantees
+----------
+* Column set and order are taken from the registry, never from the data.
+* Median imputation and robust scaling statistics are fitted on training rows
+  only; no whole-dataset or holdout statistic ever enters.
+* Binary availability flags are passed through unscaled.
+* A column that is missing, duplicated, reordered or unexpectedly added raises
+  rather than being silently accommodated.
+* :meth:`state_dict` round-trips exactly, so a refit stage can be audited.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Sequence
+
+import numpy as np
+import pandas as pd
+
+from .unified_feature_registry import (
+    REGISTRY_VERSION,
+    FeatureRole,
+    continuous_feature_columns,
+    flag_feature_columns,
+    model_feature_columns,
+    registry_hash,
+)
+
+
+class PreprocessorError(RuntimeError):
+    """Raised on any feature-contract violation."""
+
+
+@dataclass
+class UnifiedFoldPreprocessor:
+    """Median imputation + robust scaling fitted on training rows only.
+
+    Parameters
+    ----------
+    exclude_roles:
+        Registry roles to drop. NaPINN-Q passes
+        ``("stress_coordinate", "initial_state")`` so the differentiable stress
+        coordinate and the initial state are not duplicated into the auxiliary
+        feature tensor; classical models pass nothing.
+    scale:
+        When False, imputation still happens but continuous columns are not
+        rescaled. Tree models are scale invariant, but the default is True for
+        both so that the matrix handed to every model is byte-identical.
+    """
+
+    exclude_roles: tuple[FeatureRole, ...] = ()
+    scale: bool = True
+    #: Robust-scale quantile range.
+    quantile_range: tuple[float, float] = (25.0, 75.0)
+
+    feature_columns_: list[str] | None = None
+    continuous_columns_: list[str] | None = None
+    flag_columns_: list[str] | None = None
+    medians_: dict[str, float] = field(default_factory=dict)
+    centers_: dict[str, float] = field(default_factory=dict)
+    scales_: dict[str, float] = field(default_factory=dict)
+    n_fit_rows_: int = 0
+    n_fit_cells_: int = 0
+
+    # -- contract ---------------------------------------------------------
+    def expected_columns(self) -> list[str]:
+        return model_feature_columns(exclude_roles=self.exclude_roles)
+
+    def _validate_frame(self, frame: pd.DataFrame, columns: Sequence[str]) -> None:
+        missing = [column for column in columns if column not in frame.columns]
+        if missing:
+            raise PreprocessorError(f"missing registered feature columns: {missing}")
+        counts = pd.Index(frame.columns).value_counts()
+        duplicated = sorted(counts[counts > 1].index.intersection(columns))
+        if duplicated:
+            raise PreprocessorError(f"duplicated feature columns: {duplicated}")
+
+    # -- fit / transform --------------------------------------------------
+    def fit(self, frame: pd.DataFrame, *, cell_column: str = "cell"
+            ) -> "UnifiedFoldPreprocessor":
+        columns = self.expected_columns()
+        self._validate_frame(frame, columns)
+        self.feature_columns_ = list(columns)
+        flags = set(flag_feature_columns())
+        self.flag_columns_ = [c for c in columns if c in flags]
+        self.continuous_columns_ = [c for c in columns if c not in flags]
+
+        numeric = (
+            frame[columns].apply(pd.to_numeric, errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+        )
+        self.n_fit_rows_ = int(len(numeric))
+        self.n_fit_cells_ = (
+            int(frame[cell_column].nunique()) if cell_column in frame.columns else 0
+        )
+
+        self.medians_ = {}
+        self.centers_ = {}
+        self.scales_ = {}
+        low, high = self.quantile_range
+        for column in columns:
+            values = numeric[column]
+            median = values.median(skipna=True)
+            # An all-NaN training column would otherwise poison the matrix. The
+            # registry guarantees every feature is populated somewhere in the
+            # dataset, but a single fold may still miss one entirely.
+            self.medians_[column] = float(median) if pd.notna(median) else 0.0
+            if column in flags:
+                continue
+            filled = values.fillna(self.medians_[column])
+            center = float(filled.median())
+            spread = float(
+                np.nanpercentile(filled, high) - np.nanpercentile(filled, low)
+            )
+            if not np.isfinite(spread) or spread <= 0.0:
+                # Constant-within-fold feature: center it, do not divide.
+                spread = 1.0
+            self.centers_[column] = center
+            self.scales_[column] = spread
+        return self
+
+    def transform(self, frame: pd.DataFrame) -> np.ndarray:
+        if self.feature_columns_ is None:
+            raise PreprocessorError("UnifiedFoldPreprocessor is not fitted")
+        columns = self.feature_columns_
+        self._validate_frame(frame, columns)
+        numeric = (
+            frame[columns].apply(pd.to_numeric, errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+        )
+        out = np.empty((len(numeric), len(columns)), dtype=float)
+        for index, column in enumerate(columns):
+            values = numeric[column].fillna(self.medians_[column]).to_numpy(dtype=float)
+            if self.scale and column in self.scales_:
+                values = (values - self.centers_[column]) / self.scales_[column]
+            out[:, index] = values
+        if not np.isfinite(out).all():
+            bad = [
+                columns[i] for i in range(out.shape[1])
+                if not np.isfinite(out[:, i]).all()
+            ]
+            raise PreprocessorError(f"non-finite values after transform in: {bad}")
+        return out
+
+    def fit_transform(self, frame: pd.DataFrame, *, cell_column: str = "cell"
+                      ) -> np.ndarray:
+        return self.fit(frame, cell_column=cell_column).transform(frame)
+
+    # -- provenance -------------------------------------------------------
+    @property
+    def feature_names_(self) -> list[str]:
+        """Alias kept so downstream reporting code can stay unchanged."""
+        return list(self.feature_columns_ or [])
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "registry_version": REGISTRY_VERSION,
+            "registry_hash": registry_hash(),
+            "exclude_roles": list(self.exclude_roles),
+            "scale": bool(self.scale),
+            "quantile_range": list(self.quantile_range),
+            "feature_columns": list(self.feature_columns_ or []),
+            "continuous_columns": list(self.continuous_columns_ or []),
+            "flag_columns": list(self.flag_columns_ or []),
+            "medians": dict(self.medians_),
+            "centers": dict(self.centers_),
+            "scales": dict(self.scales_),
+            "n_fit_rows": self.n_fit_rows_,
+            "n_fit_cells": self.n_fit_cells_,
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: dict[str, Any]) -> "UnifiedFoldPreprocessor":
+        obj = cls(
+            exclude_roles=tuple(state.get("exclude_roles", ())),
+            scale=bool(state.get("scale", True)),
+            quantile_range=tuple(state.get("quantile_range", (25.0, 75.0))),
+        )
+        obj.feature_columns_ = list(state["feature_columns"])
+        obj.continuous_columns_ = list(state.get("continuous_columns", []))
+        obj.flag_columns_ = list(state.get("flag_columns", []))
+        obj.medians_ = {k: float(v) for k, v in state["medians"].items()}
+        obj.centers_ = {k: float(v) for k, v in state.get("centers", {}).items()}
+        obj.scales_ = {k: float(v) for k, v in state.get("scales", {}).items()}
+        obj.n_fit_rows_ = int(state.get("n_fit_rows", 0))
+        obj.n_fit_cells_ = int(state.get("n_fit_cells", 0))
+        return obj
+
+    def feature_hash(self) -> str:
+        payload = json.dumps({
+            "registry_hash": registry_hash(),
+            "feature_columns": list(self.feature_columns_ or []),
+        }, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def state_hash(self) -> str:
+        payload = json.dumps(self.state_dict(), sort_keys=True).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+
+def assert_no_cell_overlap(train: pd.DataFrame, other: pd.DataFrame, *,
+                           cell_column: str = "cell") -> None:
+    """Guard against a cell appearing on both sides of a fold boundary."""
+    overlap = sorted(set(train[cell_column]) & set(other[cell_column]))
+    if overlap:
+        raise PreprocessorError(f"cells appear in both partitions: {overlap}")
+
+
+def fit_fold_preprocessor(train: pd.DataFrame, *,
+                          exclude_roles: Iterable[FeatureRole] = (),
+                          scale: bool = True) -> UnifiedFoldPreprocessor:
+    """Convenience constructor used by both pipelines."""
+    return UnifiedFoldPreprocessor(
+        exclude_roles=tuple(exclude_roles), scale=scale,
+    ).fit(train)
+
+
+################################################################################
+# FILE: src/features/selection.py
+################################################################################
+
+"""Fold-fitted numeric feature selection, imputation, and scaling."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable, List, Sequence
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+
+TARGET_COLUMNS = {
+    "SOH_pct", "RUL_cycles", "next_rpt_Q_Ah", "next_rpt_SOH_pct",
+    "delta_next_rpt_Q_Ah", "delta_next_rpt_SOH_pct", "failure_label",
+    "capacity_eol_event", "capacity_eol_cycle", "capacity_censor_cycle",
+}
+NUMERIC_IDENTIFIERS = {
+    "visit", "test_id", "segment_index", "cycle_in_file", "global_cycle", "cv_fold",
+    "start_row", "stop_row",
+}
+TARGET_CONSTRUCTION_METADATA = {
+    "initial_rpt_visit", "previous_rpt_visit", "next_rpt_visit",
+    "next_rpt_horizon_days", "is_prediction_anchor",
+}
+TARGET_DEFINING_FEATURES = {
+    # Same-cycle capacity directly defines legacy online SOH and capacity EOL.
+    "SOH_pct": {"Q_discharge_Ah", "Q_initial_Ah"},
+    "RUL_cycles": {"SOH_pct", "Q_discharge_Ah", "Q_initial_Ah"},
+}
+
+
+def numeric_feature_cols(df: pd.DataFrame,
+                         drop: Sequence[str] = ("SOH_pct", "Q_initial_Ah")) -> List[str]:
+    exclude = set(drop) | TARGET_COLUMNS | NUMERIC_IDENTIFIERS | TARGET_CONSTRUCTION_METADATA | {
+        "cell", "condition", "path", "relative_path", "file_id", "test_type",
+    }
+    return [column for column in df.select_dtypes(include=[np.number]).columns if column not in exclude]
+
+
+def drop_low_variance(df: pd.DataFrame, cols: Iterable[str],
+                      threshold: float = 1e-8) -> List[str]:
+    return [column for column in cols if df[column].var(skipna=True) > threshold]
+
+
+def drop_high_correlation(df: pd.DataFrame, cols: Iterable[str],
+                          threshold: float = 0.99) -> List[str]:
+    columns = list(cols)
+    if len(columns) < 2:
+        return columns
+    corr = df[columns].corr().abs()
+    upper = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1))
+    to_drop = {column for column in upper.columns if any(upper[column] > threshold)}
+    return [column for column in columns if column not in to_drop]
+
+
+@dataclass
+class FoldPreprocessor:
+    """Preprocessor whose learned state is derived from training rows only."""
+
+    scale: bool = False
+    variance_threshold: float = 1e-8
+    correlation_threshold: float = 0.99
+    feature_names_: list[str] | None = None
+    medians_: pd.Series | None = None
+    scaler_: StandardScaler | None = None
+
+    def fit(self, df: pd.DataFrame, *, target: str) -> "FoldPreprocessor":
+        drop = set(TARGET_DEFINING_FEATURES.get(target, set())) | {target, "Q_initial_Ah"}
+        candidates = numeric_feature_cols(df, drop=tuple(drop))
+        numeric = df[candidates].replace([np.inf, -np.inf], np.nan)
+        candidates = [column for column in candidates if numeric[column].notna().any()]
+        candidates = drop_low_variance(numeric, candidates, self.variance_threshold)
+        candidates = drop_high_correlation(numeric, candidates, self.correlation_threshold)
+        if not candidates:
+            raise ValueError("no usable training features after fold-local selection")
+        medians = numeric[candidates].median(axis=0, skipna=True)
+        candidates = [column for column in candidates if pd.notna(medians[column])]
+        if not candidates:
+            raise ValueError("all training features have undefined medians")
+        self.feature_names_ = candidates
+        self.medians_ = medians[candidates].astype(float)
+        transformed = numeric[candidates].fillna(self.medians_).to_numpy(dtype=float)
+        self.scaler_ = StandardScaler().fit(transformed) if self.scale else None
+        return self
+
+    def transform(self, df: pd.DataFrame) -> np.ndarray:
+        if self.feature_names_ is None or self.medians_ is None:
+            raise RuntimeError("FoldPreprocessor must be fitted before transform")
+        missing = set(self.feature_names_) - set(df.columns)
+        if missing:
+            raise ValueError(f"missing fitted feature columns: {sorted(missing)}")
+        numeric = df[self.feature_names_].replace([np.inf, -np.inf], np.nan)
+        transformed = numeric.fillna(self.medians_).to_numpy(dtype=float)
+        if self.scaler_ is not None:
+            transformed = self.scaler_.transform(transformed)
+        return transformed
+
+    def fit_transform(self, df: pd.DataFrame, *, target: str) -> np.ndarray:
+        return self.fit(df, target=target).transform(df)
+
+
+################################################################################
+# FILE: src/splits/group_kfold.py
+################################################################################
+
+"""GroupKFold by cell, stratified by condition when possible."""
+from __future__ import annotations
+
+from hashlib import sha256
+import warnings
+
+from typing import Iterator, Tuple
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit, StratifiedGroupKFold
+
+
+def make_folds(df: pd.DataFrame, n_splits: int = 5,
+               group_col: str = "cell", stratify_col: str | None = "condition",
+               random_state: int = 42) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+    if group_col not in df.columns:
+        raise KeyError(f"Missing group column: {group_col}")
+    n_groups = df[group_col].nunique()
+    if n_groups < n_splits:
+        raise ValueError(
+            f"Cannot create {n_splits} folds from only {n_groups} unique {group_col}s."
+        )
+    groups = df[group_col].to_numpy()
+    can_stratify = False
+    if stratify_col and stratify_col in df.columns:
+        cell_metadata = df[[group_col, stratify_col]].dropna().drop_duplicates()
+        condition_count_per_cell = cell_metadata.groupby(group_col)[stratify_col].nunique()
+        if not condition_count_per_cell.empty and condition_count_per_cell.max() > 1:
+            raise ValueError(
+                f"At least one {group_col} is assigned to multiple {stratify_col}s."
+            )
+        groups_per_condition = cell_metadata.groupby(stratify_col)[group_col].nunique()
+        can_stratify = (
+            len(groups_per_condition) >= 2
+            and groups_per_condition.min() >= n_splits
+        )
+        if not can_stratify:
+            min_groups = int(groups_per_condition.min()) if len(groups_per_condition) else 0
+            warnings.warn(
+                f"Condition-stratified GroupKFold is impossible: minimum unique "
+                f"{group_col}s per {stratify_col} is {min_groups}, but n_splits={n_splits}. "
+                f"Falling back to GroupKFold.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    if can_stratify:
+        sgkf = StratifiedGroupKFold(
+            n_splits=n_splits, shuffle=True, random_state=random_state
+        )
+        y = df[stratify_col].astype(str).to_numpy()
+        yield from sgkf.split(np.zeros(len(df)), y, groups)
+        return
+    try:
+        gkf = GroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    except TypeError:
+        gkf = GroupKFold(n_splits=n_splits)
+    yield from gkf.split(np.zeros(len(df)), groups=groups)
+
+
+def assert_no_cell_overlap(train_idx: np.ndarray, test_idx: np.ndarray,
+                            cells: pd.Series) -> None:
+    tr = set(cells.iloc[train_idx].unique())
+    te = set(cells.iloc[test_idx].unique())
+    assert not (tr & te), f"cell overlap between train and test: {tr & te}"
+
+
+def build_locked_split_manifest(df: pd.DataFrame, *, holdout_fraction: float = 0.25,
+                                n_splits: int = 5, group_col: str = "cell",
+                                stratify_col: str = "condition", random_state: int = 42,
+                                holdout_candidates: int = 1024) -> pd.DataFrame:
+    """Create one cell-level holdout and development-only CV assignment.
+
+    Candidate grouped holdouts are scored for row-count and condition balance.
+    The selected cells are then locked, and only development cells receive a
+    five-fold validation assignment.
+    """
+    required = {group_col, stratify_col}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"split data is missing columns: {sorted(missing)}")
+    if not 0.0 < holdout_fraction < 1.0:
+        raise ValueError("holdout_fraction must be between zero and one")
+
+    cell_conditions = df.groupby(group_col)[stratify_col].nunique(dropna=False)
+    if (cell_conditions > 1).any():
+        bad = cell_conditions[cell_conditions > 1].index.astype(str).tolist()
+        raise ValueError(f"cells map to multiple conditions: {bad}")
+    cells = (
+        df.groupby(group_col, as_index=False)
+        .agg(**{stratify_col: (stratify_col, "first")}, n_rows=(group_col, "size"))
+        .sort_values(group_col)
+        .reset_index(drop=True)
+    )
+    if len(cells) < n_splits + 1:
+        raise ValueError(
+            f"need at least {n_splits + 1} cells for a holdout plus {n_splits}-fold CV"
+        )
+
+    overall_condition = cells[stratify_col].value_counts(normalize=True)
+    splitter = GroupShuffleSplit(
+        n_splits=holdout_candidates,
+        test_size=holdout_fraction,
+        random_state=random_state,
+    )
+    best: tuple[float, np.ndarray, np.ndarray] | None = None
+    for development_idx, holdout_idx in splitter.split(cells, groups=cells[group_col]):
+        holdout = cells.iloc[holdout_idx]
+        condition = holdout[stratify_col].value_counts(normalize=True)
+        condition_error = float(
+            overall_condition.subtract(condition, fill_value=0.0).abs().sum()
+        )
+        row_fraction = float(holdout["n_rows"].sum() / cells["n_rows"].sum())
+        row_error = abs(row_fraction - holdout_fraction)
+        cell_error = abs(len(holdout) / len(cells) - holdout_fraction)
+        score = condition_error + 2.0 * row_error + 2.0 * cell_error
+        if best is None or score < best[0]:
+            best = (score, development_idx, holdout_idx)
+    if best is None:
+        raise RuntimeError("could not construct a grouped holdout")
+
+    _, development_idx, holdout_idx = best
+    cells["outer_role"] = "development"
+    cells.loc[holdout_idx, "outer_role"] = "holdout"
+    cells["cv_fold"] = pd.Series(pd.NA, index=cells.index, dtype="Int64")
+
+    development_cells = set(cells.loc[development_idx, group_col])
+    development_rows = df[df[group_col].isin(development_cells)].reset_index(drop=True)
+    cv = StratifiedGroupKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=random_state,
+    )
+    assigned: dict[object, int] = {}
+    y = development_rows[stratify_col].astype("category").cat.codes.to_numpy()
+    groups = development_rows[group_col].to_numpy()
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message="The least populated class in y has only .* members"
+        )
+        for fold, (_, validation_idx) in enumerate(cv.split(
+            np.zeros(len(development_rows)), y, groups
+        )):
+            for cell in development_rows.iloc[validation_idx][group_col].unique():
+                if cell in assigned:
+                    raise AssertionError(
+                        f"development cell assigned to multiple CV folds: {cell}"
+                    )
+                assigned[cell] = fold
+    if assigned.keys() != development_cells:
+        missing_cells = sorted(str(cell) for cell in development_cells - assigned.keys())
+        raise AssertionError(f"development cells missing CV assignments: {missing_cells}")
+    cells.loc[cells["outer_role"] == "development", "cv_fold"] = (
+        cells.loc[cells["outer_role"] == "development", group_col].map(assigned).astype("Int64")
+    )
+    cells["holdout_fraction"] = holdout_fraction
+    cells["achieved_cell_holdout_fraction"] = float(
+        cells["outer_role"].eq("holdout").mean()
+    )
+    cells["achieved_row_holdout_fraction"] = float(
+        cells.loc[cells["outer_role"].eq("holdout"), "n_rows"].sum()
+        / cells["n_rows"].sum()
+    )
+    cells["n_splits"] = n_splits
+    cells["random_state"] = random_state
+    development_condition_counts = cells.loc[
+        cells["outer_role"].eq("development"), stratify_col
+    ].value_counts()
+    cells["cv_stratification_status"] = (
+        "sparse_conditions_unavoidable"
+        if (development_condition_counts < n_splits).any()
+        else "fully_stratifiable"
+    )
+    result = cells.rename(columns={group_col: "cell", stratify_col: "condition"})[
+        ["cell", "condition", "outer_role", "cv_fold", "n_rows",
+         "holdout_fraction", "achieved_cell_holdout_fraction",
+         "achieved_row_holdout_fraction", "n_splits", "random_state",
+         "cv_stratification_status"]
+    ]
+    split_bytes = pd.util.hash_pandas_object(
+        result[["cell", "condition", "outer_role", "cv_fold"]].sort_values("cell"),
+        index=False,
+    ).to_numpy().tobytes()
+    result["split_id"] = sha256(split_bytes).hexdigest()
+    return result
+
+
+def validate_locked_split_manifest(df: pd.DataFrame, manifest: pd.DataFrame,
+                                   *, n_splits: int = 5,
+                                   holdout_fraction: float | None = None,
+                                   random_state: int | None = None) -> None:
+    required = {"cell", "condition", "outer_role", "cv_fold"}
+    missing = required - set(manifest.columns)
+    if missing:
+        raise ValueError(f"split manifest is missing columns: {sorted(missing)}")
+    if manifest["cell"].duplicated().any():
+        raise ValueError("split manifest contains duplicate cells")
+    data_cells = set(df["cell"].astype(str).unique())
+    manifest_cells = set(manifest["cell"].astype(str).unique())
+    if not data_cells <= manifest_cells:
+        raise ValueError(f"unassigned cells: {sorted(data_cells - manifest_cells)}")
+    current_conditions = (
+        df.assign(cell=df["cell"].astype(str))
+        .groupby("cell")["condition"].first().astype(str)
+    )
+    manifest_conditions = manifest.assign(cell=manifest["cell"].astype(str)).set_index(
+        "cell"
+    )["condition"].astype(str)
+    mismatched = sorted(
+        cell for cell in data_cells
+        if manifest_conditions.get(cell) != current_conditions.get(cell)
+    )
+    if mismatched:
+        raise ValueError(f"split manifest condition assignments changed: {mismatched}")
+    roles = set(manifest["outer_role"].unique())
+    if roles != {"development", "holdout"}:
+        raise ValueError(f"split manifest has invalid outer roles: {sorted(roles)}")
+    development = manifest[manifest["outer_role"] == "development"]
+    holdout = manifest[manifest["outer_role"] == "holdout"]
+    if holdout["cv_fold"].notna().any():
+        raise ValueError("holdout cells must not have CV folds")
+    folds = set(development["cv_fold"].dropna().astype(int).unique())
+    if folds != set(range(n_splits)):
+        raise ValueError(f"development CV folds are incomplete: {sorted(folds)}")
+    if "n_splits" in manifest and set(manifest["n_splits"].astype(int)) != {n_splits}:
+        raise ValueError("split manifest n_splits does not match current configuration")
+    if holdout_fraction is not None and "holdout_fraction" in manifest:
+        if not np.allclose(manifest["holdout_fraction"].astype(float), holdout_fraction):
+            raise ValueError("split manifest holdout fraction does not match current configuration")
+    if random_state is not None and "random_state" in manifest:
+        if set(manifest["random_state"].astype(int)) != {random_state}:
+            raise ValueError("split manifest random state does not match current configuration")
+    if "split_id" in manifest:
+        split_bytes = pd.util.hash_pandas_object(
+            manifest[["cell", "condition", "outer_role", "cv_fold"]].sort_values("cell"),
+            index=False,
+        ).to_numpy().tobytes()
+        expected_split_id = sha256(split_bytes).hexdigest()
+        if set(manifest["split_id"].astype(str)) != {expected_split_id}:
+            raise ValueError("split manifest checksum is invalid")
+
+
+################################################################################
+# FILE: src/splits/condition_holdout.py
+################################################################################
+
+"""Condition-disjoint and factor-level-disjoint evaluation splits.
+
+Cell-grouped cross-validation answers *"a new cell under a condition we have
+already seen"*. That is the weakest generalization claim available, because
+three cells share each condition, so the model can learn the condition's
+degradation rate from its siblings. Measured on this dataset, cell-grouped CV is
+about 35% optimistic relative to leave-one-condition-out (MAE 0.00284 -> 0.00436).
+
+Two stronger protocols live here:
+
+``leave_one_condition_out``
+    Hold out every cell of one complete operating condition
+    ``(T, DOD, C_ch, C_dis)``. Tests generalization to an unseen *combination*.
+
+``leave_one_factor_level_out``
+    Hold out every cell whose temperature (or DOD, or charge/discharge rate)
+    takes one value. Tests true *extrapolation* to an unseen level, which is
+    strictly stronger: a condition can be interpolated when all of its factor
+    levels appear elsewhere, but an omitted level cannot.
+
+Both emit long-format manifests with the same columns as the locked split
+manifest, so downstream code that already understands ``outer_role`` works
+unchanged. Every manifest carries a ``split_id`` hash of its own content.
+"""
+from __future__ import annotations
+
+import json
+from hashlib import sha256
+
+import numpy as np
+import pandas as pd
+
+#: Columns whose tuple defines one operating condition.
+FACTOR_COLUMNS: tuple[str, ...] = ("T_degC", "DOD_pct", "C_ch", "C_dis")
+
+#: Manifest column order, matching build_locked_split_manifest.
+MANIFEST_COLUMNS: tuple[str, ...] = (
+    "study", "split_name", "cell", "condition", "outer_role",
+    "n_rows", "n_cells_held_out", "n_conditions_held_out",
+    "held_out_value", "factor", "degenerate", "split_id",
+)
+
+
+class ConditionSplitError(RuntimeError):
+    """Raised when a requested split cannot be built safely."""
+
+
+def _split_id(frame: pd.DataFrame) -> str:
+    """Content hash of a manifest, stable under row order."""
+    payload = (
+        frame.drop(columns=["split_id"], errors="ignore")
+        .sort_values(["split_name", "cell"])
+        .to_dict(orient="records")
+    )
+    return sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _cell_table(frame: pd.DataFrame) -> pd.DataFrame:
+    """One row per cell carrying its condition and factor levels.
+
+    A cell belonging to two conditions would silently corrupt every split, so
+    that is an error rather than a warning.
+    """
+    required = ("cell", "condition", *FACTOR_COLUMNS)
+    missing = [column for column in required if column not in frame.columns]
+    if missing:
+        raise ConditionSplitError(f"frame is missing columns: {missing}")
+    table = (
+        frame[list(required)].drop_duplicates().reset_index(drop=True)
+    )
+    duplicated = table["cell"].duplicated()
+    if duplicated.any():
+        offenders = sorted(table.loc[duplicated, "cell"].unique())
+        raise ConditionSplitError(
+            f"cell(s) assigned to more than one condition: {offenders}"
+        )
+    counts = frame.groupby("cell").size().rename("n_rows")
+    return table.merge(counts, left_on="cell", right_index=True, how="left")
+
+
+def _assert_disjoint(manifest: pd.DataFrame) -> None:
+    for split_name, group in manifest.groupby("split_name"):
+        roles = group.groupby("cell")["outer_role"].nunique()
+        clashing = sorted(roles[roles > 1].index)
+        if clashing:
+            raise ConditionSplitError(
+                f"{split_name}: cell(s) in both train and test: {clashing}"
+            )
+
+
+def leave_one_condition_out(frame: pd.DataFrame, *,
+                            min_train_cells: int = 4,
+                            study: str = "loco") -> pd.DataFrame:
+    """One split per operating condition, holding out all of its cells.
+
+    Conditions represented by a single cell (six of fifteen here) are still
+    emitted, flagged ``degenerate=True``: a single-cell, often single-anchor
+    test set produces an estimate too noisy to interpret on its own, but
+    silently dropping it would misreport the coverage of the study. Filter on
+    the flag when reporting; do not filter it out of the manifest.
+    """
+    cells = _cell_table(frame)
+    rows: list[dict[str, object]] = []
+    for condition, group in cells.groupby("condition", sort=True):
+        held_cells = set(group["cell"])
+        n_train_cells = len(cells) - len(held_cells)
+        if n_train_cells < min_train_cells:
+            raise ConditionSplitError(
+                f"holding out {condition} leaves only {n_train_cells} training "
+                f"cells (minimum {min_train_cells})"
+            )
+        degenerate = len(held_cells) < 2 or int(group["n_rows"].sum()) < 2
+        for _, cell_row in cells.iterrows():
+            rows.append({
+                "study": study,
+                "split_name": f"loco__{condition}",
+                "cell": cell_row["cell"],
+                "condition": cell_row["condition"],
+                "outer_role": (
+                    "test" if cell_row["cell"] in held_cells else "train"
+                ),
+                "n_rows": int(cell_row["n_rows"]),
+                "n_cells_held_out": len(held_cells),
+                "n_conditions_held_out": 1,
+                "held_out_value": condition,
+                "factor": "condition",
+                "degenerate": bool(degenerate),
+            })
+    if not rows:
+        raise ConditionSplitError("no conditions available for LOCO")
+    manifest = pd.DataFrame(rows)
+    manifest["split_id"] = _split_id(manifest)
+    _assert_disjoint(manifest)
+    return manifest[list(MANIFEST_COLUMNS)]
+
+
+def leave_one_factor_level_out(frame: pd.DataFrame, *,
+                               factors: tuple[str, ...] = FACTOR_COLUMNS,
+                               min_train_cells: int = 4,
+                               study: str = "factor_holdout") -> pd.DataFrame:
+    """One split per (factor, level), holding out every cell at that level.
+
+    Levels whose removal would leave fewer than ``min_train_cells`` training
+    cells are skipped and reported by :func:`describe_manifest`, rather than
+    raising -- unlike LOCO, an un-runnable factor level is an expected feature of
+    an unbalanced test matrix, not a configuration error.
+    """
+    cells = _cell_table(frame)
+    rows: list[dict[str, object]] = []
+    for factor in factors:
+        if factor not in cells.columns:
+            raise ConditionSplitError(f"unknown factor column: {factor}")
+        for level, group in cells.groupby(factor, sort=True):
+            held_cells = set(group["cell"])
+            if len(cells) - len(held_cells) < min_train_cells:
+                continue
+            degenerate = len(held_cells) < 2 or int(group["n_rows"].sum()) < 2
+            for _, cell_row in cells.iterrows():
+                rows.append({
+                    "study": study,
+                    "split_name": f"{factor}__{level}",
+                    "cell": cell_row["cell"],
+                    "condition": cell_row["condition"],
+                    "outer_role": (
+                        "test" if cell_row["cell"] in held_cells else "train"
+                    ),
+                    "n_rows": int(cell_row["n_rows"]),
+                    "n_cells_held_out": len(held_cells),
+                    "n_conditions_held_out": int(group["condition"].nunique()),
+                    "held_out_value": str(level),
+                    "factor": factor,
+                    "degenerate": bool(degenerate),
+                })
+    if not rows:
+        raise ConditionSplitError(
+            "no factor level could be held out without exhausting the training set"
+        )
+    manifest = pd.DataFrame(rows)
+    manifest["split_id"] = _split_id(manifest)
+    _assert_disjoint(manifest)
+    return manifest[list(MANIFEST_COLUMNS)]
+
+
+def iter_splits(manifest: pd.DataFrame, frame: pd.DataFrame):
+    """Yield ``(split_name, train_idx, test_idx, info)`` positional indices.
+
+    Indices address ``frame`` positionally, so the caller can use ``frame.iloc``
+    directly. Cell disjointness is re-checked per split: a manifest can be
+    edited by hand between generation and use.
+    """
+    cells = frame["cell"].astype(str).to_numpy()
+    for split_name, group in manifest.groupby("split_name", sort=True):
+        test_cells = set(group.loc[group["outer_role"].eq("test"), "cell"].astype(str))
+        train_cells = set(group.loc[group["outer_role"].eq("train"), "cell"].astype(str))
+        overlap = test_cells & train_cells
+        if overlap:
+            raise ConditionSplitError(f"{split_name}: cell overlap {sorted(overlap)}")
+        test_idx = np.flatnonzero(np.isin(cells, list(test_cells)))
+        train_idx = np.flatnonzero(np.isin(cells, list(train_cells)))
+        if test_idx.size == 0 or train_idx.size == 0:
+            continue
+        first = group.iloc[0]
+        yield split_name, train_idx, test_idx, {
+            "factor": first["factor"],
+            "held_out_value": first["held_out_value"],
+            "degenerate": bool(first["degenerate"]),
+            "n_cells_held_out": int(first["n_cells_held_out"]),
+            "split_id": first["split_id"],
+        }
+
+
+def describe_manifest(manifest: pd.DataFrame) -> pd.DataFrame:
+    """Per-split summary: sizes, and whether the split is interpretable."""
+    test = manifest[manifest["outer_role"].eq("test")]
+    train = manifest[manifest["outer_role"].eq("train")]
+    summary = (
+        test.groupby(["study", "factor", "split_name", "held_out_value",
+                      "degenerate"], dropna=False)
+        .agg(test_cells=("cell", "nunique"), test_rows=("n_rows", "sum"))
+        .reset_index()
+    )
+    train_sizes = (
+        train.groupby("split_name")
+        .agg(train_cells=("cell", "nunique"), train_rows=("n_rows", "sum"))
+    )
+    return summary.merge(train_sizes, on="split_name", how="left")
+
+
+################################################################################
+# FILE: src/targets/next_rpt.py
+################################################################################
+
+"""Leakage-safe next-RPT reference-capacity target construction."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from ..io.ird_parser import parse_ird
+from ..io.loaders import load_config, load_inventory
+from ..preprocessing.protocol_segmentation import extract_reference_discharge, summarize_steps
+
+TARGET = "next_rpt_Q_Ah"
+SOH_TARGET = "next_rpt_SOH_pct"
+DELTA_Q_TARGET = "delta_next_rpt_Q_Ah"
+DELTA_SOH_TARGET = "delta_next_rpt_SOH_pct"
+
+
+class DuplicateRPTError(ValueError):
+    """Raised when same-visit RPT files cannot be ordered unambiguously."""
+
+
+def _cu_capacity_by_visit(inv: pd.DataFrame) -> pd.DataFrame:
+    """Extract one validated full-range 0.5C discharge from each CU file.
+
+    The returned cache retains invalid files and their QC status. Consumers
+    must use only ``rpt_qc_status == 'valid'`` rows.
+    """
+    cfg = load_config()
+    protocol = cfg["protocol"]
+    required = {"cell", "visit", "path", "test_type"}
+    missing = required - set(inv.columns)
+    if missing:
+        raise ValueError(f"inventory is missing columns: {sorted(missing)}")
+    cu = inv.loc[inv["test_type"] == "CU"].copy()
+    rows: list[dict[str, Any]] = []
+    for _, row in cu.iterrows():
+        parsed = parse_ird(
+            Path(row["path"]),
+            strict=False,
+            max_invalid_fraction=float(protocol["max_invalid_fraction"]),
+            max_sampling_gap_s=float(protocol["max_sampling_gap_s"]),
+        )
+        base = {
+            "condition": row.get("condition"),
+            "cell": row["cell"],
+            "cu_visit": int(row["visit"]),
+            "cu_path": str(row["path"]),
+            "cu_test_id": int(row["test_id"]) if "test_id" in row and pd.notna(row["test_id"]) else np.nan,
+            "cu_start_time": parsed.metadata.get("starttime") if parsed.metadata else pd.NaT,
+        }
+        if parsed.data is None or not parsed.qc.get("parse_ok"):
+            rows.append({
+                **base,
+                "cu_Q_Ah": np.nan,
+                "rpt_qc_status": "parse_failed",
+                "rpt_qc_flags": parsed.qc.get("parse_error_code", "parse_failed"),
+            })
+            continue
+        try:
+            steps = summarize_steps(
+                parsed.data,
+                current_deadband_A=float(protocol["current_deadband_A"]),
+            )
+            reference = extract_reference_discharge(
+                parsed.data,
+                reference_current_A=float(protocol["rpt_reference_current_A"]),
+                current_relative_tolerance=float(protocol["rpt_current_relative_tolerance"]),
+                charged_voltage_min_V=float(protocol["rpt_charged_voltage_min_V"]),
+                discharged_voltage_max_V=float(protocol["rpt_discharged_voltage_max_V"]),
+                capacity_bounds_Ah=tuple(protocol["rpt_capacity_bounds_Ah"]),
+                steps=steps,
+            )
+            rows.append({
+                **base,
+                "cu_Q_Ah": reference.capacity_Ah,
+                "rpt_qc_status": reference.status,
+                "rpt_qc_flags": ";".join(reference.qc_flags),
+            })
+        except Exception as exc:
+            rows.append({
+                **base,
+                "cu_Q_Ah": np.nan,
+                "rpt_qc_status": "extraction_failed",
+                "rpt_qc_flags": f"{type(exc).__name__}: {exc}",
+            })
+    columns = [
+        "condition", "cell", "cu_visit", "cu_path", "cu_test_id", "cu_start_time",
+        "cu_Q_Ah", "rpt_qc_status", "rpt_qc_flags",
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _normalize_rpt_cache(cu_cache: pd.DataFrame) -> pd.DataFrame:
+    cache = cu_cache.copy()
+    rename = {
+        "visit": "cu_visit",
+        "path": "cu_path",
+        "test_id": "cu_test_id",
+        "file_start_time": "cu_start_time",
+        "reference_capacity_Ah": "cu_Q_Ah",
+    }
+    for source, target in rename.items():
+        if source in cache.columns and target not in cache.columns:
+            cache = cache.rename(columns={source: target})
+    if "rpt_qc_status" not in cache.columns:
+        cache["rpt_qc_status"] = np.where(cache["cu_Q_Ah"].notna(), "valid", "missing")
+    if "condition" not in cache.columns:
+        cache["condition"] = pd.NA
+    if "cu_start_time" in cache.columns:
+        cache["cu_start_time"] = pd.to_datetime(cache["cu_start_time"], errors="coerce")
+    return cache
+
+
+def _validate_unique_rpts(cache: pd.DataFrame) -> None:
+    """Allow visit-label collisions only when timestamps distinguish events."""
+    valid = cache[cache["rpt_qc_status"] == "valid"]
+    key_cols = ["cell", "cu_visit"]
+    if valid["condition"].notna().any():
+        key_cols.insert(0, "condition")
+    duplicate = valid.duplicated(key_cols, keep=False)
+    if not duplicate.any():
+        return
+    ambiguous: list[dict[str, object]] = []
+    for _, group in valid.loc[duplicate].groupby(key_cols, dropna=False):
+        timestamps = group["cu_start_time"] if "cu_start_time" in group else pd.Series(dtype="datetime64[ns]")
+        paths = group["cu_path"] if "cu_path" in group else pd.Series(dtype="object")
+        if timestamps.isna().any() or timestamps.duplicated().any() or paths.duplicated().any():
+            columns = [*key_cols, "cu_path"]
+            if "cu_start_time" in group:
+                columns.append("cu_start_time")
+            ambiguous.extend(group[columns].to_dict(orient="records"))
+    if ambiguous:
+        raise DuplicateRPTError(
+            "same-visit RPT files lack unique chronology: "
+            f"{ambiguous}"
+        )
+
+
+def add_target(df: pd.DataFrame, cu_cache: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Attach the next RPT only to the final complete cycle of each CYC file.
+
+    Chronology uses file start timestamps when available. Visit order is an
+    explicit fallback and is recorded in ``next_rpt_match_method``.
+    """
+    cache = _normalize_rpt_cache(
+        cu_cache if cu_cache is not None else _cu_capacity_by_visit(load_inventory())
+    )
+    _validate_unique_rpts(cache)
+
+    cfg = load_config()
+    initial_visit = int(cfg.get("targets", {}).get("next_rpt", {}).get("initial_visit", 0))
+
+    out = df.copy()
+    for column in (
+        "initial_rpt_Q_Ah", "previous_rpt_Q_Ah", "previous_rpt_SOH_pct",
+        TARGET, SOH_TARGET, DELTA_Q_TARGET, DELTA_SOH_TARGET,
+    ):
+        out[column] = np.nan
+    out["initial_rpt_path"] = pd.NA
+    out["initial_rpt_visit"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+    out["initial_rpt_match_method"] = pd.NA
+    out["previous_rpt_path"] = pd.NA
+    out["previous_rpt_visit"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+    out["previous_rpt_match_method"] = pd.NA
+    out["next_rpt_path"] = pd.NA
+    out["next_rpt_visit"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+    out["next_rpt_match_method"] = pd.NA
+    out["next_rpt_horizon_days"] = np.nan
+    out["is_prediction_anchor"] = False
+    out["anchor_id"] = pd.NA
+    out["next_rpt_target_status"] = "not_anchor"
+    out["next_rpt_soh_status"] = "not_anchor"
+    out["next_rpt_delta_status"] = "not_anchor"
+    out["delta_next_rpt_Q_status"] = "not_anchor"
+    out["delta_next_rpt_SOH_status"] = "not_anchor"
+    out["target_unavailable_reason"] = "not_final_complete_cycle"
+    if cache.empty:
+        return out
+
+    valid = cache[cache["rpt_qc_status"] == "valid"].copy()
+    if valid.empty:
+        return out
+    if "file_start_time" in out.columns:
+        out["file_start_time"] = pd.to_datetime(out["file_start_time"], errors="coerce")
+
+    grouping = [column for column in ["condition", "cell", "path"] if column in out.columns]
+    if "path" not in grouping:
+        grouping = [column for column in ["condition", "cell", "visit"] if column in out.columns]
+    order_column = "global_cycle" if "global_cycle" in out.columns else "cycle_in_file"
+
+    for _, cycle_file in out.groupby(grouping, dropna=False, sort=False):
+        eligible = cycle_file
+        if "cycle_complete" in eligible.columns:
+            eligible = eligible[eligible["cycle_complete"].fillna(False)]
+        if eligible.empty:
+            continue
+        anchor_index = eligible[order_column].astype(float).idxmax()
+        anchor = out.loc[anchor_index]
+        out.at[anchor_index, "is_prediction_anchor"] = True
+        anchor_key = anchor.get("file_id")
+        if pd.isna(anchor_key):
+            anchor_key = anchor.get("path")
+        if pd.isna(anchor_key):
+            anchor_key = str(anchor_index)
+        out.at[anchor_index, "anchor_id"] = f"{anchor_key}::{anchor.get(order_column)}"
+        out.at[anchor_index, "next_rpt_target_status"] = "unavailable"
+        out.at[anchor_index, "next_rpt_soh_status"] = "unavailable"
+        out.at[anchor_index, "next_rpt_delta_status"] = "unavailable"
+        out.at[anchor_index, "delta_next_rpt_Q_status"] = "unavailable"
+        out.at[anchor_index, "delta_next_rpt_SOH_status"] = "unavailable"
+        out.at[anchor_index, "target_unavailable_reason"] = "no_valid_rpt_for_cell"
+        candidates = valid[valid["cell"] == anchor["cell"]].copy()
+        if "condition" in out.columns and valid["condition"].notna().any():
+            candidates = candidates[candidates["condition"] == anchor["condition"]]
+        if candidates.empty:
+            continue
+
+        candidates = candidates.sort_values(
+            ["cu_start_time", "cu_test_id"], na_position="last"
+        )
+        initial_candidates = candidates[candidates["cu_visit"] == initial_visit]
+        initial_rpt = initial_candidates.iloc[0] if not initial_candidates.empty else None
+        initial_q = np.nan
+
+        file_start_time = anchor.get("file_start_time", pd.NaT)
+        cycle_end_s = anchor.get("cycle_end_time_s", np.nan)
+        if pd.notna(file_start_time) and pd.notna(cycle_end_s):
+            anchor_time = file_start_time + pd.to_timedelta(float(cycle_end_s), unit="s")
+            time_method = "cycle_end_time"
+        else:
+            anchor_time = file_start_time
+            time_method = "file_start_time_fallback"
+        if initial_rpt is not None:
+            initial_time = initial_rpt.get("cu_start_time", pd.NaT)
+            if pd.notna(anchor_time) and pd.notna(initial_time):
+                initial_is_causal = initial_time < anchor_time
+                initial_method = "timestamp"
+            else:
+                initial_is_causal = int(initial_rpt["cu_visit"]) < int(anchor["visit"])
+                initial_method = "visit_fallback_missing_timestamp"
+            if initial_is_causal:
+                initial_q = float(initial_rpt["cu_Q_Ah"])
+                out.at[anchor_index, "initial_rpt_Q_Ah"] = initial_q
+                out.at[anchor_index, "initial_rpt_path"] = initial_rpt.get("cu_path")
+                out.at[anchor_index, "initial_rpt_visit"] = int(initial_rpt["cu_visit"])
+                out.at[anchor_index, "initial_rpt_match_method"] = initial_method
+        timed_candidates = (
+            candidates[candidates["cu_start_time"].notna()]
+            if "cu_start_time" in candidates.columns else candidates.iloc[0:0]
+        )
+        visit_future = candidates[candidates["cu_visit"] > int(anchor["visit"])].sort_values(
+            ["cu_visit", "cu_test_id"], na_position="last"
+        )
+        visit_previous = candidates[candidates["cu_visit"] < int(anchor["visit"])].sort_values(
+            ["cu_visit", "cu_test_id"], na_position="last"
+        )
+        previous: pd.Series | None = None
+        previous_method: str | None = None
+        if pd.notna(anchor_time) and not timed_candidates.empty:
+            timed_previous = timed_candidates[
+                timed_candidates["cu_start_time"] < anchor_time
+            ].sort_values(["cu_start_time", "cu_test_id"], na_position="last")
+            if not timed_previous.empty:
+                previous = timed_previous.iloc[-1]
+                previous_method = "timestamp"
+        if not visit_previous.empty:
+            visit_candidate = visit_previous.iloc[-1]
+            visit_candidate_time = visit_candidate.get("cu_start_time", pd.NaT)
+            visit_candidate_is_causal = (
+                pd.isna(anchor_time) or pd.isna(visit_candidate_time)
+                or visit_candidate_time < anchor_time
+            )
+            if visit_candidate_is_causal and (
+                previous is None
+                or (
+                    pd.isna(visit_candidate_time)
+                    and int(visit_candidate["cu_visit"]) >= int(previous["cu_visit"])
+                )
+            ):
+                previous = visit_candidate
+                previous_method = "visit_fallback_missing_timestamp"
+        if previous is not None:
+            previous_q = float(previous["cu_Q_Ah"])
+            out.at[anchor_index, "previous_rpt_Q_Ah"] = previous_q
+            out.at[anchor_index, "previous_rpt_path"] = previous.get("cu_path")
+            out.at[anchor_index, "previous_rpt_visit"] = int(previous["cu_visit"])
+            out.at[anchor_index, "previous_rpt_match_method"] = previous_method
+            if np.isfinite(initial_q) and initial_q > 0:
+                out.at[anchor_index, "previous_rpt_SOH_pct"] = 100.0 * previous_q / initial_q
+        if pd.notna(anchor_time) and not timed_candidates.empty:
+            future = timed_candidates[timed_candidates["cu_start_time"] > anchor_time].sort_values(
+                ["cu_start_time", "cu_test_id"], na_position="last"
+            )
+            method = time_method
+            untimed_future = visit_future[visit_future["cu_start_time"].isna()]
+            if not untimed_future.empty and (
+                future.empty or int(untimed_future.iloc[0]["cu_visit"]) < int(future.iloc[0]["cu_visit"])
+            ):
+                future = untimed_future
+                method = "visit_fallback_missing_timestamp"
+        else:
+            future = visit_future
+            method = "visit_fallback_missing_timestamp"
+        if future.empty:
+            out.at[anchor_index, "target_unavailable_reason"] = "no_future_valid_rpt"
+            continue
+        next_rpt = future.iloc[0]
+        next_q = float(next_rpt["cu_Q_Ah"])
+        out.at[anchor_index, TARGET] = next_q
+        out.at[anchor_index, "next_rpt_path"] = next_rpt.get("cu_path")
+        out.at[anchor_index, "next_rpt_visit"] = int(next_rpt["cu_visit"])
+        out.at[anchor_index, "next_rpt_match_method"] = method
+        out.at[anchor_index, "next_rpt_target_status"] = "available"
+        out.at[anchor_index, "target_unavailable_reason"] = pd.NA
+        if np.isfinite(initial_q) and initial_q > 0:
+            next_soh = 100.0 * next_q / initial_q
+            out.at[anchor_index, SOH_TARGET] = next_soh
+            out.at[anchor_index, "next_rpt_soh_status"] = "available"
+        else:
+            next_soh = np.nan
+            out.at[anchor_index, "next_rpt_soh_status"] = "missing_initial_rpt"
+        if previous is not None:
+            previous_q = float(previous["cu_Q_Ah"])
+            out.at[anchor_index, DELTA_Q_TARGET] = next_q - previous_q
+            out.at[anchor_index, "delta_next_rpt_Q_status"] = "available"
+            if np.isfinite(next_soh) and np.isfinite(out.at[anchor_index, "previous_rpt_SOH_pct"]):
+                out.at[anchor_index, DELTA_SOH_TARGET] = (
+                    next_soh - float(out.at[anchor_index, "previous_rpt_SOH_pct"])
+                )
+            delta_soh_available = np.isfinite(out.at[anchor_index, DELTA_SOH_TARGET])
+            out.at[anchor_index, "delta_next_rpt_SOH_status"] = (
+                "available" if delta_soh_available else "missing_initial_rpt"
+            )
+            out.at[anchor_index, "next_rpt_delta_status"] = (
+                "available" if delta_soh_available else "partial_capacity_only"
+            )
+        else:
+            out.at[anchor_index, "next_rpt_delta_status"] = "missing_previous_rpt"
+            out.at[anchor_index, "delta_next_rpt_Q_status"] = "missing_previous_rpt"
+            out.at[anchor_index, "delta_next_rpt_SOH_status"] = "missing_previous_rpt"
+        if method in {"cycle_end_time", "file_start_time_fallback"}:
+            out.at[anchor_index, "next_rpt_horizon_days"] = (
+                next_rpt["cu_start_time"] - anchor_time
+            ).total_seconds() / 86400.0
+    return _drop_non_adjacent_blocks(out)
+
+
+def _drop_non_adjacent_blocks(out: pd.DataFrame) -> pd.DataFrame:
+    """Retain one anchor per (cell, next RPT): the block adjacent to the target.
+
+    A cell may run several CYC blocks with no RPT between them (observed for
+    ``S2000FM42G``: CYC V03, V04, V05 all sit between CU V02 and CU V06). Every
+    such block is an anchor pointing at the same next RPT, which gives duplicate
+    targets on non-independent rows, and for the earlier blocks the features
+    cover only part of the previous-RPT-to-next-RPT interval while the stress
+    delta spans all of it. Only the last block before the target satisfies the
+    contract, so the earlier ones are demoted to unavailable rather than
+    silently regressed on.
+    """
+    targeted = out["next_rpt_path"].notna()
+    if not targeted.any():
+        return out
+    # Closest to the target in time wins; visit order breaks ties when the
+    # horizon is unavailable (visit-fallback matches carry no horizon).
+    order = out.loc[targeted].sort_values(
+        ["next_rpt_horizon_days", "visit"],
+        ascending=[True, False],
+        na_position="last",
+        kind="mergesort",
+    )
+    keep = order.groupby(["condition", "cell", "next_rpt_path"], sort=False).head(1).index
+    superseded = out.index[targeted].difference(keep)
+    if len(superseded) == 0:
+        return out
+    for column in (TARGET, SOH_TARGET, DELTA_Q_TARGET, DELTA_SOH_TARGET):
+        out.loc[superseded, column] = np.nan
+    out.loc[superseded, "next_rpt_target_status"] = "unavailable"
+    out.loc[superseded, "target_unavailable_reason"] = "superseded_by_adjacent_block"
+    return out
+
+

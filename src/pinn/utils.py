@@ -97,34 +97,58 @@ def gpu_memory_mb() -> tuple[float, float]:
         return 0.0, 0.0
 
 
-def atomic_write_json(payload: dict[str, Any], path: Path) -> None:
+def _atomic_write(write_tmp: "Any", path: Path, *,
+                  retries: int = 3, retry_delay: float = 0.5) -> None:
+    """Write to ``path``'s ``.tmp`` sibling then rename, retrying on failure.
+
+    ``write_tmp(tmp)`` must (re)create ``tmp`` from scratch each call. Retried
+    because RunPod's network-attached volumes have occasionally shown a
+    transient gap between a file write completing and it becoming visible for
+    ``os.replace`` on the same path (observed: ``FileNotFoundError`` on
+    ``tmp.replace(path)`` immediately after ``tmp`` was written, single
+    -threaded, no concurrent writer) -- a short retry absorbs that without
+    masking a genuine persistent failure, which still raises after
+    ``retries`` attempts.
+    """
+    import time
+
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    last_exc: OSError | None = None
+    for attempt in range(retries):
+        try:
+            write_tmp(tmp)
+            tmp.replace(path)
+            return
+        except OSError as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(retry_delay * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
+
+
+def atomic_write_json(payload: dict[str, Any], path: Path) -> None:
+    _atomic_write(
+        lambda tmp: tmp.write_text(
+            json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8"
+        ),
+        path,
+    )
 
 
 def atomic_write_csv(frame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    frame.to_csv(tmp, index=False)
-    tmp.replace(path)
+    _atomic_write(lambda tmp: frame.to_csv(tmp, index=False), path)
 
 
 def atomic_write_parquet(frame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    frame.to_parquet(tmp, index=False)
-    tmp.replace(path)
+    _atomic_write(lambda tmp: frame.to_parquet(tmp, index=False), path)
 
 
 def atomic_write_torch(state: Any, path: Path) -> None:
     import torch
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    torch.save(state, tmp)
-    tmp.replace(path)
+    _atomic_write(lambda tmp: torch.save(state, tmp), path)
 
 
 def git_commit(cwd: Path | None = None) -> str:

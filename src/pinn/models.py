@@ -139,13 +139,25 @@ class SolutionNet(nn.Module):
 
 
 class RateNet(nn.Module):
-    """Nonnegative degradation rate r_hat = Softplus(G_Theta(s, x[, u_hat]))."""
+    """Degradation rate r_hat = Softplus(G_Theta(s, x[, u_hat])) - rate_floor.
+
+    With the default ``rate_floor=0.0`` this is the original hard nonnegative
+    rate (``r_hat >= 0`` everywhere, so the ODE coupling ``du/ds = -r_hat``
+    forces the solution to be monotonically non-increasing along stress with
+    no exception). ``rate_floor > 0`` shifts the floor down so ``r_hat`` can
+    take small negative values, i.e. the solution can express small predicted
+    *increases* in capacity between anchors -- needed because real RPT-to-RPT
+    transitions include apparent regeneration (relaxation/measurement noise)
+    a hard-nonnegative rate head can never fit, which biases every delta
+    prediction negative regardless of the true sign.
+    """
 
     def __init__(self, feature_dim: int, hidden_dims: Iterable[int] = (8, 8),
                  activation: str = "tanh", dropout: float = 0.0,
-                 uses_u_hat: bool = True) -> None:
+                 uses_u_hat: bool = True, rate_floor: float = 0.0) -> None:
         super().__init__()
         self.uses_u_hat = bool(uses_u_hat)
+        self.rate_floor = float(rate_floor)
         in_dim = feature_dim + (2 if self.uses_u_hat else 1)
         self.body = _stack_mlp(in_dim, hidden_dims, activation,
                                 dropout=dropout, output_dim=1)
@@ -161,7 +173,7 @@ class RateNet(nn.Module):
             inputs = torch.cat([stress, u_hat, features], dim=-1)
         else:
             inputs = torch.cat([stress, features], dim=-1)
-        return self.softplus(self.body(inputs)).squeeze(-1)
+        return self.softplus(self.body(inputs)).squeeze(-1) - self.rate_floor
 
 
 class NaPINNQ(nn.Module):
@@ -184,6 +196,7 @@ class NaPINNQ(nn.Module):
                  rate_dropout: float = 0.0,
                  rate_uses_u_hat: bool = True,
                  predict_delta_u: bool = False,
+                 rate_floor: float = 0.0,
                  # Hybrid rate model -------------------------------------------
                  use_hybrid_rate: bool = False,
                  hybrid_temperature_index: int | None = None,
@@ -201,6 +214,12 @@ class NaPINNQ(nn.Module):
                                      dropout=solution_dropout,
                                      predict_delta_u=predict_delta_u)
         self.use_hybrid_rate = bool(use_hybrid_rate)
+        if use_hybrid_rate and rate_floor:
+            raise ValueError(
+                "rate_floor is not implemented for use_hybrid_rate=True; "
+                "HybridRateModel sums named nonnegative components and has no "
+                "single Softplus head to shift"
+            )
         if use_hybrid_rate:
             if hybrid_temperature_index is None or hybrid_dod_index is None:
                 raise ValueError(
@@ -229,9 +248,11 @@ class NaPINNQ(nn.Module):
             )
         else:
             self.rate = RateNet(feature_dim, rate_hidden_dims, rate_activation,
-                                dropout=rate_dropout, uses_u_hat=rate_uses_u_hat)
+                                dropout=rate_dropout, uses_u_hat=rate_uses_u_hat,
+                                rate_floor=rate_floor)
         self.feature_dim = int(feature_dim)
         self.predict_delta_u = bool(predict_delta_u)
+        self.rate_floor = float(rate_floor)
 
     def rate_components(self, stress: torch.Tensor, features: torch.Tensor,
                         u_hat: torch.Tensor | None = None) -> RateComponents:

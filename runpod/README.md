@@ -94,9 +94,8 @@ invalidate the primary-seed result.
 Before any stage, `run.sh` fails fast if the deployment or config would produce
 an unfair or misreported comparison: registry over the 64-feature cap, stress
 coordinate or initial state duplicated into the PINN auxiliary tensor,
-`preprocessing_levels` not `["unified"]`, `rate_uses_u_hat` not false,
-`predict_delta_u` not true, `checkpoint_after_physics_active` not true, or
-SVR-RBF still enabled.
+`preprocessing_levels` not `["unified"]`, `rate_uses_u_hat` not false, or
+`predict_delta_u` not true.
 
 It also logs whether the locked holdout is gated off.
 `experiment.evaluate_holdout` ships as `false`; set it true exactly once, after

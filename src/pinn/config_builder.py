@@ -62,6 +62,7 @@ def build_trainer_config(pinn_cfg: dict[str, Any], *, architecture: str,
         rate_dropout=float(model.get("rate_dropout", 0.0)),
         rate_uses_u_hat=bool(model.get("rate_uses_u_hat", True)),
         predict_delta_u=bool(model.get("predict_delta_u", False)),
+        rate_floor=float(model.get("rate_floor", 0.0)),
         batch_size=int(training.get("batch_size", 0)),
         batch_mode=str(training.get("batch_mode", "cell_balanced")),
         maximum_parameters=int(model["maximum_parameters"]),
@@ -80,6 +81,9 @@ def build_trainer_config(pinn_cfg: dict[str, Any], *, architecture: str,
         ),
         gradient_balance_max_multiplier=float(
             training.get("gradient_balance_max_multiplier", 10.0)
+        ),
+        gradient_balance_normalize_active=bool(
+            training.get("gradient_balance_normalize_active", False)
         ),
         checkpoint_after_physics_active=bool(
             training.get("checkpoint_after_physics_active", True)

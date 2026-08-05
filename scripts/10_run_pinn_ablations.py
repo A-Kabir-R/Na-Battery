@@ -205,6 +205,7 @@ def main() -> None:
             rate_dropout=float(model_cfg.get("rate_dropout", 0.0)),
             rate_uses_u_hat=rate_uses_u_hat,
             predict_delta_u=bool(model_cfg.get("predict_delta_u", False)),
+            rate_floor=float(model_cfg.get("rate_floor", 0.0)),
             batch_size=int(pinn_cfg["training"].get("batch_size", 0)),
             batch_mode=str(pinn_cfg["training"].get("batch_mode", "cell_balanced")),
             maximum_parameters=int(model_cfg["maximum_parameters"]),
@@ -223,6 +224,8 @@ def main() -> None:
                 "gradient_balance_min_multiplier", 0.1)),
             gradient_balance_max_multiplier=float(pinn_cfg["training"].get(
                 "gradient_balance_max_multiplier", 10.0)),
+            gradient_balance_normalize_active=bool(pinn_cfg["training"].get(
+                "gradient_balance_normalize_active", False)),
             checkpoint_after_physics_active=bool(pinn_cfg["training"].get(
                 "checkpoint_after_physics_active", True)),
             rate_data_weight=float(pinn_cfg["losses"].get("rate_data", 0.0)),
