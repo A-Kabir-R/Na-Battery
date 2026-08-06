@@ -1,0 +1,268 @@
+% ---------------------------------------------------------------------------
+% Styles + drawing components for the NaPINN-Q architecture figure.
+% Geometry follows src/pinn/ as configured by config.yaml -> pinn.
+%
+% Every component is a macro taking (x,y) = its bottom-left corner.
+%
+%   \anchorplot   3.00 x 2.40      \ratepanel   12.30 x 5.45
+%   \featstack    2.50 x 2.40      \intervals    6.00 x 5.45
+%   \solstack     3.60 x 2.40      \lossbars     7.80 x 5.45
+%   \ratestack    4.20 x 1.90      \legendrow   26.00 x 0.40
+% ---------------------------------------------------------------------------
+\usepackage{times}
+\usepackage{amsmath,amssymb}
+\usetikzlibrary{arrows.meta,positioning,calc,decorations.pathreplacing}
+
+\definecolor{solc}{HTML}{6FAF7B}   % solution network
+\definecolor{physc}{HTML}{E0A458}  % parametric physics
+\definecolor{coldc}{HTML}{7EA6D8}  % cold-regime term
+\definecolor{resc}{HTML}{C48CC0}   % neural residual
+\definecolor{datac}{HTML}{7FB3C8}  % inputs
+\definecolor{gradc}{HTML}{B8443F}  % backpropagation
+\definecolor{lossc}{HTML}{9B8EC4}  % data-like loss terms
+\definecolor{colloc}{HTML}{C0392B} % collocation points
+\definecolor{panelbg}{HTML}{FAF7FD}
+\definecolor{inbg}{HTML}{F2F7FD}
+\definecolor{phybg}{HTML}{FDF8F0}
+
+\tikzset{
+  dat/.style   ={rounded corners=1pt, draw=black!35, fill=black!5, align=center,
+                 font=\tiny, inner sep=2.6pt},
+  hot/.style   ={rounded corners=1.4pt, draw=black!55, fill=white, align=center,
+                 font=\scriptsize, inner sep=3pt, line width=0.7pt},
+  op/.style    ={circle, draw=black!60, fill=white, inner sep=0.4pt,
+                 minimum size=4.6mm, font=\scriptsize},
+  bigop/.style ={circle, draw=black!60, fill=white, inner sep=0.4pt,
+                 minimum size=6.2mm, font=\small},
+  ar/.style    ={-{Latex[length=1.8mm,width=1.3mm]}, draw=black!65, line width=0.55pt},
+  thinar/.style={-{Latex[length=1.4mm,width=1.0mm]}, draw=black!55, line width=0.4pt},
+  dar/.style   ={-{Latex[length=1.6mm,width=1.2mm]}, draw=black!45, line width=0.45pt,
+                 dashed, dash pattern=on 1.2pt off 1.2pt},
+  gar/.style   ={-{Latex[length=2.0mm,width=1.5mm]}, draw=gradc, line width=0.6pt,
+                 dashed, dash pattern=on 1.8pt off 1.4pt},
+  panel/.style ={rounded corners=3pt, draw=black!45, dashed,
+                 dash pattern=on 2pt off 1.6pt, line width=0.6pt},
+  ttl/.style   ={font=\scriptsize\bfseries, align=left},
+  lb/.style    ={font=\tiny, align=center, text=black!80},
+  capt/.style  ={font=\tiny, align=center, text=black!70},
+  ax/.style    ={draw=black!50, line width=0.4pt},
+}
+
+% 3-D slab.  #1 x  #2 y  #3 w  #4 h  #5 depth  #6 colour
+\newcommand{\cube}[6]{%
+  \begin{scope}[shift={(#1,#2)}]
+    \filldraw[fill=#6!82!black, draw=black!60, line width=0.35pt]
+      (0,#4) -- (#5,#4+#5) -- (#3+#5,#4+#5) -- (#3,#4) -- cycle;
+    \filldraw[fill=#6!66!black, draw=black!60, line width=0.35pt]
+      (#3,0) -- (#3+#5,#5) -- (#3+#5,#4+#5) -- (#3,#4) -- cycle;
+    \filldraw[fill=#6, draw=black!60, line width=0.35pt] (0,0) rectangle (#3,#4);
+  \end{scope}}
+\newcommand{\stack}[5]{\foreach \k in {2,1,0}{\cube{#1+0.15*\k}{#2+0.10*\k}{#3}{#4}{0.14}{#5}}}
+
+\newcommand{\framepanel}[4]{%
+  \fill[#3, rounded corners=3pt, draw=black!45, dashed,
+        dash pattern=on 2pt off 1.6pt, line width=0.6pt] (0,0) rectangle (#1,#2);
+  \node[ttl, anchor=north west] at (0.20,#2-0.14) {#4};}
+
+% =========================================================================
+% Pipeline components
+% =========================================================================
+
+% ---- RPT anchors, 3.00 x 2.40 -------------------------------------------
+\newcommand{\anchorplot}[2]{\begin{scope}[shift={(#1,#2)}]
+  \fill[inbg, rounded corners=2pt, draw=black!35, line width=0.4pt]
+    (0,0) rectangle (3.00,2.40);
+  \begin{scope}[shift={(0.45,0.72)}]
+    \draw[ax,-{Latex[length=1.2mm,width=0.9mm]}] (0,0) -- (2.35,0);
+    \draw[ax,-{Latex[length=1.2mm,width=0.9mm]}] (0,0) -- (0,1.42);
+    \fill[datac!22] (0.75,0) rectangle (1.75,1.32);
+    \node[font=\tiny, text=black!60] at (1.25,0.30) {$\Delta s_k$};
+    \draw[solc!60!black, line width=0.7pt]
+      plot[smooth] coordinates {(0.10,1.42) (0.75,1.32) (1.25,1.20)
+                                (1.75,1.02) (2.15,0.80)};
+    \foreach \x/\y in {0.75/1.32, 1.75/1.02}{\fill[gradc] (\x,\y) circle (0.062);}
+    \node[font=\tiny, text=black!70, anchor=north] at (0.75,-0.04) {$s_k$};
+    \node[font=\tiny, text=black!70, anchor=north] at (1.75,-0.04) {$s_{k+1}$};
+    \node[font=\tiny, text=black!75, anchor=south east] at (0.72,1.34) {$u_k$};
+    \node[font=\tiny, text=black!75, anchor=south west] at (1.80,1.00) {$u_{k+1}$};
+    \node[font=\tiny, text=black!70, rotate=90, anchor=south] at (-0.16,0.78)
+      {$u=Q/Q_0$};
+  \end{scope}
+  \node[lb] at (1.50,0.22) {RPT anchors \ $\cdot$ \ $s=$ EFC$_{\text{cum}}$};
+\end{scope}}
+
+% ---- audited feature groups, 2.50 x 2.40 --------------------------------
+\newcommand{\featstack}[2]{\begin{scope}[shift={(#1,#2)}]
+  \foreach \i/\n/\lab in {0/4/{state}, 1/4/{cond}, 2/6/{cycle},
+                          3/5/{temp}, 4/13/{diag}, 5/8/{misc}}{%
+    \pgfmathsetmacro{\xx}{0.16+0.38*\i}
+    \cube{\xx}{1.02}{0.20}{1.05}{0.12}{datac}
+    \node[font=\tiny, text=black!60] at (\xx+0.16,2.28) {\n};
+    \node[lb, rotate=90, anchor=east] at (\xx+0.10,0.94) {\lab};}
+  \draw[decorate, decoration={brace, amplitude=2.4pt, mirror}, draw=black!50,
+        line width=0.4pt] (0.16,0.30) -- (2.22,0.30);
+  \node[lb] at (1.19,0.10) {$40$ audited columns};
+\end{scope}}
+
+% ---- solution network slabs, 3.60 x 2.40 --------------------------------
+\newcommand{\solstack}[2]{\begin{scope}[shift={(#1,#2)}]
+  \node[lb, font=\tiny\bfseries] at (2.20,2.30) {SolutionNet $f_\theta$};
+  \stack{0.25}{0.90}{0.30}{0.95}{solc}
+  \stack{1.75}{0.90}{0.30}{0.95}{solc}
+  \cube{3.25}{0.90}{0.26}{0.95}{0.14}{solc}
+  \foreach \x in {0.95, 2.45}{\draw[ar] (\x,1.35) -- (\x+0.65,1.35);}
+  \node[lb] at (0.62,0.62) {$43\!\to\!32$\\ tanh};
+  \node[lb] at (2.12,0.62) {$32\!\to\!32$\\ tanh};
+  \node[lb] at (3.45,0.62) {$32\!\to\!1$\\ zero-init};
+\end{scope}}
+
+% ---- hybrid rate head, compact, 4.20 x 1.90 -----------------------------
+\newcommand{\ratestack}[2]{\begin{scope}[shift={(#1,#2)}]
+  \node[lb, font=\tiny\bfseries] at (2.10,1.80) {Hybrid rate head};
+  \cube{0.20}{0.55}{0.28}{0.85}{0.14}{physc}
+  \cube{1.10}{0.55}{0.28}{0.85}{0.14}{coldc}
+  \stack{2.00}{0.55}{0.26}{0.85}{resc}
+  \node[lb] at (0.41,0.34) {$r_{\text{cyc}}$};
+  \node[lb] at (1.31,0.34) {$r_{\text{cold}}$};
+  \node[lb] at (2.35,0.34) {$r_{\text{res}}$};
+  \node[op] (rs) at (3.55,0.98) {$\Sigma$};
+  \foreach \x in {0.34,1.24,2.20}{\draw[thinar] (\x,1.48) -- (\x,1.62)
+    -- (3.55,1.62) -- (rs.north);}
+\end{scope}}
+
+% =========================================================================
+% Magnified panels
+% =========================================================================
+
+% ---- inside the hybrid rate head, 12.30 x 5.45 --------------------------
+\newcommand{\ratepanel}[2]{\begin{scope}[shift={(#1,#2)}]
+  \framepanel{12.30}{5.45}{phybg}{Inside the hybrid rate head}
+
+  \begin{scope}[shift={(0.60,3.62)}]
+    \draw[ax] (0,0) -- (1.70,0);  \draw[ax] (0,0) -- (0,1.15);
+    \draw[physc!70!black, line width=0.8pt]
+      plot[smooth] coordinates {(0.05,0.09) (0.45,0.16) (0.85,0.30)
+                                (1.20,0.54) (1.45,0.82) (1.62,1.08)};
+    \node[font=\tiny, text=black!70, anchor=north] at (0.85,-0.02) {$T$};
+    \node[lb, anchor=north] at (0.85,-0.20) {Arrhenius $\times$ DOD$^{\beta}$};
+  \end{scope}
+  \begin{scope}[shift={(3.10,3.62)}]
+    \draw[ax] (0,0) -- (1.70,0);  \draw[ax] (0,0) -- (0,1.15);
+    \draw[coldc!70!black, line width=0.8pt]
+      plot[smooth] coordinates {(0.05,1.08) (0.38,1.00) (0.66,0.78)
+                                (0.90,0.44) (1.24,0.16) (1.62,0.06)};
+    \draw[black!45, dashed, dash pattern=on 1pt off 1pt] (0.78,0) -- (0.78,1.15);
+    \node[font=\tiny, text=black!70, anchor=south] at (0.78,1.10) {$T_c$};
+    \node[font=\tiny, text=black!70, anchor=north] at (0.85,-0.02) {$T$};
+    \node[lb, anchor=north] at (0.85,-0.20) {sigmoid cold gate};
+  \end{scope}
+  \begin{scope}[shift={(5.60,3.62)}]
+    \foreach \k in {2,1,0}{\cube{0.20+0.15*\k}{0.10*\k}{0.28}{1.10}{0.14}{resc}}
+    \node[lb, anchor=north] at (0.55,-0.20) {MLP $43\!-\!8\!-\!8\!-\!1$, softplus};
+  \end{scope}
+
+  \cube{0.85}{1.90}{0.30}{0.90}{0.15}{physc}
+  \cube{3.35}{1.90}{0.30}{0.90}{0.15}{coldc}
+  \cube{5.85}{1.90}{0.30}{0.90}{0.15}{resc}
+  \node[lb] at (1.08,1.69) {$r_{\text{cyc}}$};
+  \node[lb] at (3.58,1.69) {$r_{\text{cold}}$};
+  \node[lb] at (6.08,1.69) {$r_{\text{res}}$};
+  \foreach \x in {1.00,3.50,6.00}{\draw[thinar] (\x,3.02) -- (\x,2.95);}
+
+  \node[bigop] (sg) at (7.90,2.35) {$\Sigma$};
+  \foreach \x in {1.00,3.50,6.00}{%
+    \draw[thinar, draw=black!45] (\x,1.85) -- (\x,1.52) -- (7.90,1.52) -- (sg.south);}
+  \node[hot, anchor=west] (rh) at (8.45,2.35) {$\hat r\ \ge 0$};
+  \draw[ar] (sg.east) -- (rh.west);
+
+  \node[lb, anchor=north west, align=left] at (0.30,1.26)
+    {$r_{\text{cyc}}=k_{\text{ref}}\,
+      e^{-\frac{E_a}{R}(\frac1T-\frac1{T_{\text{ref}}})}\text{DOD}^{\beta}$,
+     \ $E_a\in[-60,120]$\,kJ\,mol$^{-1}$, \ $\beta\in[0,3]$, \
+     $\alpha$ frozen at $0$\\[3pt]
+     $r_{\text{cold}}=\sigma\!\big((T_c-T)/w\big)k_{\text{cold}}
+      \text{DOD}^{\beta}$,
+     \ $T_c\in[243,293]$\,K, \ $r_{\text{res}}$ bias $-12$ and its share
+     penalised above $0.5$};
+
+  \node[lb, anchor=north east, align=right, text=black!55] at (12.10,4.90)
+    {calendar and diagnostic\\ terms exist but are off};
+\end{scope}}
+
+% ---- one transition interval, 6.00 x 5.45 -------------------------------
+\newcommand{\intervals}[2]{\begin{scope}[shift={(#1,#2)}]
+  \framepanel{6.00}{5.45}{phybg}{One transition interval}
+  \begin{scope}[shift={(0.70,2.85)}]
+    \draw[ax,-{Latex[length=1.2mm,width=0.9mm]}] (0,0) -- (4.30,0);
+    \draw[solc!60!black, line width=0.8pt]
+      plot[smooth] coordinates {(0.30,1.75) (1.10,1.60) (1.90,1.42)
+                                (2.70,1.18) (3.55,0.86)};
+    \foreach \x/\y in {0.70/1.68, 1.10/1.60, 1.50/1.51, 1.90/1.42,
+                       2.30/1.31, 2.70/1.18, 3.15/1.03, 3.50/0.88}
+      {\fill[colloc] (\x,\y) circle (0.055);}
+    \fill[black!75] (0.30,1.75) circle (0.075);
+    \fill[black!75] (3.55,0.86) circle (0.075);
+    \node[font=\tiny, text=black!70, anchor=north] at (0.30,-0.04) {$s_k$};
+    \node[font=\tiny, text=black!70, anchor=north] at (3.55,-0.04) {$s_{k+1}$};
+    \node[font=\tiny, text=black!70, anchor=south west] at (0.36,1.78) {$\hat u(s)$};
+  \end{scope}
+  \node[lb] at (2.85,2.42) {\textcolor{colloc}{$\bullet$}\ $8$ collocation
+    points, resampled each epoch};
+  \begin{scope}[shift={(0.85,1.50)}]
+    \foreach \i in {0,...,7}{%
+      \pgfmathsetmacro{\xx}{0.10+0.28*\i}
+      \pgfmathsetmacro{\hh}{ifthenelse(\i==0||\i==7,0.20,0.40)}
+      \fill[physc!75] (\xx-0.055,0.06) rectangle (\xx+0.055,0.06+\hh);
+      \fill[black!70] (\xx,0) circle (0.04);}
+    \draw[ax] (-0.05,0) -- (2.20,0);
+    \node[lb, anchor=north] at (1.05,-0.06) {$8$ quadrature weights $w_j$};
+  \end{scope}
+  \node[hot, anchor=west, text width=26mm] at (3.35,1.65)
+    {$\hat u_{\text{int}}=u_k-\Delta s_k\sum_j w_j\hat r(s_j)$};
+  \node[lb, anchor=south] at (3.00,0.28)
+    {residual $H$ evaluated at $s_k$, $s_{k+1}$ and every collocation point};
+\end{scope}}
+
+% ---- loss terms, 7.80 x 5.45 --------------------------------------------
+\newcommand{\lossbars}[2]{\begin{scope}[shift={(#1,#2)}]
+  \framepanel{7.80}{5.45}{panelbg}{Loss terms, all cell-balanced}
+  \draw[black!45, line width=0.4pt] (2.05,0.62) -- (2.05,4.72);
+  \foreach \i/\nm/\ln/\wt/\c in {%
+      0/{$\mathcal{L}_{\text{data}}$}/2.10/{$1.0$}/lossc,
+      1/{$\mathcal{L}_{\text{ODE}}$}/0.58/{$10^{-3}$}/physc,
+      2/{$\mathcal{L}_{\text{IC}}$}/1.42/{$0.1$}/solc,
+      3/{$\mathcal{L}_{\text{int}}$}/0.90/{$5\!\cdot\!10^{-3}$}/physc,
+      4/{$\mathcal{L}_{\text{mono}}$}/0.74/{$2\!\cdot\!10^{-3}$}/physc,
+      5/{$\mathcal{L}_{\text{bnd}}$}/1.26/{$0.05$}/physc,
+      6/{$\mathcal{L}_{\text{rdata}}$}/0.90/{$5\!\cdot\!10^{-3}$}/lossc,
+      7/{$\mathcal{L}_{\text{share}}$}/1.06/{$0.01$}/resc,
+      8/{$\mathcal{L}_{\text{rreg}}$}/0.24/{$10^{-4}$}/lossc}{%
+    \pgfmathsetmacro{\yy}{4.52-0.44*\i}
+    \node[font=\tiny, anchor=east, text=black!85] at (1.95,\yy) {\nm};
+    \fill[\c] (2.05,\yy-0.085) rectangle ++(\ln,0.17);
+    \node[font=\tiny, anchor=west, text=black!65] at (2.05+\ln+0.10,\yy) {\wt};}
+  \node[lb, anchor=north, align=center] at (3.90,0.56)
+    {nominal weight $w_i$, then $\times\gamma$(epoch) for the ramped terms
+     and $\times m_i$ for gradient-norm balancing};
+\end{scope}}
+
+% ---- legend, 26.00 x 0.40 -----------------------------------------------
+\newcommand{\legendrow}[2]{\begin{scope}[shift={(#1,#2)}]
+  \node[anchor=west, font=\tiny\bfseries] at (0,0.16) {Legend:};
+  \cube{0.90}{0}{0.20}{0.30}{0.12}{datac}
+  \node[anchor=west, font=\tiny] at (1.30,0.16) {audited inputs};
+  \cube{3.60}{0}{0.20}{0.30}{0.12}{solc}
+  \node[anchor=west, font=\tiny] at (4.00,0.16) {solution network};
+  \cube{6.90}{0}{0.20}{0.30}{0.12}{physc}
+  \node[anchor=west, font=\tiny] at (7.30,0.16) {parametric physics};
+  \cube{10.30}{0}{0.20}{0.30}{0.12}{coldc}
+  \node[anchor=west, font=\tiny] at (10.70,0.16) {cold regime};
+  \cube{13.20}{0}{0.20}{0.30}{0.12}{resc}
+  \node[anchor=west, font=\tiny] at (13.60,0.16) {bounded neural residual};
+  \draw[gar] (17.60,0.16) -- (18.40,0.16);
+  \node[anchor=west, font=\tiny] at (18.50,0.16)
+    {$\partial\mathcal{L}_{\text{total}}/\partial\theta$};
+  \node[anchor=west, font=\tiny, text=black!60] at (21.20,0.16)
+    {$\approx2.9$k parameters \ $\cdot$ \ AdamW \ $\cdot$ \ cell-grouped
+     $5$-fold CV};
+\end{scope}}

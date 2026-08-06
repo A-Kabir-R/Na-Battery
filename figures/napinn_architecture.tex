@@ -1,0 +1,83 @@
+% ---------------------------------------------------------------------------
+% NaPINN-Q architecture, 28.0 x 12.4 cm.
+%
+%   top     end-to-end pipeline, with the rate head as one block
+%   bottom  that block magnified, the transition interval, the loss terms
+%
+% Compile: pdflatex napinn_architecture.tex
+% ---------------------------------------------------------------------------
+\documentclass[tikz,border=0pt]{standalone}
+\input{napinn_style}
+
+\begin{document}
+\begin{tikzpicture}[font=\scriptsize]
+\useasboundingbox (0,0) rectangle (28.0,12.4);
+
+\node[anchor=north west, font=\small\bfseries] at (0.30,12.32)
+  {NaPINN-Q \ {\normalfont\scriptsize
+   $\mathrm{d}\hat u/\mathrm{d}s+\hat r=0$ in the cumulative-stress
+   coordinate $s$}};
+
+% ================= pipeline ==============================================
+\anchorplot{0.30}{8.85}
+\draw[ar] (3.40,10.05) -- (3.85,10.05);
+\featstack{3.90}{8.85}
+\draw[ar] (6.45,10.05) -- (6.90,10.05);
+\node[dat, text width=15mm] (xv) at (7.75,10.05)
+  {$\mathbf{x}\in\mathbb{R}^{42}$\\ $[\Delta s_k, u_k, 40]$};
+\draw[ar] (8.62,10.05) -- (9.05,10.05);
+\solstack{9.10}{8.85}
+\draw[ar] (13.00,10.05) -- (13.35,10.05);
+
+\node[op] (mul) at (13.65,10.05) {$\otimes$};
+\node[op] (plu) at (14.85,10.05) {$\oplus$};
+\node[dat, anchor=south] at (13.65,10.70) {$s-s_k$};
+\node[dat, anchor=south] at (14.85,10.70) {$u_k$};
+\draw[ar] (13.65,10.56) -- (mul.north);
+\draw[ar] (14.85,10.56) -- (plu.north);
+\draw[ar] (mul.east) -- (plu.west);
+\node[lb, anchor=north] at (14.25,9.62) {hard initial condition};
+\node[hot, anchor=west] (uh) at (15.40,10.05) {$\hat u$};
+\draw[ar] (plu.east) -- (uh.west);
+
+\node[op] (dop) at (17.10,10.05) {$\tfrac{\partial}{\partial s}$};
+\draw[ar] (16.20,10.05) -- (dop.west);
+\node[dat, anchor=west, text width=14mm] (du) at (17.50,10.05)
+  {$\mathrm{d}\hat u/\mathrm{d}s$\\ \ttfamily autograd};
+\draw[ar] (dop.east) -- (du.west);
+\node[op] (pl2) at (20.15,10.05) {$\oplus$};
+\draw[ar] (du.east) -- (pl2.west);
+\node[hot, anchor=west] (hh) at (20.65,10.05)
+  {$H=\mathrm{d}\hat u/\mathrm{d}s+\hat r$};
+\draw[ar] (pl2.east) -- (hh.west);
+\node[op] (sl) at (24.20,10.05) {$\Sigma$};
+\draw[ar] (23.35,10.05) -- (sl.west);
+\node[lb, anchor=north] at (24.20,9.66) {loss terms};
+\node[hot, anchor=west] (lt) at (24.65,10.05)
+  {$\mathcal{L}_{\text{total}}$};
+\draw[ar] (sl.east) -- (lt.west);
+
+% ---- rate branch ---------------------------------------------------------
+\draw[ar] (7.75,9.68) -- (7.75,8.05) -- (16.55,8.05);
+\node[lb, anchor=south] at (11.80,8.10) {$\mathbf{x}$};
+\ratestack{16.60}{7.10}
+\node[hot, anchor=west] (rh) at (20.85,8.08) {$\hat r$};
+\draw[ar] (20.30,8.08) -- (rh.west);
+\draw[ar] (21.12,8.42) -- (21.12,9.35) -- (20.15,9.35) -- (pl2.south);
+
+% ---- backpropagation -----------------------------------------------------
+\draw[gar] (26.20,10.45) -- (26.20,11.55) -- (10.00,11.55) -- (10.00,11.30);
+\draw[gar] (18.70,11.55) -- (18.70,9.06);
+\node[lb, anchor=south, text=gradc] at (19.80,11.62)
+  {$\partial\mathcal{L}_{\text{total}}/\partial\theta$};
+
+% ================= magnified panels ======================================
+\draw[dar] (18.70,7.05) -- (18.70,6.72) -- (6.45,6.72) -- (6.45,6.35);
+\ratepanel{0.30}{0.85}
+\intervals{12.90}{0.85}
+\lossbars{19.40}{0.85}
+
+\legendrow{0.30}{0.24}
+
+\end{tikzpicture}
+\end{document}
