@@ -511,12 +511,12 @@ pinn:
       # rate_floor=0.0 flip above does not silently change their behaviour --
       # NaPINNQ raises if use_hybrid_rate=True and rate_floor!=0, so these must
       # stay pinned to use_hybrid_rate=false explicitly too.
-      - name: "A0_Data_Only"
-        architecture: "NaPINN-Q"
-        model_overrides: {use_hybrid_rate: false, rate_floor: 0.06}
-        weights: {data: 1.0, ode: 0.0, initial_condition: 0.0, integral: 0.0,
-                  monotonicity: 0.0, bounds: 0.0, rate_regularization: 0.0,
-                  rate_data: 0.0, pairwise: 0.0}
+      # - name: "A0_Data_Only"
+      #   architecture: "NaPINN-Q"
+      #   model_overrides: {use_hybrid_rate: false, rate_floor: 0.06}
+      #   weights: {data: 1.0, ode: 0.0, initial_condition: 0.0, integral: 0.0,
+      #             monotonicity: 0.0, bounds: 0.0, rate_regularization: 0.0,
+      #             rate_data: 0.0, pairwise: 0.0}
       - name: "A1_No_ODE_Residual"
         architecture: "NaPINN-Q"
         model_overrides: {use_hybrid_rate: false, rate_floor: 0.06}
@@ -576,34 +576,34 @@ pinn:
       # A9: hybrid model, cold-regime term disabled. Isolates the low-temperature
       # gating contribution. Most cells are at 25 °C or 50 °C; this ablation is
       # only meaningfully different for the two -10 °C cells.
-      - name: "A9_No_Cold_Regime"
-        architecture: "NaPINN-Q"
-        # rate_floor: 0.0 overrides the global pinn.model.rate_floor (0.06):
-        # NaPINNQ raises if use_hybrid_rate=True and rate_floor!=0
-        # (HybridRateModel has no single Softplus head to shift a floor on).
-        model_overrides: {use_hybrid_rate: true, hybrid_enable_cold_regime: false,
-                          rate_floor: 0.0}
-        weights: {data: 1.0, ode: 0.001, initial_condition: 0.1, integral: 0.005,
-                  monotonicity: 0.002, bounds: 0.05, rate_regularization: 1.0e-4,
-                  rate_data: 0.005, pairwise: 0.0, residual_share: 0.01}
+      # - name: "A9_No_Cold_Regime"
+      #   architecture: "NaPINN-Q"
+      #   # rate_floor: 0.0 overrides the global pinn.model.rate_floor (0.06):
+      #   # NaPINNQ raises if use_hybrid_rate=True and rate_floor!=0
+      #   # (HybridRateModel has no single Softplus head to shift a floor on).
+      #   model_overrides: {use_hybrid_rate: true, hybrid_enable_cold_regime: false,
+      #                     rate_floor: 0.0}
+      #   weights: {data: 1.0, ode: 0.001, initial_condition: 0.1, integral: 0.005,
+      #             monotonicity: 0.002, bounds: 0.05, rate_regularization: 1.0e-4,
+      #             rate_data: 0.005, pairwise: 0.0, residual_share: 0.01}
       # A10: hybrid model, no residual-share penalty. Lets the neural residual
       # grow without constraint, turning the model back toward a black box.
-      - name: "A10_No_Residual_Share_Penalty"
-        architecture: "NaPINN-Q"
-        model_overrides: {use_hybrid_rate: true, rate_floor: 0.0}
-        weights: {data: 1.0, ode: 0.001, initial_condition: 0.1, integral: 0.005,
-                  monotonicity: 0.002, bounds: 0.05, rate_regularization: 1.0e-4,
-                  rate_data: 0.005, pairwise: 0.0, residual_share: 0.0}
+      # - name: "A10_No_Residual_Share_Penalty"
+      #   architecture: "NaPINN-Q"
+      #   model_overrides: {use_hybrid_rate: true, rate_floor: 0.0}
+      #   weights: {data: 1.0, ode: 0.001, initial_condition: 0.1, integral: 0.005,
+      #             monotonicity: 0.002, bounds: 0.05, rate_regularization: 1.0e-4,
+      #             rate_data: 0.005, pairwise: 0.0, residual_share: 0.0}
       # A11: hybrid model, C-rate exponent fitted (not frozen at 0). Tests the
       # Klick et al. finding that C-rate has no significant effect; expected to
       # converge to near-zero alpha given the confounded test matrix.
-      - name: "A11_Fit_C_Rate_Exponent"
-        architecture: "NaPINN-Q"
-        model_overrides: {use_hybrid_rate: true, hybrid_fit_c_rate_exponent: true,
-                          rate_floor: 0.0}
-        weights: {data: 1.0, ode: 0.001, initial_condition: 0.1, integral: 0.005,
-                  monotonicity: 0.002, bounds: 0.05, rate_regularization: 1.0e-4,
-                  rate_data: 0.005, pairwise: 0.0, residual_share: 0.01}
+      # - name: "A11_Fit_C_Rate_Exponent"
+      #   architecture: "NaPINN-Q"
+      #   model_overrides: {use_hybrid_rate: true, hybrid_fit_c_rate_exponent: true,
+      #                     rate_floor: 0.0}
+      #   weights: {data: 1.0, ode: 0.001, initial_condition: 0.1, integral: 0.005,
+      #             monotonicity: 0.002, bounds: 0.05, rate_regularization: 1.0e-4,
+      #             rate_data: 0.005, pairwise: 0.0, residual_share: 0.01}
       # A12 (full hybrid model, all components active) is commented out of the
       # sweep as of 2026-08-05: this IS the main/headline model -- pinn.model
       # above (use_hybrid_rate: true, rate_floor: 0.0) already trains exactly
